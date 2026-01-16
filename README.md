@@ -2,9 +2,9 @@
 
 This repository studies **thermal quantum states** obtained variationally by minimizing the free energy
 
-\[
+$$
 F = \langle H \rangle - T S_2,
-\]
+$$
 
 where \(S_2\) is the **Rényi-2 entanglement entropy** between a physical system and an ancilla.
 
