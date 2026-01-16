@@ -6,7 +6,7 @@ $$
 F = \langle H \rangle - T S_2,
 $$
 
-where \(S_2\) is the **Rényi-2 entanglement entropy** between a physical system and an ancilla.
+where $$S_2$$ is the **Rényi-2 entanglement entropy** between a physical system and an ancilla.
 
 The goal is to reproduce thermal states using entanglement-based variational principles, and to compare exact and variational approaches.
 
