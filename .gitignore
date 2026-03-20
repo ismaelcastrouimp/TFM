@@ -2,3 +2,4 @@
 .env.*
 *.env
 output.png
+tfm.egg-info
