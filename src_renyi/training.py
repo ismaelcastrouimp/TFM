@@ -47,6 +47,9 @@ def free_energy_minimize_SR_SGD(
         diag_shift = optax.linear_schedule(1e-1, 1e-4, n_steps)
 
     sr = nk.optimizer.SR(diag_shift=diag_shift)
+    optimizer = optax.sgd(learning_rate)
+    opt_state = optimizer.init(vstate.parameters)
+
     free_renyi_op = FreeRenyiEnergyObservable(vstate.hilbert, Hamiltonian, partition, T)
     n_samples_full = vstate.n_samples
 
@@ -64,10 +67,8 @@ def free_energy_minimize_SR_SGD(
         delta = sr(vstate, F_grad, step)
         vstate.n_samples = n_samples_full
 
-        lr = float(learning_rate(step) if callable(learning_rate) else learning_rate)
-        vstate.parameters = jax.tree_util.tree_map(
-            lambda p, d: p - lr * d, vstate.parameters, delta
-        )
+        updates, opt_state = optimizer.update(delta, opt_state)
+        vstate.parameters = optax.apply_updates(vstate.parameters, updates)
 
         if timing:
             jax.tree_util.tree_map(lambda x: x.block_until_ready(), vstate.parameters)
