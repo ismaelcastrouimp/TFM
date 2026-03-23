@@ -11,6 +11,7 @@ __pycache__/
 *$py.class
 
 # Packaging
+tfm.egg-info
 *.egg-info/
 build/
 dist/
