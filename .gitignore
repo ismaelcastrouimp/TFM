@@ -1,5 +1,26 @@
+# Entornos
 .env
 .env.*
 *.env
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Packaging
+*.egg-info/
+build/
+dist/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Archivos generados
 output.png
-tfm.egg-info
+
+# IDE / sistema
+.vscode/
+.DS_Store

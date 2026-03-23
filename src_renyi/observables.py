@@ -76,8 +76,13 @@ def expect_and_grad_free_renyi(
     all_sites = jnp.arange(vstate.hilbert.size)
     complement_sites = jnp.setdiff1d(all_sites, subsystem_sites)
 
-    samples1 = vstate.samples.reshape(-1, vstate.hilbert.size)
-    samples2 = vstate.sample(n_samples=vstate.n_samples).reshape(-1, vstate.hilbert.size)
+    # Un solo batch — se parte en dos mitades para el swap trick
+    all_samples = vstate.samples.reshape(-1, vstate.hilbert.size)
+    n = all_samples.shape[0] // 2
+    samples1 = all_samples[:n]
+    samples2 = all_samples[n:]
+
+    # <H> se calcula sobre samples1 (n muestras)
     sigma_p, mels = op.H.get_conn_padded(samples1)
 
     E_mean, S2, grad_F = _free_renyi_grad_jit(
