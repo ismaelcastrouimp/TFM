@@ -172,6 +172,104 @@ def renyi2_entropy_and_grad_sampled(vstate, subsystem_sites, n_samples, key=0, d
 
     return S2, grad_S2
 
+from netket.jax import jacobian
+def renyi2_entropy_and_grad_sampled2(vstate, subsystem_sites, n_samples, key=0, debug=False):
+    subsystem_sites = jnp.array(subsystem_sites, dtype=int)
+    """
+    Calcula la entropía de Rényi-2 de un subsistema y su gradiente mediante el *swap trick*
+    
+    Args:
+        vstate: estado variacional de NetKet
+        subsystem_sites: índices del subsistema
+        n_samples: número de muestras
+        key: semilla aleatoria
+        debug: modo depuración
+    
+    Returns:
+        S2: entropía de Rényi-2
+        grad_S2: gradiente respecto a parámetros (misma estructura que vstate.parameters)
+    """
+    
+    # ============================================================
+    # 1) MUESTREO
+    # ============================================================
+    all_samples = vstate.sample(n_samples=2 * n_samples, n_discard_per_chain=1000).reshape(-1, vstate.hilbert.size)
+    key = jax.random.PRNGKey(key)
+    all_samples = jax.random.permutation(key, all_samples, axis=0)
+    
+    samples1 = all_samples[:n_samples]
+    samples2 = all_samples[n_samples:2*n_samples]
+    
+    # ============================================================
+    # 2) CONFIGURACIONES SWAP
+    # ============================================================
+    all_sites = jnp.arange(samples1.shape[1])
+    complement_sites = jnp.setdiff1d(all_sites, subsystem_sites)
+    
+    swapped1 = jnp.concatenate([samples2[:, subsystem_sites], samples1[:, complement_sites]], axis=1)
+    swapped2 = jnp.concatenate([samples1[:, subsystem_sites], samples2[:, complement_sites]], axis=1)
+    
+    # ============================================================
+    # 3) LOG-AMPLITUDES
+    # ============================================================
+    log_o1 = vstate.log_value(samples1)
+    log_o2 = vstate.log_value(samples2)
+    log_s1 = vstate.log_value(swapped1)
+    log_s2 = vstate.log_value(swapped2)
+    
+    # ============================================================
+    # 4) RATIO SWAP Y ENTROPÍA S₂
+    # ============================================================
+    R = jnp.exp(jnp.real(log_s1 + log_s2 - log_o1 - log_o2))
+    R_mean = jnp.mean(R)
+    S2 = -jnp.log(jnp.abs(R_mean))
+    
+    # ============================================================
+    # 5) JACOBIANOS O_θ = ∂_θ log ψ
+    # ============================================================
+    O_o1 = jacobian(vstate._apply_fun, vstate.parameters, samples1,
+                    model_state=vstate.model_state, mode="real", dense=True)
+    O_o2 = jacobian(vstate._apply_fun, vstate.parameters, samples2,
+                    model_state=vstate.model_state, mode="real", dense=True)
+    O_s1 = jacobian(vstate._apply_fun, vstate.parameters, swapped1,
+                    model_state=vstate.model_state, mode="real", dense=True)
+    O_s2 = jacobian(vstate._apply_fun, vstate.parameters, swapped2,
+                    model_state=vstate.model_state, mode="real", dense=True)
+    
+    R_exp = R.reshape(-1, 1)  # (n_samples, 1) para broadcasting
+    
+    # ============================================================
+    # 6) TÉRMINO 1: dependencia explícita de R en θ
+    #    ⟨R · ∇log R⟩ = ⟨R · 2(O_s1 + O_s2 - O_o1 - O_o2)⟩
+    # ============================================================
+    grad_log_R = O_s1 + O_s2 - O_o1 - O_o2  # (n_samples, n_params)
+    term1 = 2.0 * jnp.mean(R_exp * grad_log_R, axis=0)  # (n_params,)
+
+    # ============================================================
+    # 7) TÉRMINO 2: dependencia de p(x)p(y) en θ — REINFORCE
+    #    2⟨(R - ⟨R⟩) · (O_o1 + O_o2)⟩
+    #    ∇log p(x)p(y) = 2(O_o1 + O_o2) porque p = |ψ|²
+    # ============================================================
+    R_centered = (R - R_mean).reshape(-1, 1)
+    term2 = 2.0 * jnp.mean(R_centered * (O_o1 + O_o2), axis=0)  # (n_params,)
+
+    # ============================================================
+    # 8) ∇S₂ = -(term1 + term2) / ⟨R⟩
+    # ============================================================
+    grad_S2_flat = -(term1 + term2) / R_mean
+
+    _, unravel = jax.flatten_util.ravel_pytree(vstate.parameters)
+    grad_S2 = unravel(grad_S2_flat)
+
+    if debug:
+        print(f"⟨R⟩  = {float(R_mean):.6f}")
+        print(f"S₂   = {float(S2):.6f}")
+        print(f"||term1|| = {jnp.linalg.norm(term1):.6f}  (explícito)")
+        print(f"||term2|| = {jnp.linalg.norm(term2):.6f}  (REINFORCE)")
+        print(f"|∇S₂| = {jnp.linalg.norm(grad_S2_flat):.6f}")
+    
+    return S2, grad_S2
+
 
 def renyi2_entropy_sampled(vstate, partition, n_samples):
     """
