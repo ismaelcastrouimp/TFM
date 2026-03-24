@@ -270,6 +270,144 @@ def renyi2_entropy_and_grad_sampled2(vstate, subsystem_sites, n_samples, key=0, 
     
     return S2, grad_S2
 
+def renyi2_entropy_and_grad_lambda_integral(vstate, subsystem_sites, n_samples, n_lambda=10, key=0, debug=False):
+    """
+    Calcula S₂ y ∇S₂ usando el método de la λ-integral
+    basado en Drut & Porter (2022)
+
+    S₂ = - ∫₀¹ dλ ⟨ln R⟩_{P_λ}
+    ∇S₂ = - ∫₀¹ [ ⟨∇lnR⟩_{P_λ} + λ·Cov_{P_λ}(lnR, ∇lnR) + 2⟨(lnR-⟨lnR⟩)(O_o1+O_o2)⟩_{P_λ} ] dλ
+    """
+    subsystem_sites = jnp.array(subsystem_sites, dtype=int)
+    key_obj = jax.random.PRNGKey(key)
+    lambda_grid = jnp.linspace(0.0, 1.0, n_lambda)
+
+    f_vals = []
+    grad_f_vals = []
+
+    for lam in lambda_grid:
+
+        key_obj, subkey = jax.random.split(key_obj)
+
+        # =====================================================
+        # 1) MUESTREO
+        # =====================================================
+        all_samples = (
+            vstate.sample(n_samples=2 * n_samples, n_discard_per_chain=500)
+            .reshape(-1, vstate.hilbert.size)
+        )
+        all_samples = jax.random.permutation(subkey, all_samples, axis=0)
+
+        samples1 = all_samples[:n_samples]
+        samples2 = all_samples[n_samples:2 * n_samples]
+
+        # =====================================================
+        # 2) SWAP CONFIGS
+        # =====================================================
+        all_sites = jnp.arange(samples1.shape[1])
+        complement_sites = jnp.setdiff1d(all_sites, subsystem_sites)
+
+        swapped1 = jnp.concatenate(
+            [samples2[:, subsystem_sites], samples1[:, complement_sites]], axis=1
+        )
+        swapped2 = jnp.concatenate(
+            [samples1[:, subsystem_sites], samples2[:, complement_sites]], axis=1
+        )
+
+        # =====================================================
+        # 3) LOG-AMPLITUDES Y RATIO R
+        # =====================================================
+        log_o1 = vstate.log_value(samples1)
+        log_o2 = vstate.log_value(samples2)
+        log_s1 = vstate.log_value(swapped1)
+        log_s2 = vstate.log_value(swapped2)
+
+        log_R = jnp.real(log_s1 + log_s2 - log_o1 - log_o2)
+
+        # =====================================================
+        # 4) JACOBIANOS O_θ = ∂_θ log ψ
+        # =====================================================
+        O_o1 = jacobian(vstate._apply_fun, vstate.parameters, samples1,
+                        model_state=vstate.model_state, mode="real", dense=True)
+        O_o2 = jacobian(vstate._apply_fun, vstate.parameters, samples2,
+                        model_state=vstate.model_state, mode="real", dense=True)
+        O_s1 = jacobian(vstate._apply_fun, vstate.parameters, swapped1,
+                        model_state=vstate.model_state, mode="real", dense=True)
+        O_s2 = jacobian(vstate._apply_fun, vstate.parameters, swapped2,
+                        model_state=vstate.model_state, mode="real", dense=True)
+
+        # ∇ln R = 2*(O_s1 + O_s2 - O_o1 - O_o2)
+        grad_lnR = 2.0 * (O_s1 + O_s2 - O_o1 - O_o2)  # (n_samples, n_params)
+
+        # =====================================================
+        # 5) PESOS P_λ ∝ p(x)p(y) R^λ
+        # =====================================================
+        log_weights = lam * log_R
+        log_weights -= jax.nn.logsumexp(log_weights)
+        weights = jnp.exp(log_weights)  # (n_samples,)
+
+        w = weights.reshape(-1, 1)  # para broadcasting
+
+        # =====================================================
+        # 6) f(λ) = ⟨ln R⟩_λ
+        # =====================================================
+        f_lam = jnp.sum(weights * log_R)
+        f_vals.append(f_lam)
+
+        # =====================================================
+        # 7) ⟨∇ln R⟩_λ
+        # =====================================================
+        mean_grad = jnp.sum(w * grad_lnR, axis=0)  # (n_params,)
+
+        # =====================================================
+        # 8) Covarianza: Cov_λ(lnR, ∇lnR)
+        #    = ⟨lnR · ∇lnR⟩_λ - ⟨lnR⟩_λ · ⟨∇lnR⟩_λ
+        # =====================================================
+        lnR_exp = log_R.reshape(-1, 1)
+        mean_lnR_grad = jnp.sum(w * lnR_exp * grad_lnR, axis=0)
+        cov = mean_lnR_grad - f_lam * mean_grad  # (n_params,)
+
+        # =====================================================
+        # 9) TÉRMINO REINFORCE: dependencia de p(x)p(y) en θ
+        #    2⟨(lnR - ⟨lnR⟩_λ)(O_o1 + O_o2)⟩_λ
+        # =====================================================
+        lnR_centered = (log_R - f_lam).reshape(-1, 1)
+        grad_log_p = O_o1 + O_o2  # ∇log[p(x)p(y)] / 2, shape (n_samples, n_params)
+        reinforce = 2.0 * jnp.sum(w * lnR_centered * grad_log_p, axis=0)  # (n_params,)
+
+        # =====================================================
+        # 10) ∇f(λ) = ⟨∇lnR⟩_λ + λ·Cov + REINFORCE
+        # =====================================================
+        grad_f_flat = mean_grad + lam * cov + reinforce  # (n_params,)
+        grad_f_vals.append(grad_f_flat)
+
+        if debug:
+            ess = 1.0 / jnp.sum(weights ** 2)
+            print(f"λ={float(lam):.3f} | f(λ)={float(f_lam):.6f} | "
+                  f"||mean_grad||={jnp.linalg.norm(mean_grad):.4f} | "
+                  f"||cov||={jnp.linalg.norm(cov):.4f} | "
+                  f"||reinforce||={jnp.linalg.norm(reinforce):.4f} | "
+                  f"ESS={float(ess):.1f}")
+
+    # =====================================================
+    # 11) INTEGRACIÓN TRAPECIO
+    # =====================================================
+    f_vals = jnp.array(f_vals)
+    dlam = lambda_grid[1] - lambda_grid[0]
+
+    S2 = -(dlam * (0.5 * f_vals[0] + jnp.sum(f_vals[1:-1]) + 0.5 * f_vals[-1]))
+
+    flat_grads = jnp.stack(grad_f_vals)  # (n_lambda, n_params)
+    grad_S2_flat = -(dlam * (0.5 * flat_grads[0] + jnp.sum(flat_grads[1:-1], axis=0) + 0.5 * flat_grads[-1]))
+
+    _, unravel = jax.flatten_util.ravel_pytree(vstate.parameters)
+    grad_S2 = unravel(grad_S2_flat)
+
+    if debug:
+        print(f"\nS₂ = {float(S2):.6f}")
+        print(f"||∇S₂|| = {jnp.linalg.norm(grad_S2_flat):.6f}")
+
+    return float(S2), grad_S2
 
 def renyi2_entropy_sampled(vstate, partition, n_samples):
     """
