@@ -6,4 +6,4 @@ from .entropy import (
     renyi2_entropy_sampled,
     renyi2_entropy_and_grad_sampled,
 )
-from .training import free_energy_minimize_SR_SGD, free_energy_minimize_scipy
+from .training import free_energy_minimize_SR_SGD, free_energy_minimize_scipy, renyi_entropy_maximize_SR_SGD, renyi_entropy_maximize_ADAM

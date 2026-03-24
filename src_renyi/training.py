@@ -10,7 +10,7 @@ from jax.flatten_util import ravel_pytree
 from scipy.optimize import minimize
 
 from .observables import FreeRenyiEnergyObservable
-from .entropy import renyi2_entropy_sampled, renyi2_entropy_exact
+from .entropy import renyi2_entropy_and_grad_sampled, renyi2_entropy_sampled, renyi2_entropy_exact
 
 
 def free_energy_minimize_SR_SGD(
@@ -176,3 +176,144 @@ def free_energy_minimize_scipy(
         "best_energy":         energy_history[best_idx],
         "best_entropy":        entropy_history[best_idx],
     }
+
+def renyi_entropy_maximize_SR_SGD(
+    vstate, partition, n_steps=1000,
+    verbose=True, freq=50, plot=True,
+    learning_rate=None, diag_shift=None,
+    n_samples_sr=4096, timing=False,
+):
+    """
+    Maximiza S₂ del subsistema A usando SR + SGD.
+
+    Parámetros
+    ----------
+    vstate       : MCState de NetKet con el modelo variacional.
+    partition    : Lista de sitios del subsistema A para S₂.
+    n_steps      : Número de pasos de optimización.
+    verbose      : Si True, imprime progreso cada `freq` pasos.
+    freq         : Frecuencia de impresión.
+    plot         : Si True, muestra gráfica de S₂ al final.
+    learning_rate: Schedule o escalar de optax. Por defecto warmup_cosine_decay.
+    diag_shift   : Schedule o escalar para SR. Por defecto linear 1e-1 → 1e-4.
+    n_samples_sr : Muestras usadas en el paso de SR (< n_samples completo).
+    timing       : Si True, mide y muestra el tiempo real de cada step en los prints.
+
+    Devuelve
+    -------
+    (entropy_history, best_S2, best_params)
+    """
+    if learning_rate is None:
+        learning_rate = optax.warmup_cosine_decay_schedule(0.1, 0.1, 100, n_steps, 0.001)
+    if diag_shift is None:
+        diag_shift = optax.linear_schedule(1e-1, 1e-4, n_steps)
+
+    sr = nk.optimizer.SR(diag_shift=diag_shift)
+    optimizer = optax.sgd(learning_rate)
+    opt_state = optimizer.init(vstate.parameters)
+    n_samples_full = vstate.n_samples
+
+    entropy_history = []
+    best_S2 = float("-inf")
+    best_params = None
+
+    for step in range(n_steps):
+        if timing:
+            t0 = time.time()
+
+        S2, grad_S2 = renyi2_entropy_and_grad_sampled(
+            vstate, partition, n_samples_full
+        )
+
+        vstate.n_samples = n_samples_sr
+        delta = sr(vstate, grad_S2, step)
+        vstate.n_samples = n_samples_full
+
+        neg_delta = jax.tree_util.tree_map(lambda d: -d, delta)
+        updates, opt_state = optimizer.update(neg_delta, opt_state)
+        vstate.parameters = optax.apply_updates(vstate.parameters, updates)
+
+        if timing:
+            jax.tree_util.tree_map(lambda x: x.block_until_ready(), vstate.parameters)
+
+        S2_val = float(S2)
+        entropy_history.append(S2_val)
+
+        if S2_val > best_S2:
+            best_S2 = S2_val
+            best_params = vstate.parameters
+
+        if step % freq == 0 and verbose:
+            if timing:
+                print(f"Step {step:4d} | S₂={S2_val:.6f} | t={time.time()-t0:.3f}s")
+            else:
+                print(f"Step {step:4d} | S₂={S2_val:.6f}")
+
+    vstate.parameters = best_params
+
+    if plot:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(entropy_history, color="tab:green", label=r"$S_2$")
+        ax.set_xlabel("Step")
+        ax.set_ylabel(r"$S_2$", color="tab:green")
+        plt.tight_layout()
+        plt.show()
+
+    return entropy_history, best_S2, best_params
+
+def renyi_entropy_maximize_ADAM(
+    vstate, partition, n_steps=1000,
+    verbose=True, freq=50, plot=True,
+    learning_rate=None, timing=False,
+):
+    if learning_rate is None:
+        learning_rate = optax.linear_schedule(1e-3, 1e-5, n_steps)
+
+    optimizer = optax.adam(learning_rate=learning_rate)
+    opt_state = optimizer.init(vstate.parameters)
+    n_samples_full = vstate.n_samples
+
+    entropy_history = []
+    best_S2 = float("-inf")
+    best_params = None
+
+    for step in range(n_steps):
+        if timing:
+            t0 = time.time()
+
+        S2, grad_S2 = renyi2_entropy_and_grad_sampled(
+            vstate, partition, n_samples_full
+        )
+
+        # Negamos el gradiente para maximizar
+        neg_grad = jax.tree_util.tree_map(lambda g: -g, grad_S2)
+        updates, opt_state = optimizer.update(neg_grad, opt_state)
+        vstate.parameters = optax.apply_updates(vstate.parameters, updates)
+
+        if timing:
+            jax.tree_util.tree_map(lambda x: x.block_until_ready(), vstate.parameters)
+
+        S2_val = float(S2)
+        entropy_history.append(S2_val)
+
+        if S2_val > best_S2:
+            best_S2 = S2_val
+            best_params = vstate.parameters
+
+        if step % freq == 0 and verbose:
+            if timing:
+                print(f"Step {step:4d} | S₂={S2_val:.6f} | t={time.time()-t0:.3f}s")
+            else:
+                print(f"Step {step:4d} | S₂={S2_val:.6f}")
+
+    vstate.parameters = best_params
+
+    if plot:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(entropy_history, color="tab:green", label=r"$S_2$")
+        ax.set_xlabel("Step")
+        ax.set_ylabel(r"$S_2$", color="tab:green")
+        plt.tight_layout()
+        plt.show()
+
+    return entropy_history, best_S2, best_params
