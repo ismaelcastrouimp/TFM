@@ -10,7 +10,7 @@ from jax.flatten_util import ravel_pytree
 from scipy.optimize import minimize
 
 from .observables import FreeRenyiEnergyObservable
-from .entropy import renyi2_entropy_and_grad_sampled, renyi2_entropy_sampled, renyi2_entropy_exact
+from .entropy import renyi2_entropy_and_grad_sampled, renyi2_entropy_sampled, renyi2_entropy_exact, renyi2_entropy_and_grad_lambda_integral
 
 
 def free_energy_minimize_SR_SGD(
@@ -101,7 +101,6 @@ def free_energy_minimize_SR_SGD(
         plt.show()
 
     return free_energy_history, best_F, E_best, S2_best
-
 
 def free_energy_minimize_scipy(
     vstate, T, partition, Hamiltonian,
@@ -221,16 +220,23 @@ def renyi_entropy_maximize_SR_SGD(
         if timing:
             t0 = time.time()
 
-        S2, grad_S2 = renyi2_entropy_and_grad_sampled(
-            vstate, partition, n_samples_full
-        )
+        # S2, grad_S2 = renyi2_entropy_and_grad_sampled(vstate, partition, n_samples_full)
+        S2, grad_S2 = renyi2_entropy_and_grad_lambda_integral(vstate, partition, n_samples_full, 30)
+
+        S2_max = len(partition) * jnp.log(2.0)
+        mask = float(S2 < S2_max)
+
+        # Gradiente con mask aplicado (se anula si S2 >= S2_max)
+        masked_grad = jax.tree_util.tree_map(lambda g: mask * g, grad_S2)
 
         vstate.n_samples = n_samples_sr
-        delta = sr(vstate, grad_S2, step)
+        delta = sr(vstate, masked_grad, step)
         vstate.n_samples = n_samples_full
 
+        # Negamos delta para maximizar
         neg_delta = jax.tree_util.tree_map(lambda d: -d, delta)
         updates, opt_state = optimizer.update(neg_delta, opt_state)
+        vstate.parameters = optax.apply_updates(vstate.parameters, updates)
         vstate.parameters = optax.apply_updates(vstate.parameters, updates)
 
         if timing:
