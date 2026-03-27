@@ -271,8 +271,6 @@ def renyi2_entropy_and_grad_sampled2(vstate, subsystem_sites, n_samples, key=0, 
     return S2, grad_S2
 
 
-
-@partial(jax.jit, static_argnames=("apply_fun", "n_lambda"))
 def _renyi2_lambda_integral_jit(apply_fun, params, model_state,
                                  samples1, samples2, swapped1, swapped2,
                                  subsystem_sites, complement_sites,
@@ -283,26 +281,19 @@ def _renyi2_lambda_integral_jit(apply_fun, params, model_state,
 
     lambda_grid = jnp.linspace(0.0, 1.0, n_lambda)
 
+    # Calculados una sola vez, fuera del vmap
+    log_o1 = log_psi(params, samples1)
+    log_o2 = log_psi(params, samples2)
+    log_s1 = log_psi(params, swapped1)
+    log_s2 = log_psi(params, swapped2)
+    log_R = jnp.real(log_s1 + log_s2 - log_o1 - log_o2)
+
     def compute_for_lambda(lam):
-
-        # Forward pass con parámetros fijos para obtener cantidades auxiliares
-        log_o1 = log_psi(params, samples1)
-        log_o2 = log_psi(params, samples2)
-        log_s1 = log_psi(params, swapped1)
-        log_s2 = log_psi(params, swapped2)
-
-        log_R = jnp.real(log_s1 + log_s2 - log_o1 - log_o2)
-
         log_w = lam * log_R
         log_w -= jax.nn.logsumexp(log_w)
-        w = jnp.exp(log_w)  # (n_samples,)
+        w = jnp.exp(log_w)
+        f_lam = jnp.sum(w * log_R)
 
-        f_lam = jnp.sum(w * log_R)  # <ln R>_λ
-
-        # loss_fn cuyo gradiente da los tres términos correctamente:
-        # grad(loss_fn) = <∂_θ ln R>_λ            [término 1, diferenciando log_R]
-        #               + λ·Cov_λ(lnR, ∂_θ lnR)   [término 2a, diferenciando w vía log_R]
-        #               + 2<(lnR-<lnR>)(O_o1+O_o2)>_λ [término 2b, REINFORCE]
         def loss_fn(p):
             lo1 = log_psi(p, samples1)
             lo2 = log_psi(p, samples2)
@@ -311,16 +302,11 @@ def _renyi2_lambda_integral_jit(apply_fun, params, model_state,
 
             log_R_ = jnp.real(ls1 + ls2 - lo1 - lo2)
 
-            # Pesos con gradiente habilitado para capturar el término de covarianza
             log_w_ = lam * log_R_
             log_w_ -= jax.nn.logsumexp(log_w_)
             w_ = jnp.exp(log_w_)
-
-            # Término 1 + término 2a (covarianza): <ln R>_λ con pesos diferenciables
             f_ = jnp.sum(w_ * log_R_)
 
-            # Término 2b (REINFORCE): 2<(lnR - <lnR>_λ)(O_o1 + O_o2)>_λ
-            # Usamos w y log_R del outer scope (stop_gradient implícito por closure)
             w_stopped = jax.lax.stop_gradient(w)
             lnR_centered = jax.lax.stop_gradient(log_R - f_lam)
             reinforce = 2.0 * jnp.sum(
@@ -337,7 +323,9 @@ def _renyi2_lambda_integral_jit(apply_fun, params, model_state,
     dlam = lambda_grid[1] - lambda_grid[0]
     trap_w = jnp.ones(n_lambda).at[0].set(0.5).at[-1].set(0.5)
 
-    S2 = -dlam * jnp.sum(trap_w * f_vals)
+    S2_max = subsystem_sites.shape[0] * jnp.log(2.0)
+    S2 = jnp.minimum(-dlam * jnp.sum(trap_w * f_vals), S2_max)
+
     grad_S2 = jax.tree_util.tree_map(
         lambda g: -dlam * jnp.sum(
             trap_w.reshape((-1,) + (1,) * (g.ndim - 1)) * g, axis=0
@@ -430,32 +418,10 @@ def _renyi2_loss_and_grad_cv(apply_fun, params, model_state,
     return S2, grad_S2
 
 
-def renyi2_entropy_and_grad_cv(vstate, subsystem_sites, n_samples, key=0, debug=False):
-    """
-    Estima S₂ y su gradiente  con control variate.
-
-    Reduce la varianza del gradiente respecto a renyi2_entropy_and_grad_sampled,
-    especialmente para estados de alta entropía donde el estimador estándar
-    es muy ruidoso.
-
-    Parámetros
-    ----------
-    vstate          : MCState de NetKet.
-    subsystem_sites : Índices de los sitios del subsistema A.
-    n_samples       : Número de muestras por copia.
-    key             : Semilla para la permutación aleatoria.
-    debug           : Si True, imprime S₂ y norma del gradiente.
-
-    Devuelve
-    -------
-    S2      : Estimación de la entropía de Rényi-2.
-    grad_S2 : Gradiente de S₂ respecto a los parámetros.
-    """
+def renyi2_entropy_and_grad_cv(vstate, subsystem_sites, n_samples, key=0, debug=False, diagnostics=False):
     subsystem_sites = jnp.array(subsystem_sites, dtype=int)
 
-    all_samples = vstate.sample(
-        n_samples=2 * n_samples
-    ).reshape(-1, vstate.hilbert.size)
+    all_samples = vstate.sample(n_samples=2 * n_samples).reshape(-1, vstate.hilbert.size)
 
     rng = jax.random.PRNGKey(key)
     all_samples = jax.random.permutation(rng, all_samples, axis=0)
@@ -466,6 +432,36 @@ def renyi2_entropy_and_grad_cv(vstate, subsystem_sites, n_samples, key=0, debug=
     complement_sites = jnp.setdiff1d(all_sites, subsystem_sites)
     swapped1 = jnp.concatenate([samples2[:, subsystem_sites], samples1[:, complement_sites]], axis=1)
     swapped2 = jnp.concatenate([samples1[:, subsystem_sites], samples2[:, complement_sites]], axis=1)
+
+    if diagnostics:
+        log_o1 = vstate.log_value(samples1)
+        log_o2 = vstate.log_value(samples2)
+        log_s1 = vstate.log_value(swapped1)
+        log_s2 = vstate.log_value(swapped2)
+        log_R = jnp.real(log_s1 + log_s2 - log_o1 - log_o2)
+        R = jnp.exp(log_R)
+        R_mean = jnp.mean(R)
+        log_p = jnp.real(log_o1 + log_o2)
+        log_p_centered = log_p - jnp.mean(log_p)
+        R_centered = R - R_mean
+        log_R_centered = log_R - jnp.mean(log_R)
+
+        corr_logp = jnp.mean(R_centered * log_p_centered) / (
+            jnp.std(R_centered) * jnp.std(log_p_centered) + 1e-8
+        )
+        corr_logR = jnp.mean(R_centered * log_R_centered) / (
+            jnp.std(R_centered) * jnp.std(log_R_centered) + 1e-8
+        )
+
+        print(f"── Diagnostics ──────────────────────────")
+        print(f"  mean(R)      = {float(R_mean):.3e}")
+        print(f"  std(R)       = {float(jnp.std(R)):.3e}")
+        print(f"  max(R)       = {float(jnp.max(R)):.3e}")
+        print(f"  mean(log_R)  = {float(jnp.mean(log_R)):.3f}")
+        print(f"  std(log_R)   = {float(jnp.std(log_R)):.3f}")
+        print(f"  corr(R,logp) = {float(corr_logp):.3f}  → CV reducción ≈ {100*(1-float(corr_logp)**2):.1f}% NO, {100*float(corr_logp)**2:.1f}% SÍ")
+        print(f"  corr(R,logR) = {float(corr_logR):.3f}  → CV reducción ≈ {100*float(corr_logR)**2:.1f}% SÍ")
+        print(f"─────────────────────────────────────────")
 
     S2, grad_S2 = _renyi2_loss_and_grad_cv(
         vstate._apply_fun,
