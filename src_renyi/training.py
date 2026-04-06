@@ -88,9 +88,13 @@ def free_energy_minimize_SR_SGD(
 
     # Restaurar mejores parámetros y evaluar
     vstate.parameters = best_params
+    jax.clear_caches()
+
+    vstate.chunk_size = 64
     E_best = float(vstate.expect(Hamiltonian).mean.real)
     S2_best = renyi2_entropy_sampled(vstate, partition, n_samples_full)
     best_F = E_best - T * S2_best
+    vstate.chunk_size = None
 
     if plot:
         fig, ax = plt.subplots(figsize=(8, 4))
