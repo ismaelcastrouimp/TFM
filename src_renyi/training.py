@@ -113,19 +113,24 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbos
 
     Parámetros
     ----------
+    vstate       : MCState de NetKet con el modelo variacional.
+    T            : Temperatura.
+    partition    : Lista de sitios del subsistema A para S₂.
+    Hamiltonian  : Operador H compatible con NetKet.
+    n_steps      : Número de pasos de optimización.
+    verbose      : Si True, imprime progreso cada `freq` pasos.
+    freq         : Frecuencia de impresión.
+    plot         : Si True, muestra gráfica de F al final.
     optimizer : optax.GradientTransformation
-        Por ejemplo:
-            optax.sgd(lr)
-            optax.adam(lr)
-            optax.chain(optax.sign(), optax.scale_by_learning_rate(lr))
+    learning_rate: Schedule o escalar de optax. Por defecto warmup_cosine_decay.
+    clip_norm : float o None. Si no es None, aplica clip_by_global_norm.
+    timing       : Si True, mide y muestra el tiempo real de cada step en los prints.
 
-    clip_norm : float o None
-        Si no es None, aplica clip_by_global_norm.
-
-    sr : nk.optimizer.SR o None
-        Si None, no se usa SR.
+    Devuelve
+    -------
+    (free_energy_history, best_F, E_best, S2_best)
     """
-
+    
     # --- learning rate por defecto ---
     if learning_rate is None:
         learning_rate = optax.warmup_cosine_decay_schedule(
