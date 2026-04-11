@@ -107,9 +107,9 @@ def free_energy_minimize_SR_SGD(
     return free_energy_history, best_F, E_best, S2_best
 
 def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbose=True, freq=50,
-    plot=True, optimizer=None, learning_rate=None, clip_norm=None, sr=None, n_samples_sr=4096, timing=False):
+    plot=True, optimizer=None, learning_rate=None, clip_norm=None, timing=False):
     """
-    Minimiza F = E - T·S₂ con optimizador general y SR opcional.
+    Minimiza F = E - T·S₂ con optimizador general.
 
     Parámetros
     ----------
@@ -167,14 +167,7 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbos
 
         F_stats, F_grad = vstate.expect_and_grad(free_renyi_op)
 
-        # --- SR opcional ---
-        if sr is not None:
-            vstate.n_samples = n_samples_sr
-            updates = sr(vstate, F_grad, step)
-            vstate.n_samples = n_samples_full
-
-        else:
-            updates, opt_state = gradient_transform.update(F_grad, opt_state, vstate.parameters)
+        updates, opt_state = gradient_transform.update(F_grad, opt_state, vstate.parameters)
 
         vstate.parameters = optax.apply_updates(vstate.parameters, updates)
 
@@ -182,7 +175,6 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbos
             jax.tree_util.tree_map(lambda x: x.block_until_ready(), vstate.parameters)
 
         F_val = float(F_stats.mean.real)
-
         free_energy_history.append(F_val)
 
         if F_val < best_F:
@@ -190,7 +182,6 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbos
             best_params = vstate.parameters
 
         if step % freq == 0 and verbose:
-
             if timing:
                 print(
                     f"Step {step:4d} | "
