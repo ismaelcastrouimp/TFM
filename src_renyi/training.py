@@ -106,6 +106,133 @@ def free_energy_minimize_SR_SGD(
 
     return free_energy_history, best_F, E_best, S2_best
 
+def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbose=True, freq=50,
+    plot=True, optimizer=None, learning_rate=None, clip_norm=None, sr=None, n_samples_sr=4096, timing=False):
+    """
+    Minimiza F = E - T·S₂ con optimizador general y SR opcional.
+
+    Parámetros
+    ----------
+    optimizer : optax.GradientTransformation
+        Por ejemplo:
+            optax.sgd(lr)
+            optax.adam(lr)
+            optax.chain(optax.sign(), optax.scale_by_learning_rate(lr))
+
+    clip_norm : float o None
+        Si no es None, aplica clip_by_global_norm.
+
+    sr : nk.optimizer.SR o None
+        Si None, no se usa SR.
+    """
+
+    # --- learning rate por defecto ---
+    if learning_rate is None:
+        learning_rate = optax.warmup_cosine_decay_schedule(
+            0.1, 0.1, 100, n_steps, 0.001
+        )
+
+    # --- optimizador por defecto ---
+    if optimizer is None:
+        optimizer = optax.sgd(learning_rate)
+
+    # --- construir gradient_transform ---
+    if clip_norm is not None:
+        gradient_transform = optax.chain(
+            optax.clip_by_global_norm(clip_norm),
+            optimizer
+        )
+    else:
+        gradient_transform = optimizer
+
+    opt_state = gradient_transform.init(vstate.parameters)
+
+    free_renyi_op = FreeRenyiEnergyObservable(
+        vstate.hilbert,
+        Hamiltonian,
+        partition,
+        T
+    )
+
+    n_samples_full = vstate.n_samples
+
+    free_energy_history = []
+    best_F = float("inf")
+    best_params = None
+
+    for step in range(n_steps):
+
+        if timing:
+            t0 = time.time()
+
+        F_stats, F_grad = vstate.expect_and_grad(free_renyi_op)
+
+        # --- SR opcional ---
+        if sr is not None:
+            vstate.n_samples = n_samples_sr
+            updates = sr(vstate, F_grad, step)
+            vstate.n_samples = n_samples_full
+
+        else:
+            updates, opt_state = gradient_transform.update(F_grad, opt_state, vstate.parameters)
+
+        vstate.parameters = optax.apply_updates(vstate.parameters, updates)
+
+        if timing:
+            jax.tree_util.tree_map(lambda x: x.block_until_ready(), vstate.parameters)
+
+        F_val = float(F_stats.mean.real)
+
+        free_energy_history.append(F_val)
+
+        if F_val < best_F:
+            best_F = F_val
+            best_params = vstate.parameters
+
+        if step % freq == 0 and verbose:
+
+            if timing:
+                print(
+                    f"Step {step:4d} | "
+                    f"F={F_val:.6f} | "
+                    f"t={time.time()-t0:.3f}s"
+                )
+            else:
+                print(
+                    f"Step {step:4d} | "
+                    f"F={F_val:.6f}"
+                )
+
+    # --- restaurar mejores parámetros ---
+
+    vstate.parameters = best_params
+    jax.clear_caches()
+
+    vstate.chunk_size = 64
+    E_best = float(vstate.expect(Hamiltonian).mean.real)
+    S2_best = renyi2_entropy_sampled(vstate, partition, n_samples_full)
+    best_F = E_best - T * S2_best
+    vstate.chunk_size = None
+
+    if plot:
+
+        fig, ax = plt.subplots(
+            figsize=(8, 4)
+        )
+
+        ax.plot(
+            free_energy_history,
+            label=r"$F$",
+        )
+
+        ax.set_xlabel("Step")
+        ax.set_ylabel(r"$F$")
+
+        plt.tight_layout()
+        plt.show()
+
+    return (free_energy_history, best_F, E_best, S2_best)
+
 def free_energy_minimize_scipy(
     vstate, T, partition, Hamiltonian,
     method="L-BFGS-B", options=None, verbose=True,
