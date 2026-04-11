@@ -18,6 +18,7 @@ def free_energy_minimize_SR_SGD(
     verbose=True, freq=50, plot=True,
     learning_rate=None, diag_shift=None,
     n_samples_sr=4096, timing=False,
+    chunk_size = 256
 ):
     """
     Minimiza F = E - T·S₂ con SR + SGD.
@@ -36,6 +37,7 @@ def free_energy_minimize_SR_SGD(
     diag_shift   : Schedule o escalar para SR. Por defecto linear 1e-1 → 1e-4.
     n_samples_sr : Muestras usadas en el paso de SR (< n_samples completo).
     timing       : Si True, mide y muestra el tiempo real de cada step en los prints.
+    chunk_size   : tamaño de los chunks para procesar FreeRenyiEnergyObservable.
 
     Devuelve
     -------
@@ -50,7 +52,7 @@ def free_energy_minimize_SR_SGD(
     optimizer = optax.sgd(learning_rate)
     opt_state = optimizer.init(vstate.parameters)
 
-    free_renyi_op = FreeRenyiEnergyObservable(vstate.hilbert, Hamiltonian, partition, T)
+    free_renyi_op = FreeRenyiEnergyObservable(vstate.hilbert, Hamiltonian, partition, T, chunk_size=chunk_size)
     n_samples_full = vstate.n_samples
 
     free_energy_history = []
@@ -107,7 +109,7 @@ def free_energy_minimize_SR_SGD(
     return free_energy_history, best_F, E_best, S2_best
 
 def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbose=True, freq=50,
-    plot=True, optimizer=None, learning_rate=None, clip_norm=None, timing=False):
+    plot=True, optimizer=None, learning_rate=None, clip_norm=None, timing=False, chunk_size=256):
     """
     Minimiza F = E - T·S₂ con optimizador general.
 
@@ -121,10 +123,11 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbos
     verbose      : Si True, imprime progreso cada `freq` pasos.
     freq         : Frecuencia de impresión.
     plot         : Si True, muestra gráfica de F al final.
-    optimizer : optax.GradientTransformation
+    optimizer    : optax.GradientTransformation
     learning_rate: Schedule o escalar de optax. Por defecto warmup_cosine_decay.
-    clip_norm : float o None. Si no es None, aplica clip_by_global_norm.
+    clip_norm    : float o None. Si no es None, aplica clip_by_global_norm.
     timing       : Si True, mide y muestra el tiempo real de cada step en los prints.
+    chunk_size   : tamaño de los chunks para procesar FreeRenyiEnergyObservable.
 
     Devuelve
     -------
@@ -156,7 +159,8 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbos
         vstate.hilbert,
         Hamiltonian,
         partition,
-        T
+        T,
+        chunk_size
     )
 
     n_samples_full = vstate.n_samples
