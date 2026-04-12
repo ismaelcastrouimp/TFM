@@ -33,7 +33,7 @@ def _compute_E_loc_jit(logpsi, params, model_state, samples1, sigma_p, mels, chu
         # vmap dentro del chunk → paralelo en GPU
         def e_loc_single(sigma, eta, mel):
             lp_sigma = log_psi(params, sigma[None])[0]
-            lp_eta = jax.vmap(lambda e: log_psi(params, e[None])[0])(eta)
+            lp_eta = log_psi(params, eta)   
             return jnp.sum(mel * jnp.exp(lp_eta - lp_sigma))
         return jax.vmap(e_loc_single)(batch_sigma, batch_eta, batch_mel)
 
