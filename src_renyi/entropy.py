@@ -91,6 +91,62 @@ def renyi2_entropy_exact(vstate, subsystem_sites):
 
 # ── Rényi-2 muestreado ────────────────────────────────────────────────────────
 
+@partial(jax.jit, static_argnames=("apply_fun", "chunk_size"))
+def _renyi2_forward_jit(apply_fun, params, model_state,
+                         samples1, samples2, swapped1, swapped2,
+                         chunk_size=128):
+    def log_psi(s):
+        return apply_fun({"params": params, **model_state}, s)
+
+    n = samples1.shape[0]
+    n_chunks = n // chunk_size
+
+    def reshape(x):
+        return x.reshape(n_chunks, chunk_size, *x.shape[1:])
+
+    s1_c, s2_c, sw1_c, sw2_c = map(reshape, (samples1, samples2, swapped1, swapped2))
+
+    def renyi_chunk(bs1, bs2, bsw1, bsw2):
+        def renyi_single(s1, s2, sw1, sw2):
+            lo1 = log_psi(s1[None])[0]
+            lo2 = log_psi(s2[None])[0]
+            ls1 = log_psi(sw1[None])[0]
+            ls2 = log_psi(sw2[None])[0]
+            return jnp.real(ls1 + ls2 - lo1 - lo2)
+        return jax.vmap(renyi_single)(bs1, bs2, bsw1, bsw2)
+
+    log_R = jax.lax.map(
+        lambda x: renyi_chunk(*x), (s1_c, s2_c, sw1_c, sw2_c)
+    ).reshape(n)
+
+    return -jnp.log(jnp.abs(jnp.mean(jnp.exp(log_R))))
+
+def renyi2_entropy_sampled(vstate, subsystem_sites, n_samples, key=0, chunk_size=128, debug=False):
+    subsystem_sites = jnp.array(subsystem_sites, dtype=int)
+
+    all_samples = vstate.sample(n_samples=2 * n_samples).reshape(-1, vstate.hilbert.size)
+
+    rng = jax.random.PRNGKey(key)
+    all_samples = jax.random.permutation(rng, all_samples, axis=0)
+    samples1 = all_samples[:n_samples]
+    samples2 = all_samples[n_samples:]
+
+    all_sites = jnp.arange(samples1.shape[1])
+    complement_sites = jnp.setdiff1d(all_sites, subsystem_sites)
+    swapped1 = jnp.concatenate([samples2[:, subsystem_sites], samples1[:, complement_sites]], axis=1)
+    swapped2 = jnp.concatenate([samples1[:, subsystem_sites], samples2[:, complement_sites]], axis=1)
+
+    S2 = _renyi2_forward_jit(
+        vstate._apply_fun, vstate.parameters, vstate.model_state,
+        samples1, samples2, swapped1, swapped2,
+        chunk_size=chunk_size,
+    )
+
+    if debug:
+        print(f"S₂ = {float(S2):.6f}")
+
+    return S2
+
 @partial(jax.jit, static_argnames=("apply_fun",))
 def _renyi2_loss_and_grad(apply_fun, params, model_state,
                           samples1, samples2, swapped1, swapped2):
@@ -123,7 +179,6 @@ def _renyi2_loss_and_grad(apply_fun, params, model_state,
 
     grad_S2 = jax.grad(loss_fn)(params)
     return S2, grad_S2
-
 
 def renyi2_entropy_and_grad_sampled(vstate, subsystem_sites, n_samples, key=0, debug=False):
     """
@@ -476,20 +531,3 @@ def renyi2_entropy_and_grad_cv(vstate, subsystem_sites, n_samples, key=0, debug=
         print(f"|∇S₂| = {jnp.linalg.norm(grad_flat):.6f}")
 
     return S2, grad_S2
-
-def renyi2_entropy_sampled(vstate, partition, n_samples):
-    """
-    Estima S₂ (escalar) mediante muestreo Monte Carlo.
-
-    Parámetros
-    ----------
-    vstate    : MCState de NetKet.
-    partition : Índices de los sitios del subsistema A.
-    n_samples : Número de muestras por copia.
-
-    Devuelve
-    -------
-    S2 : Estimación escalar de la entropía de Rényi-2.
-    """
-    S2, _ = renyi2_entropy_and_grad_sampled(vstate, partition, n_samples)
-    return float(S2)

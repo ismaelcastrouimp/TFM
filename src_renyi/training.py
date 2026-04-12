@@ -92,11 +92,11 @@ def free_energy_minimize_SR_SGD(
     vstate.parameters = best_params
     jax.clear_caches()
 
-    vstate.chunk_size = 64
+    vstate.chunk_size = chunk_size
     E_best = float(vstate.expect(Hamiltonian).mean.real)
-    S2_best = renyi2_entropy_sampled(vstate, partition, n_samples_full)
-    best_F = E_best - T * S2_best
     vstate.chunk_size = None
+    S2_best = renyi2_entropy_sampled(vstate, partition, n_samples_full, chunk_size=chunk_size)
+    best_F = E_best - T * S2_best
 
     if plot:
         fig, ax = plt.subplots(figsize=(8, 4))
@@ -208,11 +208,12 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbos
     vstate.parameters = best_params
     jax.clear_caches()
 
-    vstate.chunk_size = 64
+    vstate.chunk_size = chunk_size
     E_best = float(vstate.expect(Hamiltonian).mean.real)
-    S2_best = renyi2_entropy_sampled(vstate, partition, n_samples_full)
-    best_F = E_best - T * S2_best
     vstate.chunk_size = None
+    S2_best = renyi2_entropy_sampled(vstate, partition, n_samples_full, chunk_size=chunk_size)
+    best_F = E_best - T * S2_best
+    
 
     if plot:
 
