@@ -109,7 +109,8 @@ def free_energy_minimize_SR_SGD(
     return free_energy_history, best_F, E_best, S2_best
 
 def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbose=True, freq=50,
-    plot=True, optimizer=None, learning_rate=None, clip_norm=None, timing=False, chunk_size=256):
+    plot=True, optimizer=None, learning_rate=None, clip_norm=None, timing=False, chunk_size=256,
+    sr=None, n_samples_sr=None):
     """
     Minimiza F = E - T·S₂ con optimizador general.
 
@@ -128,6 +129,8 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbos
     clip_norm    : float o None. Si no es None, aplica clip_by_global_norm.
     timing       : Si True, mide y muestra el tiempo real de cada step en los prints.
     chunk_size   : tamaño de los chunks para procesar FreeRenyiEnergyObservable.
+    sr           : nk.optimizer.SR
+    n_samples_sr : Muestras usadas en el paso de SR (< n_samples completo).
 
     Devuelve
     -------
@@ -155,13 +158,7 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbos
 
     opt_state = gradient_transform.init(vstate.parameters)
 
-    free_renyi_op = FreeRenyiEnergyObservable(
-        vstate.hilbert,
-        Hamiltonian,
-        partition,
-        T,
-        chunk_size
-    )
+    free_renyi_op = FreeRenyiEnergyObservable(vstate.hilbert, Hamiltonian, partition, T, chunk_size)
 
     n_samples_full = vstate.n_samples
 
@@ -175,6 +172,13 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbos
             t0 = time.time()
 
         F_stats, F_grad = vstate.expect_and_grad(free_renyi_op)
+
+        if sr is not None:
+            if n_samples_sr is not None:
+                vstate.n_samples = n_samples_sr
+            F_grad = sr(vstate, F_grad, step)
+            if n_samples_sr is not None:
+                vstate.n_samples = n_samples_full
 
         updates, opt_state = gradient_transform.update(F_grad, opt_state, vstate.parameters)
 
@@ -204,7 +208,6 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbos
                 )
 
     # --- restaurar mejores parámetros ---
-
     vstate.parameters = best_params
     jax.clear_caches()
 
@@ -216,19 +219,10 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbos
     
 
     if plot:
-
-        fig, ax = plt.subplots(
-            figsize=(8, 4)
-        )
-
-        ax.plot(
-            free_energy_history,
-            label=r"$F$",
-        )
-
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(free_energy_history, label=r"$F$")
         ax.set_xlabel("Step")
         ax.set_ylabel(r"$F$")
-
         plt.tight_layout()
         plt.show()
 
