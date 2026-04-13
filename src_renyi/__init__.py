@@ -3,6 +3,7 @@ from .observables import FreeRenyiEnergyObservable, expect_and_grad_free_renyi
 from .entropy import (
     vstate_to_vector,
     renyi2_entropy_exact,
+    renyi2_entropy_and_grad_exact,
     renyi2_entropy_sampled,
     renyi2_entropy_and_grad_sampled,
     renyi2_entropy_and_grad_sampled2,

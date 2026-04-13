@@ -88,6 +88,34 @@ def renyi2_entropy_exact(vstate, subsystem_sites):
 
     return S2, rho_A
 
+def renyi2_entropy_and_grad_exact(vstate, subsystem_sites, isFullSum=False):
+    """
+    Calcula el gradiente exacto de la entropía de Rényi-2 usando
+    diferenciación automática sobre la función que calcula S₂ exactamente.
+    
+    Args:
+        vstate: NetKet variational state
+        subsystem_sites: lista de sitios del subsistema A
+        
+    Returns:
+        S2: Entropía de Rényi-2
+        grad_S2: gradiente exacto (misma estructura que vstate.parameters)
+    """
+    
+    # Definir una función que solo depende de los parámetros
+    def S2_func(params):
+        # Crear un estado temporal con los parámetros dados
+        if isFullSum:
+            vstate_tmp = nk.vqs.FullSumState(hi_extended, vstate.model)
+        else:
+            vstate_tmp = nk.vqs.MCState(sampler=vstate.sampler,model=vstate.model,n_samples=vstate.n_samples,)
+        vstate_tmp.parameters = params
+        S2, _ = renyi2_entropy_exact(vstate_tmp, subsystem_sites)
+        return S2
+    
+    # Usar value_and_grad de JAX para obtener S₂ y su gradiente
+    S2, S2_grad = jax.value_and_grad(S2_func)(vstate.parameters)
+    return S2, S2_grad
 
 # ── Rényi-2 muestreado ────────────────────────────────────────────────────────
 
