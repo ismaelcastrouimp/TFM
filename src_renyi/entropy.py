@@ -4,6 +4,7 @@ from itertools import product
 import jax
 import jax.numpy as jnp
 import numpy as np
+import netket as nk
 
 
 # ── Utilidades ────────────────────────────────────────────────────────────────
@@ -88,7 +89,7 @@ def renyi2_entropy_exact(vstate, subsystem_sites):
 
     return S2, rho_A
 
-def renyi2_entropy_and_grad_exact(vstate, subsystem_sites, isFullSum=False):
+def renyi2_entropy_and_grad_exact(vstate, subsystem_sites, hi_extended, isFullSum=False):
     """
     Calcula el gradiente exacto de la entropía de Rényi-2 usando
     diferenciación automática sobre la función que calcula S₂ exactamente.
