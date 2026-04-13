@@ -21,6 +21,7 @@ dist/
 
 # Archivos generados
 output.png
+plots
 
 # IDE / sistema
 .vscode/
