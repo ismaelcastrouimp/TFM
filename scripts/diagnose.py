@@ -9,7 +9,7 @@ Calcula:
   - clip_norm recomendado a partir de las normas de gradiente
 
 Uso:
-    Edita la sección "CONFIGURACIÓN" y ejecuta:
+    Editar la sección "CONFIGURACIÓN" y ejecutar:
         python scripts/diagnose.py
 """
 
@@ -23,11 +23,10 @@ from netket.operator.spin import sigmax, sigmaz
 import optax
 
 from src_renyi.observables import FreeRenyiEnergyObservable
-from src_renyi.training import free_energy_minimize
 
-# ── CONFIGURACIÓN  ─────────────────────────────────────────────────
+# ── CONFIGURACIÓN  ────────────────────────────────────────────────────────────
 N         = 30
-N_SAMPLES = 2**19
+N_SAMPLES = 2**16
 GAMMA     = -1.5
 V         = -1.0
 T         = 1.0         # temperatura de diagnóstico
@@ -36,7 +35,7 @@ N_GRAD    = 20           # steps para medir normas de gradiente y clip_norm
 LR        = 0.05         # lr para el diagnóstico (no afecta a los resultados)
 # ──────────────────────────────────────────────────────────────────────────────
 
-# ── construir hilbert, hamiltoniano y vstate ───────────────────────────────────
+# ── construir hilbert, hamiltoniano y vstate ──────────────────────────────────
 hi_sys = nk.hilbert.Spin(s=1/2, N=N)
 hi_anc = nk.hilbert.Spin(s=1/2, N=N)
 hi = nk.hilbert.Spin(s=1/2, N=N+N)
@@ -45,9 +44,9 @@ H_extended = 0
 for i in range(N):
     H_sys+= GAMMA * sigmax(hi_sys, i)
     H_sys += V * sigmaz(hi_sys, i) @ sigmaz(hi_sys, (i + 1) % N)
-for i in range(N):
     H_extended += GAMMA * sigmax(hi, i)
     H_extended += V * sigmaz(hi, i) @ sigmaz(hi, (i + 1) % N)
+
 
 model = nk.models.ARNNDense(hilbert=hi, layers=1, features=16, activation=jax.nn.gelu)
 sampler = nk.sampler.ARDirectSampler(hi)
@@ -93,7 +92,7 @@ if chunk_size is None:
 print("\n── 2. Tiempo por step ────────────────────────────────────")
 
 op_time   = FreeRenyiEnergyObservable(hi, H_extended, partition, T, chunk_size=chunk_size)
-optimizer = optax.sgd(LR)
+optimizer = optax.adam(LR)
 opt_state = optimizer.init(vstate.parameters)
 params_bak = copy.deepcopy(vstate.parameters)
 
@@ -126,7 +125,7 @@ vstate.parameters = params_bak
 print("\n── 3. Normas de gradiente y clip_norm ───────────────────")
 
 op_clip   = FreeRenyiEnergyObservable(hi, H_extended, partition, T, chunk_size=chunk_size)
-optimizer2 = optax.sgd(LR)
+optimizer2 = optax.adam(LR)
 opt_state2 = optimizer2.init(vstate.parameters)
 
 grad_norms = []
