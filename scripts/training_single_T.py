@@ -22,6 +22,7 @@ V          = -1.0
 T          = 1.9
 N_STEPS    = 300
 chunk_size = N_SAMPLES//2
+clip_norm  = None
 lr         = optax.linear_schedule(0.05, 0.001, N_STEPS)
 optimizer  = optax.sign_sgd(lr)
 # ───────────────────────────────────────────────────────────────────────────────
@@ -50,6 +51,6 @@ partition = list(range(N))
 # ── ENTRENAMIENTO  ─────────────────────────────────────────────────────────────
 _,f_best,E_best,S_best = free_energy_minimize(vstate, T, partition, H_extended, N_STEPS, freq=20,
                                                optimizer=optimizer, clip_norm=None, timing=True,
-                                               chunk_size=vstate.n_samples//16)
+                                               chunk_size=vstate.n_samples//16, clip_norm=clip_norm)
 
 print(f"Best solution: S₂={S_best:.6f}, E={E_best:.6f}, F={f_best:.6f}")
