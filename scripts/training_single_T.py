@@ -4,31 +4,14 @@ training_single_T.py
 Entrenamiento NQS a temperatura T para minimizar <H>-TS₂.
 
 Uso:
-    Editae la sección "CONFIGURACIÓN" y ejecutar:
+    Editar la sección "CONFIGURACIÓN" y ejecutar:
         python scripts/training_single_T.py
 """
 
-import os
-import sys
-os.environ["JAX_PLATFORM_NAME"] = "gpu"
-
 import jax
-import jax.numpy as jnp
-import flax.linen as nn
 import netket as nk
 from netket.operator.spin import sigmax, sigmaz
 import optax
-import numpy as np
-import matplotlib.pyplot as plt
-import json
-import flax.serialization as serialization
-from tqdm import tqdm
-
-import importlib
-try:
-    importlib.reload(sys.modules["src_renyi"])
-except KeyError: 
-    pass
 from src_renyi import free_energy_minimize
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
