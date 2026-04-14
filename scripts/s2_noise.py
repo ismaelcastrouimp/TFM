@@ -45,7 +45,7 @@ from src_renyi.entropy import (
 from src_renyi.training import free_energy_minimize
 
 # ── directorios ────────────────────────────────────────────────────────────────
-PLOTS_DIR = os.path.join(os.path.dirname(__file__), "..", "plots")
+PLOTS_DIR = os.path.join(os.path.dirname(__file__), "..", "plots/S2_noise")
 os.makedirs(PLOTS_DIR, exist_ok=True)
 
 
@@ -68,14 +68,13 @@ def cosine_similarity(g1, g2):
 
 
 # ── configuración ──────────────────────────────────────────────────────────────
-N              = 5
+N              = 6
 GAMMA          = -1.5
 V              = -1.0
-TEMPS          = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0]
-n_rep          = 20
-chunk_size     = 128
-n_samples_diag = 4096
-N_SAMPLES_LIST = [256, 512, 1024, 2048, 4096, 8192]
+TEMPS          = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0]
+n_rep          = 50
+n_samples_diag = 16384
+N_SAMPLES_LIST = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
 
 subsystem = list(range(N))
 partition = subsystem
@@ -85,15 +84,13 @@ partition = subsystem
 hi_sys = nk.hilbert.Spin(s=1/2, N=N)
 hi_anc = nk.hilbert.Spin(s=1/2, N=N)
 hi = nk.hilbert.Spin(s=1/2, N=N+N)
-Gamma = -1.5  
-V = -1
 H_sys=0
 H_extended = 0
 for i in range(N):
-    H_sys+= Gamma * sigmax(hi_sys, i)
+    H_sys+= GAMMA * sigmax(hi_sys, i)
     H_sys += V * sigmaz(hi_sys, i) @ sigmaz(hi_sys, (i + 1) % N)
 for i in range(N):
-    H_extended += Gamma * sigmax(hi, i)
+    H_extended += GAMMA * sigmax(hi, i)
     H_extended += V * sigmaz(hi, i) @ sigmaz(hi, (i + 1) % N)
 
 model = nk.models.ARNNDense(hilbert=hi, layers=1, features=16, activation=jax.nn.gelu)
@@ -116,7 +113,6 @@ for i, T in enumerate(TEMPS):
     free_energy_minimize(
         vstate, T, partition, H_extended, n_steps=400,
         optimizer=optax.sgd(lr),
-        chunk_size=chunk_size,
         plot=False, verbose=False,
     )
     trained_vstates[T] = vstate
@@ -152,7 +148,7 @@ for T, vstate in trained_vstates.items():
         cos_sw.append(cosine_similarity(grad_est, grad_ex))
 
         S2_est, grad_est = renyi2_entropy_and_grad_lambda_integral(
-            vstate, subsystem, n_samples_diag, n_lambda=30
+            vstate, subsystem, n_samples_diag, n_lambda=50
         )
         s2_ti.append(float(S2_est))
         cos_ti.append(cosine_similarity(grad_est, grad_ex))
@@ -217,7 +213,6 @@ for label, T in [("baja", TEMPS[0]), ("alta", TEMPS[-1])]:
     cos_sw_ns, cos_ti_ns = [], []
 
     for ns in N_SAMPLES_LIST:
-        cs = min(chunk_size, ns // 2)
         s2_sw, cos_sw = [], []
         s2_ti, cos_ti = [], []
 
@@ -229,7 +224,7 @@ for label, T in [("baja", TEMPS[0]), ("alta", TEMPS[-1])]:
             cos_sw.append(cosine_similarity(grad_est, grad_ex))
 
             S2_est, grad_est = renyi2_entropy_and_grad_lambda_integral(
-                vstate, subsystem, ns, n_lambda=30
+                vstate, subsystem, ns, n_lambda=50
             )
             s2_ti.append(float(S2_est))
             cos_ti.append(cosine_similarity(grad_est, grad_ex))
