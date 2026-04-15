@@ -27,7 +27,7 @@ N_SAMPLES  = 2**18
 GAMMA      = -1.5
 V          = -1.0
 T_array    = np.linspace(0, 4, 41)
-N_STEPS    = 330
+N_STEPS    = 300
 chunk_size = N_SAMPLES//8
 clip_norm  = None
 lr         = optax.linear_schedule(0.05, 0.001, N_STEPS)
@@ -93,6 +93,15 @@ for T_idx, T in enumerate(tqdm(T_array, desc="Temperaturas")):
 
     print(f"  Mejor resultado: E={best_energy:.4f}, S₂={best_entropy:.4f}, F={best_F:.4f}")
 
+results_file = os.path.join(data_dir, f"results_N{N}_vs_T.txt")
+data = {
+    "T": [float(T) for T in T_array],
+    "energy": [float(x) for x in energy_results],
+    "entropy": [float(x) for x in entropy_results],
+    "free_energy": [float(x) for x in free_energy_results],
+}
+with open(results_file, "w") as f:
+    json.dump(data, f, indent=2)
 # ───────────────────────────────────────────────────────────────────────────────
 
 
@@ -113,13 +122,3 @@ plt.xlabel('T'); plt.ylabel('F'); plt.title('Energía Libre vs Temperatura'); pl
 
 plt.tight_layout()
 plt.show()
-
-results_file = os.path.join(data_dir, f"results_N{N}_vs_T.txt")
-data = {
-    "T": [float(T) for T in T_array],
-    "energy": [float(x) for x in energy_results],
-    "entropy": [float(x) for x in entropy_results],
-    "free_energy": [float(x) for x in free_energy_results],
-}
-with open(results_file, "w") as f:
-    json.dump(data, f, indent=2)
