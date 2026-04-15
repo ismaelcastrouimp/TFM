@@ -22,8 +22,8 @@ from tqdm import tqdm
 from src_renyi import free_energy_minimize
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
-N          = 30
-N_SAMPLES  = 2**18
+N          = 50
+N_SAMPLES  = 2**15
 GAMMA      = -1.5
 V          = -1.0
 T_array    = np.linspace(0, 4, 41)
