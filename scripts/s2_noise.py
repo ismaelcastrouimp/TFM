@@ -148,7 +148,7 @@ for T, vstate in trained_vstates.items():
         cos_sw.append(cosine_similarity(grad_est, grad_ex))
 
         S2_est, grad_est = renyi2_entropy_and_grad_lambda_integral(
-            vstate, subsystem, n_samples_diag, n_lambda=50
+            vstate, subsystem, n_samples_diag, n_lambda=60
         )
         s2_ti.append(float(S2_est))
         cos_ti.append(cosine_similarity(grad_est, grad_ex))
@@ -191,7 +191,6 @@ ax.plot(S2_arr, cos_ti_mean, 's-', label='TI')
 ax.axhline(1.0, color='k', linestyle='--', alpha=0.3)
 ax.set_xlabel(r'$S_2$ (exacto)')
 ax.set_ylabel(r'$\cos(\nabla S_2^\mathrm{est},\, \nabla S_2^\mathrm{ex})$')
-ax.set_ylim(-0.1, 1.05)
 ax.legend()
 ax.set_title(r"Calidad del gradiente vs entropia")
 fig.tight_layout()
@@ -224,7 +223,7 @@ for label, T in [("baja", TEMPS[0]), ("alta", TEMPS[-1])]:
             cos_sw.append(cosine_similarity(grad_est, grad_ex))
 
             S2_est, grad_est = renyi2_entropy_and_grad_lambda_integral(
-                vstate, subsystem, ns, n_lambda=50
+                vstate, subsystem, ns, n_lambda=60
             )
             s2_ti.append(float(S2_est))
             cos_ti.append(cosine_similarity(grad_est, grad_ex))
