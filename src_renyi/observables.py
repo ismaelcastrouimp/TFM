@@ -111,18 +111,27 @@ def expect_and_grad_free_renyi(vstate, op, chunk_size, **kwargs):
     swapped1 = jnp.concatenate([samples2[:, subsystem_sites], samples1[:, complement_sites]], axis=1)
     swapped2 = jnp.concatenate([samples1[:, subsystem_sites], samples2[:, complement_sites]], axis=1)
 
-    # E_loc fuera del JIT principal para no materializar sigma_p en el grafo
-    sigma_p, mels = op.H.get_conn_padded(samples1)
-    E_loc = _compute_E_loc_jit(
-        vstate._apply_fun, vstate.parameters, vstate.model_state,
-        samples1, sigma_p, mels, op.chunk_size
-    )
+    cs = op.chunk_size
+    n_chunks = n // cs
+
+    # E_loc chunkeado — get_conn_padded solo sobre cs muestras a la vez
+    def compute_E_loc_chunk(samples1_chunk):
+        sigma_p_chunk, mels_chunk = op.H.get_conn_padded(samples1_chunk)
+        return _compute_E_loc_jit(
+            vstate._apply_fun, vstate.parameters, vstate.model_state,
+            samples1_chunk, sigma_p_chunk, mels_chunk, chunk_size=cs,
+        )
+
+    E_loc = jnp.concatenate([
+        compute_E_loc_chunk(samples1[i*cs:(i+1)*cs])
+        for i in range(n_chunks)
+    ])
     E_loc_sg = jax.lax.stop_gradient(E_loc)
 
     E_mean, S2, grad_F = _free_renyi_grad_jit(
         vstate._apply_fun, vstate.parameters, vstate.model_state,
         samples1, samples2, E_loc_sg,
-        swapped1, swapped2, op.T, op.chunk_size
+        swapped1, swapped2, op.T, op.chunk_size,
     )
 
     F = float(E_mean) - op.T * float(S2)
