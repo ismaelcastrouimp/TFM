@@ -14,7 +14,6 @@ Métricas:
   - Error absoluto en S₂
   - Coseno entre gradiente estimado y exacto
   - Evolución con n_samples (para S₂ baja y alta)
-  - Crecimiento exponencial del error con S₂  (N_eff ≈ N · e^{-S₂})
 
 Gráficas guardadas en ../plots/ en formato .pgf
 """
@@ -27,6 +26,7 @@ import jax.numpy as jnp
 import netket as nk
 from netket.operator.spin import sigmax, sigmaz
 import optax
+from scipy.optimize import curve_fit
 import matplotlib
 matplotlib.use("pgf")
 matplotlib.rcParams.update({
@@ -108,12 +108,13 @@ params_prev     = None
 
 for i, T in enumerate(TEMPS):
     vstate = copy.deepcopy(vstate_ref)
-    lr = optax.linear_schedule(0.05, 0.001, 400)
+    lr = optax.linear_schedule(0.05, 0.001, 300)
     print(f"\n  T={T:.2f}")
     free_energy_minimize(
-        vstate, T, partition, H_extended, n_steps=400,
+        vstate, T, partition, H_extended, n_steps=300,
         optimizer=optax.sgd(lr),
         plot=False, verbose=False,
+        chunk_size=vstate.n_samples//2
     )
     trained_vstates[T] = vstate
     params_prev        = copy.deepcopy(vstate.parameters)
@@ -161,43 +162,92 @@ for T, vstate in trained_vstates.items():
     print(f"    swap  |ΔS₂|={err_swap_list[-1].mean():.4f}  cos={np.mean(cos_sw):.4f}")
     print(f"    TI    |ΔS₂|={err_ti_list[-1].mean():.4f}  cos={np.mean(cos_ti):.4f}")
 
+
 S2_arr      = np.array(S2_exact_list)
 err_sw_mean = np.array([e.mean() for e in err_swap_list])
-err_sw_std  = np.array([e.std()  for e in err_swap_list])
 err_ti_mean = np.array([e.mean() for e in err_ti_list])
-err_ti_std  = np.array([e.std()  for e in err_ti_list])
 cos_sw_mean = np.array([c.mean() for c in cos_swap_list])
 cos_ti_mean = np.array([c.mean() for c in cos_ti_list])
 
-fig, ax = plt.subplots(figsize=(5, 3.5))
-ax.errorbar(S2_arr, err_sw_mean, yerr=err_sw_std,
-            marker='o', capsize=3, label='Swap trick')
-ax.errorbar(S2_arr, err_ti_mean, yerr=err_ti_std,
-            marker='s', capsize=3, label='TI')
+# Percentiles para barras asimétricas robustas
+def percentile_bands(err_list):
+    p25 = np.array([np.percentile(e, 25) for e in err_list])
+    p75 = np.array([np.percentile(e, 75) for e in err_list])
+    return p25, p75
+
+sw_p25, sw_p75 = percentile_bands(err_swap_list)
+ti_p25, ti_p75 = percentile_bands(err_ti_list)
+
+# Error relativo
+rel_sw_mean = err_sw_mean / S2_arr
+rel_ti_mean = err_ti_mean / S2_arr
+rel_sw_p25  = sw_p25 / S2_arr
+rel_sw_p75  = sw_p75 / S2_arr
+rel_ti_p25  = ti_p25 / S2_arr
+rel_ti_p75  = ti_p75 / S2_arr
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.5))
+
+# Panel izquierdo: error absoluto con bandas de percentiles
+ax = axes[0]
+ax.plot(S2_arr, err_sw_mean, 'o-', color='C0', label='Swap trick')
+ax.fill_between(S2_arr, sw_p25, sw_p75, alpha=0.25, color='C0')
+ax.plot(S2_arr, err_ti_mean, 's-', color='C1', label='TI')
+ax.fill_between(S2_arr, ti_p25, ti_p75, alpha=0.25, color='C1')
+# Referencia teórica corregida: std ~ e^{S2/2} / sqrt(N_samp)
 S2_ref = np.linspace(S2_arr.min(), S2_arr.max(), 100)
-ax.plot(S2_ref, np.exp(S2_ref) / n_samples_diag, 'k--',
-        label=r'$e^{S_2}/N_\mathrm{samp}$')
+ax.plot(S2_ref, np.exp(S2_ref / 2) / np.sqrt(n_samples_diag), 'k--',
+        label=r'$e^{S_2/2}/\sqrt{N_\mathrm{samp}}$')
 ax.set_xlabel(r'$S_2$ (exacto)')
 ax.set_ylabel(r'$|\Delta S_2|$')
 ax.set_yscale('log')
 ax.legend()
-ax.set_title(r"Error en $S_2$ vs entropia")
+ax.set_title(r'Error absoluto en $S_2$')
+
+# Panel derecho: error relativo (sin escala log, más legible)
+ax = axes[1]
+ax.plot(S2_arr, rel_sw_mean, 'o-', color='C0', label='Swap trick')
+ax.fill_between(S2_arr, rel_sw_p25, rel_sw_p75, alpha=0.25, color='C0')
+ax.plot(S2_arr, rel_ti_mean, 's-', color='C1', label='TI')
+ax.fill_between(S2_arr, rel_ti_p25, rel_ti_p75, alpha=0.25, color='C1')
+ax.set_xlabel(r'$S_2$ (exacto)')
+ax.set_ylabel(r'$|\Delta S_2| / S_2$')
+ax.set_title(r'Error relativo en $S_2$')
+ax.legend()
+
 fig.tight_layout()
 save_fig(fig, "s2_error_vs_entropy")
 
 fig, ax = plt.subplots(figsize=(5, 3.5))
-ax.plot(S2_arr, cos_sw_mean, 'o-', label='Swap trick')
-ax.plot(S2_arr, cos_ti_mean, 's-', label='TI')
+
+# Calcular std
+cos_sw_std = np.array([c.std() for c in cos_swap_list])
+cos_ti_std = np.array([c.std() for c in cos_ti_list])
+
+# Graficar con bandas de ±1σ
+ax.plot(S2_arr, cos_sw_mean, 'o-', color='C0', label='Swap trick')
+ax.fill_between(S2_arr, cos_sw_mean - cos_sw_std, cos_sw_mean + cos_sw_std, 
+                alpha=0.2, color='C0')
+
+ax.plot(S2_arr, cos_ti_mean, 's-', color='C1', label='TI')
+ax.fill_between(S2_arr, cos_ti_mean - cos_ti_std, cos_ti_mean + cos_ti_std, 
+                alpha=0.2, color='C1')
+
 ax.axhline(1.0, color='k', linestyle='--', alpha=0.3)
+
 ax.set_xlabel(r'$S_2$ (exacto)')
-ax.set_ylabel(r'$\cos(\nabla S_2^\mathrm{est},\, \nabla S_2^\mathrm{ex})$')
+ax.set_ylabel(r'$\langle \cos(\nabla S_2^\mathrm{est}, \nabla S_2^\mathrm{ex}) \rangle$')
 ax.legend()
-ax.set_title(r"Calidad del gradiente vs entropia")
+ax.set_title(r"Calidad del gradiente vs entropía")
+ax.grid(True, alpha=0.3)
+
 fig.tight_layout()
 save_fig(fig, "grad_cosine_vs_entropy")
 
 
 # ── 2. error vs n_samples  (S₂ baja y alta) ───────────────────────────────────
+from scipy.optimize import curve_fit
+
 print("\n" + "=" * 60)
 print("2. Error vs n_samples")
 print("=" * 60)
@@ -208,7 +258,7 @@ for label, T in [("baja", TEMPS[0]), ("alta", TEMPS[-1])]:
     S2_ex = float(S2_ex)
     print(f"\n  S2 {label}  (T={T})  S2={S2_ex:.4f}")
 
-    err_sw_ns, err_ti_ns = [], []
+    s2_sw_all, s2_ti_all = [], []
     cos_sw_ns, cos_ti_ns = [], []
 
     for ns in N_SAMPLES_LIST:
@@ -228,39 +278,49 @@ for label, T in [("baja", TEMPS[0]), ("alta", TEMPS[-1])]:
             s2_ti.append(float(S2_est))
             cos_ti.append(cosine_similarity(grad_est, grad_ex))
 
-        err_sw_ns.append((np.abs(np.array(s2_sw) - S2_ex).mean(),
-                          np.abs(np.array(s2_sw) - S2_ex).std()))
-        err_ti_ns.append((np.abs(np.array(s2_ti) - S2_ex).mean(),
-                          np.abs(np.array(s2_ti) - S2_ex).std()))
+        s2_sw_all.append(s2_sw)
+        s2_ti_all.append(s2_ti)
         cos_sw_ns.append(np.mean(cos_sw))
         cos_ti_ns.append(np.mean(cos_ti))
-        print(f"    n={ns:5d}  swap |DS2|={err_sw_ns[-1][0]:.4f}"
-              f"  TI |DS2|={err_ti_ns[-1][0]:.4f}")
 
-    err_sw_m = np.array([e[0] for e in err_sw_ns])
-    err_sw_s = np.array([e[1] for e in err_sw_ns])
-    err_ti_m = np.array([e[0] for e in err_ti_ns])
-    err_ti_s = np.array([e[1] for e in err_ti_ns])
-    ns_arr   = np.array(N_SAMPLES_LIST)
-    Neff_ref = ns_arr * np.exp(-S2_ex)
+        sw_mean = np.abs(np.array(s2_sw) - S2_ex).mean()
+        ti_mean = np.abs(np.array(s2_ti) - S2_ex).mean()
+        print(f"    n={ns:5d}  swap |DS2|={sw_mean:.4f}  TI |DS2|={ti_mean:.4f}")
 
-    fig, axes = plt.subplots(1, 2, figsize=(9, 3.5))
-    for ax, (err_m, err_s, lbl) in zip(axes, [
-        (err_sw_m, err_sw_s, 'Swap trick'),
-        (err_ti_m, err_ti_s, 'TI'),
-    ]):
-        ax.errorbar(ns_arr, err_m, yerr=err_s, marker='o', capsize=3, label=lbl)
-        ax.plot(ns_arr, 1.0 / np.sqrt(Neff_ref), 'k--',
-                label=r'$1/\sqrt{N_\mathrm{eff}}$')
-        ax.set_xscale('log')
-        ax.set_yscale('log')
-        ax.set_xlabel(r'$N_\mathrm{samples}$')
-        ax.set_ylabel(r'$|\Delta S_2|$')
-        ax.set_title(f'{lbl}  --  $S_2$ {label}')
-        ax.legend()
+    ns_arr   = np.array(N_SAMPLES_LIST, dtype=float)
+    err_sw_m = np.array([np.abs(np.array(s) - S2_ex).mean() for s in s2_sw_all])
+    err_ti_m = np.array([np.abs(np.array(s) - S2_ex).mean() for s in s2_ti_all])
+    sw_p25   = np.array([np.percentile(np.abs(np.array(s) - S2_ex), 25) for s in s2_sw_all])
+    sw_p75   = np.array([np.percentile(np.abs(np.array(s) - S2_ex), 75) for s in s2_sw_all])
+    ti_p25   = np.array([np.percentile(np.abs(np.array(s) - S2_ex), 25) for s in s2_ti_all])
+    ti_p75   = np.array([np.percentile(np.abs(np.array(s) - S2_ex), 75) for s in s2_ti_all])
+
+    # fit α / √N para cada método
+    def inv_sqrt(n, alpha):
+        return alpha / np.sqrt(n)
+
+    alpha_sw, _ = curve_fit(inv_sqrt, ns_arr, err_sw_m, p0=[1.0])
+    alpha_ti, _ = curve_fit(inv_sqrt, ns_arr, err_ti_m, p0=[1.0])
+    ns_fit = np.geomspace(ns_arr.min(), ns_arr.max(), 200)
+
+    # ── plot error absoluto ────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(5, 3.5))
+    ax.loglog(ns_arr, err_sw_m, 'o-', color='C0', label='Swap trick')
+    ax.fill_between(ns_arr, sw_p25, sw_p75, alpha=0.25, color='C0')
+    ax.loglog(ns_arr, err_ti_m, 's-', color='C1', label='TI')
+    ax.fill_between(ns_arr, ti_p25, ti_p75, alpha=0.25, color='C1')
+    ax.loglog(ns_fit, inv_sqrt(ns_fit, alpha_sw), '--', color='C0',
+              label=rf'$\alpha_\mathrm{{sw}}/\sqrt{{N}}$, $\alpha={alpha_sw[0]:.3f}$')
+    ax.loglog(ns_fit, inv_sqrt(ns_fit, alpha_ti), '--', color='C1',
+              label=rf'$\alpha_\mathrm{{TI}}/\sqrt{{N}}$, $\alpha={alpha_ti[0]:.3f}$')
+    ax.set_xlabel(r'$N_\mathrm{samples}$')
+    ax.set_ylabel(r'$|\Delta S_2|$')
+    ax.set_title(fr'Error absoluto — $S_2$ {label} ($S_2={S2_ex:.2f}$)')
+    ax.legend(fontsize=7)
     fig.tight_layout()
     save_fig(fig, f"s2_error_vs_nsamples_{label}")
 
+    # ── plot coseno (sin cambios) ──────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(5, 3.5))
     ax.semilogx(ns_arr, cos_sw_ns, 'o-', label='Swap trick')
     ax.semilogx(ns_arr, cos_ti_ns, 's-', label='TI')
@@ -271,46 +331,5 @@ for label, T in [("baja", TEMPS[0]), ("alta", TEMPS[-1])]:
     ax.legend()
     fig.tight_layout()
     save_fig(fig, f"grad_cosine_vs_nsamples_{label}")
-
-
-# ── 3. colapso exponencial de N_eff con S₂ ────────────────────────────────────
-print("\n" + "=" * 60)
-print("3. N_eff vs S2")
-print("=" * 60)
-
-Neff_data = []
-
-for T, vstate in trained_vstates.items():
-    S2_ex, _ = renyi2_entropy_and_grad_exact(vstate, subsystem, hi)
-    S2_ex    = float(S2_ex)
-
-    s2_vals = []
-    for rep in range(n_rep * 2):
-        S2_est, _ = renyi2_entropy_and_grad_sampled(
-            vstate, subsystem, n_samples_diag
-        )
-        s2_vals.append(float(S2_est))
-
-    var      = np.var(s2_vals)
-    Neff_emp = 1.0 / (var + 1e-30)
-    Neff_th  = n_samples_diag * np.exp(-S2_ex)
-    Neff_data.append((S2_ex, Neff_emp, Neff_th))
-    print(f"  T={T:.2f}  S2={S2_ex:.3f}"
-          f"  N_eff empirico={Neff_emp:.1f}  teorico={Neff_th:.1f}")
-
-S2_neff  = np.array([x[0] for x in Neff_data])
-Neff_emp = np.array([x[1] for x in Neff_data])
-Neff_th  = np.array([x[2] for x in Neff_data])
-
-fig, ax = plt.subplots(figsize=(5, 3.5))
-ax.semilogy(S2_neff, Neff_emp, 'o-', label=r'$N_\mathrm{eff}$ empirico')
-ax.semilogy(S2_neff, Neff_th,  'k--',
-            label=r'$N_\mathrm{samp} \cdot e^{-S_2}$')
-ax.set_xlabel(r'$S_2$')
-ax.set_ylabel(r'$N_\mathrm{eff}$')
-ax.set_title(r'Colapso exponencial de $N_\mathrm{eff}$')
-ax.legend()
-fig.tight_layout()
-save_fig(fig, "neff_vs_s2")
 
 print("\nDone. Graficas guardadas en", os.path.abspath(PLOTS_DIR))
