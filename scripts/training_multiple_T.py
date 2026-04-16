@@ -23,12 +23,12 @@ from src_renyi import free_energy_minimize
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
 N          = 50
-N_SAMPLES  = 2**15
+N_SAMPLES  = 2**16
 GAMMA      = -1.5
 V          = -1.0
 T_array    = np.linspace(0, 4, 41)
 N_STEPS    = 300
-chunk_size = N_SAMPLES//8
+chunk_size = N_SAMPLES//4
 clip_norm  = None
 lr         = optax.linear_schedule(0.05, 0.001, N_STEPS)
 optimizer  = optax.sign_sgd(lr)
