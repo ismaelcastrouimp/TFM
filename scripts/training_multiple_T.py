@@ -4,12 +4,13 @@ training_multiple_T.py
 Entrenamiento NQS en array de temperaturas para minimizar <H>-TS₂.
 
 Uso:
-    Editae la sección "CONFIGURACIÓN" y ejecutar:
+    Editar la sección "CONFIGURACIÓN" y ejecutar:
         python scripts/training_single_T.py
 """
 
 import os
 import jax
+import jax.numpy as jnp
 import netket as nk
 from netket.operator.spin import sigmax, sigmaz
 import optax
@@ -19,19 +20,21 @@ import json
 import flax.serialization as serialization
 from tqdm import tqdm
 
-from src_renyi import free_energy_minimize
+from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
-N          = 50
+N          = 15
 N_SAMPLES  = 2**16
 GAMMA      = -1.5
 V          = -1.0
 T_array    = np.linspace(0, 4, 41)
 N_STEPS    = 300
-chunk_size = N_SAMPLES//4
+chunk_size = N_SAMPLES//2
 clip_norm  = None
 lr         = optax.linear_schedule(0.05, 0.001, N_STEPS)
 optimizer  = optax.sign_sgd(lr)
+
+N_REP_COSINE = 10
 # ───────────────────────────────────────────────────────────────────────────────
 
 
@@ -54,11 +57,22 @@ vstate  = nk.vqs.MCState(sampler, model, n_samples=N_SAMPLES)
 partition = list(range(N))
 # ───────────────────────────────────────────────────────────────────────────────
 
+# ── funciones auxiliares ───────────────────────────────────────────────────────
+def cosine_similarity(g1, g2):
+    """Calcula el coseno entre dos gradientes (pytrees)."""
+    flat1, _ = jax.flatten_util.ravel_pytree(g1)
+    flat2, _ = jax.flatten_util.ravel_pytree(g2)
+    flat1 = jnp.array(flat1, float)
+    flat2 = jnp.array(flat2, float)
+    return float(jnp.dot(flat1, flat2) /
+                 (jnp.linalg.norm(flat1) * jnp.linalg.norm(flat2) + 1e-30))
+# ───────────────────────────────────────────────────────────────────────────────
 
 # ── ENTRENAMIENTO  ─────────────────────────────────────────────────────────────
 energy_results = []
 entropy_results = []
 free_energy_results = []
+reliability_results = []
 all_histories = []
 best_params = None
 
@@ -93,12 +107,37 @@ for T_idx, T in enumerate(tqdm(T_array, desc="Temperaturas")):
 
     print(f"  Mejor resultado: E={best_energy:.4f}, S₂={best_entropy:.4f}, F={best_F:.4f}")
 
+    # ── EVALUACIÓN DE FIABILIDAD (coseno entre réplicas del gradiente) ──
+    grads = []
+    for rep in range(N_REP_COSINE):
+        _, grad_est = renyi2_entropy_and_grad_sampled(
+            vstate, partition, N_SAMPLES
+        )
+        grads.append(grad_est)
+    
+    # Calcular coseno medio entre todos los pares de réplicas
+    cos_vals = []
+    for i in range(N_REP_COSINE):
+        for j in range(i+1, N_REP_COSINE):
+            cos_vals.append(cosine_similarity(grads[i], grads[j]))
+    
+    cos_mean = np.mean(cos_vals)
+    cos_std = np.std(cos_vals)
+    
+    reliability_results.append({
+        "cos_mean": float(cos_mean),
+        "cos_std": float(cos_std),
+    })
+    
+    print(f"  Consistencia del gradiente: cos = {cos_mean:.4f} ± {cos_std:.4f}")
+
 results_file = os.path.join(data_dir, f"results_N{N}_vs_T.txt")
 data = {
     "T": [float(T) for T in T_array],
     "energy": [float(x) for x in energy_results],
     "entropy": [float(x) for x in entropy_results],
     "free_energy": [float(x) for x in free_energy_results],
+    "reliability": reliability_results,
 }
 with open(results_file, "w") as f:
     json.dump(data, f, indent=2)
