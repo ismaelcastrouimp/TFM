@@ -19,9 +19,6 @@ dist/
 # Jupyter
 .ipynb_checkpoints/
 
-# Archivos generados
-output.png
-plots
 
 # IDE / sistema
 .vscode/
