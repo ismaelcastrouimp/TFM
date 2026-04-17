@@ -23,13 +23,13 @@ from tqdm import tqdm
 from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
-N          = 15
+N          = 50
 N_SAMPLES  = 2**16
 GAMMA      = -1.5
 V          = -1.0
 T_array    = np.linspace(0, 4, 41)
 N_STEPS    = 300
-chunk_size = N_SAMPLES//2
+chunk_size = N_SAMPLES//4
 clip_norm  = None
 lr         = optax.linear_schedule(0.05, 0.001, N_STEPS)
 optimizer  = optax.sign_sgd(lr)
@@ -111,7 +111,7 @@ for T_idx, T in enumerate(tqdm(T_array, desc="Temperaturas")):
     grads = []
     for rep in range(N_REP_COSINE):
         _, grad_est = renyi2_entropy_and_grad_sampled(
-            vstate, partition, N_SAMPLES
+            vstate, partition, N_SAMPLES, chunk_size=chunk_size
         )
         grads.append(grad_est)
     

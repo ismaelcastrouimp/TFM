@@ -176,40 +176,67 @@ def renyi2_entropy_sampled(vstate, subsystem_sites, n_samples, key=0, chunk_size
 
     return S2
 
-@partial(jax.jit, static_argnames=("apply_fun",))
+@partial(jax.jit, static_argnames=("apply_fun", "chunk_size"))
 def _renyi2_loss_and_grad(apply_fun, params, model_state,
-                          samples1, samples2, swapped1, swapped2):
-    """
-    Calcula S₂ y grad S₂ usando backprop.
-    Memoria O(n_params) en vez de O(n_samples × n_params).
-    """
+                          samples1, samples2, swapped1, swapped2,
+                          chunk_size=256):
     def log_psi(p, s):
         return apply_fun({"params": p, **model_state}, s)
 
-    log_o1 = log_psi(params, samples1)
-    log_o2 = log_psi(params, samples2)
-    log_s1 = log_psi(params, swapped1)
-    log_s2 = log_psi(params, swapped2)
-    R = jnp.exp(jnp.real(log_s1 + log_s2 - log_o1 - log_o2))
-    S2 = -jnp.log(jnp.abs(jnp.mean(R)))
+    n = samples1.shape[0]
+    n_chunks = n // chunk_size
 
+    def reshape(x):
+        return x.reshape(n_chunks, chunk_size, *x.shape[1:])
+
+    s1_c, s2_c, sw1_c, sw2_c = map(reshape, (samples1, samples2, swapped1, swapped2))
+
+    # ── forward: log_R sin backprop ───────────────────────────────────────────
+    def forward_chunk(bs1, bs2, bsw1, bsw2):
+        def single(s1, s2, sw1, sw2):
+            lo1 = log_psi(params, s1[None])[0]
+            lo2 = log_psi(params, s2[None])[0]
+            ls1 = log_psi(params, sw1[None])[0]
+            ls2 = log_psi(params, sw2[None])[0]
+            return jnp.real(ls1 + ls2 - lo1 - lo2)
+        return jax.vmap(single)(bs1, bs2, bsw1, bsw2)
+
+    log_R = jax.lax.map(
+        lambda x: forward_chunk(*x), (s1_c, s2_c, sw1_c, sw2_c)
+    ).reshape(n)
+    log_R = jax.lax.stop_gradient(log_R)
+
+    R_mean = jax.lax.stop_gradient(jnp.mean(jnp.exp(log_R)))
+    S2 = -jnp.log(jnp.abs(R_mean))
+
+    # ── backward: gradiente chunkeado ─────────────────────────────────────────
     def loss_fn(p):
-        lo1 = log_psi(p, samples1)
-        lo2 = log_psi(p, samples2)
-        ls1 = log_psi(p, swapped1)
-        ls2 = log_psi(p, swapped2)
-        R_ = jnp.exp(jnp.real(ls1 + ls2 - lo1 - lo2))
-        R_mean = jax.lax.stop_gradient(jnp.mean(R_))
-        w = jax.lax.stop_gradient(R_ / R_mean)
-        return (
-            -2.0 * jnp.mean(w * jnp.real(ls1 + ls2))
-            + 2.0 * jnp.mean(jnp.real(lo1 + lo2))
+        log_R_c = log_R.reshape(n_chunks, chunk_size)
+
+        @jax.checkpoint
+        def grad_chunk(bs1, bs2, bsw1, bsw2, blog_R):
+            def single(s1, s2, sw1, sw2, log_Ri):
+                lo1 = log_psi(p, s1[None])[0]
+                lo2 = log_psi(p, s2[None])[0]
+                ls1 = log_psi(p, sw1[None])[0]
+                ls2 = log_psi(p, sw2[None])[0]
+                w_i = jax.lax.stop_gradient(jnp.exp(log_Ri) / R_mean)
+                return (
+                    -2.0 * w_i * jnp.real(ls1 + ls2)
+                    + 2.0 * jnp.real(lo1 + lo2)
+                )
+            return jax.vmap(single)(bs1, bs2, bsw1, bsw2, blog_R)
+
+        contributions = jax.lax.map(
+            lambda x: grad_chunk(*x),
+            (s1_c, s2_c, sw1_c, sw2_c, log_R_c)
         )
+        return jnp.mean(contributions)
 
     grad_S2 = jax.grad(loss_fn)(params)
     return S2, grad_S2
 
-def renyi2_entropy_and_grad_sampled(vstate, subsystem_sites, n_samples, key=0, debug=False):
+def renyi2_entropy_and_grad_sampled(vstate, subsystem_sites, n_samples, key=0, debug=False, chunk_size=256):
     """
     Estima S₂ y su gradiente mediante muestreo Monte Carlo (swap trick).
 
@@ -243,10 +270,9 @@ def renyi2_entropy_and_grad_sampled(vstate, subsystem_sites, n_samples, key=0, d
     swapped2 = jnp.concatenate([samples1[:, subsystem_sites], samples2[:, complement_sites]], axis=1)
 
     S2, grad_S2 = _renyi2_loss_and_grad(
-        vstate._apply_fun,
-        vstate.parameters,
-        vstate.model_state,
+        vstate._apply_fun, vstate.parameters, vstate.model_state,
         samples1, samples2, swapped1, swapped2,
+        chunk_size=chunk_size,
     )
 
     if debug:
