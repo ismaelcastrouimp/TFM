@@ -346,8 +346,7 @@ def renyi_entropy_maximize_SR_SGD(
         if timing:
             t0 = time.time()
 
-        # S2, grad_S2 = renyi2_entropy_and_grad_sampled(vstate, partition, n_samples_full)
-        S2, grad_S2 = renyi2_entropy_and_grad_lambda_integral(vstate, partition, n_samples_full, 30)
+        S2, grad_S2 = renyi2_entropy_and_grad_sampled(vstate, partition, n_samples_full)
 
         S2_max = len(partition) * jnp.log(2.0)
         mask = float(S2 < S2_max)
