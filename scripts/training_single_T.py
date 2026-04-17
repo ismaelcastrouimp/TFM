@@ -7,15 +7,16 @@ Uso:
     Editar la sección "CONFIGURACIÓN" y ejecutar:
         python scripts/training_single_T.py
 """
-
+import os
 import jax
+import flax.serialization as serialization
 import netket as nk
 from netket.operator.spin import sigmax, sigmaz
 import optax
 from src_renyi import free_energy_minimize
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
-N          = 30
+N          = 3
 N_SAMPLES  = 2**16
 GAMMA      = -1.5
 V          = -1.0
@@ -51,6 +52,18 @@ partition = list(range(N))
 # ── ENTRENAMIENTO  ─────────────────────────────────────────────────────────────
 _,f_best,E_best,S_best = free_energy_minimize(vstate, T, partition, H_extended, N_STEPS, freq=20,
                                                optimizer=optimizer, clip_norm=clip_norm, timing=True,
-                                               chunk_size=vstate.n_samples//16)
+                                               chunk_size=chunk_size, plot=False)
 
 print(f"Best solution: S₂={S_best:.6f}, E={E_best:.6f}, F={f_best:.6f}")
+
+# ── guardar parámetros ─────────────────────────────────────────────────────────
+script_dir = os.path.dirname(os.path.abspath(__file__))
+base_data_dir = os.path.join(script_dir, "..", "data")
+data_dir = os.path.join(base_data_dir, f"N{N}")
+params_dir = os.path.join(data_dir, "params")
+os.makedirs(params_dir, exist_ok=True)
+best_params = vstate.parameters
+
+filename = os.path.join(params_dir, f"params_T_{T:.3f}.msgpack")
+with open(filename, "wb") as f:
+    f.write(serialization.to_bytes(best_params))
