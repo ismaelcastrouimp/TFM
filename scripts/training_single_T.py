@@ -9,25 +9,39 @@ Uso:
 """
 import os
 import jax
+import jax.numpy as jnp
+import numpy as np
 import flax.serialization as serialization
 import netket as nk
 from netket.operator.spin import sigmax, sigmaz
 import optax
-from src_renyi import free_energy_minimize
+from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
-N          = 3
+N          = 100
 N_SAMPLES  = 2**16
 GAMMA      = -1.5
 V          = -1.0
-T          = 1.9
-N_STEPS    = 300
-chunk_size = N_SAMPLES//2
+T          = 0.5
+N_STEPS    = 350
+chunk_size = N_SAMPLES//16
 clip_norm  = None
 lr         = optax.linear_schedule(0.05, 0.001, N_STEPS)
 optimizer  = optax.sign_sgd(lr)
+
+N_REP_COSINE = 10
 # ───────────────────────────────────────────────────────────────────────────────
 
+# ── funciones auxiliares ───────────────────────────────────────────────────────
+def cosine_similarity(g1, g2):
+    """Calcula el coseno entre dos gradientes (pytrees)."""
+    flat1, _ = jax.flatten_util.ravel_pytree(g1)
+    flat2, _ = jax.flatten_util.ravel_pytree(g2)
+    flat1 = jnp.array(flat1, float)
+    flat2 = jnp.array(flat2, float)
+    return float(jnp.dot(flat1, flat2) /
+                 (jnp.linalg.norm(flat1) * jnp.linalg.norm(flat2) + 1e-30))
+# ───────────────────────────────────────────────────────────────────────────────
 
 # ── construir hilbert, hamiltoniano y vstate ───────────────────────────────────
 hi_sys = nk.hilbert.Spin(s=1/2, N=N)
@@ -50,11 +64,25 @@ partition = list(range(N))
 
 
 # ── ENTRENAMIENTO  ─────────────────────────────────────────────────────────────
+print(f"TRAINING N={N} at T={T}")
 _,f_best,E_best,S_best = free_energy_minimize(vstate, T, partition, H_extended, N_STEPS, freq=20,
                                                optimizer=optimizer, clip_norm=clip_norm, timing=True,
                                                chunk_size=chunk_size, plot=False)
 
 print(f"Best solution: S₂={S_best:.6f}, E={E_best:.6f}, F={f_best:.6f}")
+
+# ── consistencia del gradiente ─────────────────────────────────────────────────
+grads = []
+for rep in range(N_REP_COSINE):
+    _, grad_est = renyi2_entropy_and_grad_sampled(vstate, partition, N_SAMPLES, chunk_size=chunk_size)
+    grads.append(grad_est)
+cos_vals = []
+for i in range(N_REP_COSINE):
+    for j in range(i+1, N_REP_COSINE):
+        cos_vals.append(cosine_similarity(grads[i], grads[j]))
+cos_mean = np.mean(cos_vals)
+cos_std = np.std(cos_vals)
+print(f"Consistencia del gradiente: cos = {cos_mean:.4f} ± {cos_std:.4f}")
 
 # ── guardar parámetros ─────────────────────────────────────────────────────────
 script_dir = os.path.dirname(os.path.abspath(__file__))
