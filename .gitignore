@@ -13,6 +13,7 @@ __pycache__/
 # Packaging
 tfm.egg-info
 *.egg-info/
+*.egg
 build/
 dist/
 
