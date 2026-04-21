@@ -92,7 +92,7 @@ for T_idx, T in enumerate(tqdm(T_array, desc="Temperaturas")):
     )
     best_params = vstate.parameters
 
-    filename = os.path.join(params_dir, f"params_T_{T:.3f}.msgpack")
+    filename = os.path.join(params_dir, f"params_{T_idx:04d}.msgpack")
     with open(filename, "wb") as f:
         f.write(serialization.to_bytes(best_params))
 
@@ -131,13 +131,14 @@ for T_idx, T in enumerate(tqdm(T_array, desc="Temperaturas")):
     
     print(f"  Consistencia del gradiente: cos = {cos_mean:.4f} ± {cos_std:.4f}")
 
-results_file = os.path.join(data_dir, f"results_N{N}_vs_T.txt")
+results_file = os.path.join(data_dir, f"results_N{N}_vs_T.json")
 data = {
-    "T": [float(T) for T in T_array],
-    "energy": [float(x) for x in energy_results],
-    "entropy": [float(x) for x in entropy_results],
+    "T":           [float(T) for T in T_array],
+    "energy":      [float(x) for x in energy_results],
+    "entropy":     [float(x) for x in entropy_results],
     "free_energy": [float(x) for x in free_energy_results],
     "reliability": reliability_results,
+    "param_index": list(range(len(T_array))),
 }
 with open(results_file, "w") as f:
     json.dump(data, f, indent=2)

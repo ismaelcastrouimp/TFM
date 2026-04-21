@@ -15,6 +15,7 @@ import flax.serialization as serialization
 import netket as nk
 from netket.operator.spin import sigmax, sigmaz
 import optax
+import json
 from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
@@ -92,6 +93,39 @@ params_dir = os.path.join(data_dir, "params")
 os.makedirs(params_dir, exist_ok=True)
 best_params = vstate.parameters
 
-filename = os.path.join(params_dir, f"params_T_{T:.3f}.msgpack")
+results_file = os.path.join(data_dir, f"results_N{N}_vs_T.json")
+
+# Cargar JSON existente o crear uno vacío
+if os.path.exists(results_file):
+    with open(results_file, "r") as f:
+        all_data = json.load(f)
+else:
+    all_data = {"T": [], "energy": [], "entropy": [], "free_energy": [],
+                "reliability": [], "param_index": []}
+
+# Buscar si esta T ya existe (para sobreescribir) o añadir
+if T in all_data["T"]:
+    idx = all_data["T"].index(T)
+else:
+    idx = len(all_data["T"])
+    all_data["T"].append(float(T))
+    all_data["energy"].append(None)
+    all_data["entropy"].append(None)
+    all_data["free_energy"].append(None)
+    all_data["reliability"].append(None)
+    all_data["param_index"].append(idx)
+
+# Actualizar valores
+all_data["energy"][idx]      = float(E_best)
+all_data["entropy"][idx]     = float(S_best)
+all_data["free_energy"][idx] = float(f_best)
+all_data["reliability"][idx] = {"cos_mean": float(cos_mean), "cos_std": float(cos_std)}
+
+# Guardar parámetros con índice
+filename = os.path.join(params_dir, f"params_{idx:04d}.msgpack")
 with open(filename, "wb") as f:
     f.write(serialization.to_bytes(best_params))
+
+# Guardar JSON actualizado
+with open(results_file, "w") as f:
+    json.dump(all_data, f, indent=2)
