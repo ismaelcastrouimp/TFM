@@ -24,14 +24,14 @@ from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
 N          = 3
-N_SAMPLES  = 2**16
+N_SAMPLES  = 2**20
 
 GAMMA      = -1.5
 V          = -1.0
 
 T_min      = 0.0
 T_max      = 4.0
-N_Temps    = 60
+N_Temps    = 250
 linear_T   = False  #If False, creates non linear T distribution
                     #following cutoff temperatures (only for N<10)
 
