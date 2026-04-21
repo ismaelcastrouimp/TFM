@@ -25,8 +25,8 @@ import optax
 from src_renyi.observables import FreeRenyiEnergyObservable
 
 # ── CONFIGURACIÓN  ────────────────────────────────────────────────────────────
-N         = 50
-N_SAMPLES = 2**15
+N         = 100
+N_SAMPLES = 2**16
 GAMMA     = -1.5
 V         = -1.0
 T         = 1.0         # temperatura de diagnóstico
