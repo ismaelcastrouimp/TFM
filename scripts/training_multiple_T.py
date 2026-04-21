@@ -23,13 +23,20 @@ from tqdm import tqdm
 from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
-N          = 50
+N          = 3
 N_SAMPLES  = 2**16
+
 GAMMA      = -1.5
 V          = -1.0
-T_array    = np.linspace(0, 4, 41)
+
+T_min      = 0.0
+T_max      = 4.0
+N_Temps    = 60
+linear_T   = False  #If False, creates non linear T distribution
+                    #following cutoff temperatures (only for N<10)
+
 N_STEPS    = 300
-chunk_size = N_SAMPLES//4
+chunk_size = N_SAMPLES//2
 clip_norm  = None
 lr         = optax.linear_schedule(0.05, 0.001, N_STEPS)
 optimizer  = optax.sign_sgd(lr)
@@ -58,6 +65,34 @@ partition = list(range(N))
 # ───────────────────────────────────────────────────────────────────────────────
 
 # ── funciones auxiliares ───────────────────────────────────────────────────────
+def save_results(results_file, T_idx, T, best_energy, best_entropy, best_F, cos_mean, cos_std):
+    """Upsert: carga el JSON existente y actualiza/añade la entrada para T_idx."""
+    if os.path.exists(results_file):
+        with open(results_file, "r") as f:
+            data = json.load(f)
+    else:
+        data = {"T": [], "energy": [], "entropy": [], "free_energy": [],
+                "reliability": [], "param_index": []}
+
+    # Extender listas si es un índice nuevo
+    while len(data["T"]) <= T_idx:
+        data["T"].append(None)
+        data["energy"].append(None)
+        data["entropy"].append(None)
+        data["free_energy"].append(None)
+        data["reliability"].append(None)
+        data["param_index"].append(None)
+
+    data["T"][T_idx]           = float(T)
+    data["energy"][T_idx]      = float(best_energy)
+    data["entropy"][T_idx]     = float(best_entropy)
+    data["free_energy"][T_idx] = float(best_F)
+    data["reliability"][T_idx] = {"cos_mean": float(cos_mean), "cos_std": float(cos_std)}
+    data["param_index"][T_idx] = T_idx
+
+    with open(results_file, "w") as f:
+        json.dump(data, f, indent=2)
+
 def cosine_similarity(g1, g2):
     """Calcula el coseno entre dos gradientes (pytrees)."""
     flat1, _ = jax.flatten_util.ravel_pytree(g1)
@@ -66,6 +101,62 @@ def cosine_similarity(g1, g2):
     flat2 = jnp.array(flat2, float)
     return float(jnp.dot(flat1, flat2) /
                  (jnp.linalg.norm(flat1) * jnp.linalg.norm(flat2) + 1e-30))
+
+def compute_jump_temperatures(evals, max_jumps=None, tol=1e-10):
+    # Colapsar niveles degenerados
+    unique_evals = []
+    for e in evals:
+        if len(unique_evals) == 0 or abs(e - unique_evals[-1]) > tol:
+            unique_evals.append(e)
+    unique_evals = np.array(unique_evals)
+    
+    n_levels = len(unique_evals) if max_jumps is None else min(max_jumps + 1, len(unique_evals))
+    T_jumps = []
+    for n in range(1, n_levels):
+        weights = unique_evals[n] - unique_evals[:n]
+        E_bar = np.dot(unique_evals[:n], weights) / weights.sum()
+        T_jumps.append((unique_evals[n] - E_bar) / 2)
+    return np.array(T_jumps)
+
+def make_optimal_T_array(T_jumps, T_min=0.05, T_max=4.0, n_total=200, width_factor=0.1):
+    """
+    Crea un array de temperaturas con alta densidad cerca de cada T_n.
+    
+    - Empieza con una malla base uniforme gruesa
+    - Añade puntos extra concentrados alrededor de cada T_n con una
+      ventana gaussiana de anchura width_factor * gap_local
+    """
+    # Malla base uniforme (1/3 de los puntos)
+    n_base = n_total // 3
+    T_base = np.linspace(T_min, T_max, n_base)
+    # Puntos extra alrededor de cada salto
+    T_extra = []
+    jumps_in_range = T_jumps[(T_jumps > T_min) & (T_jumps < T_max)]
+    # Anchura local = fracción del gap al salto más cercano
+    for i, Tn in enumerate(jumps_in_range):
+        gaps = np.abs(jumps_in_range - Tn)
+        gaps = gaps[gaps > 1e-10]  # excluir el propio Tn
+        local_gap = gaps.min() if len(gaps) > 0 else (T_max - T_min) / len(jumps_in_range)
+        width = width_factor * local_gap
+        
+        n_local = n_total // (2 * len(jumps_in_range))  # repartir el resto entre saltos
+        T_extra.append(np.linspace(Tn - 2*width, Tn + 2*width, n_local))
+    # Unir, ordenar y eliminar duplicados
+    T_all = np.concatenate([T_base] + T_extra)
+    T_all = np.clip(T_all, T_min, T_max)
+    T_all = np.unique(np.round(T_all, 8))  # elimina duplicados numéricos
+    return T_all
+# ───────────────────────────────────────────────────────────────────────────────
+
+# ── crear array de temperaturas ────────────────────────────────────────────────
+if N>10 and (not(linear_T)):
+    linear_T=True
+if not linear_T:
+    eigvals, _ = np.linalg.eigh(H_sys.to_dense())
+    T_jumps = compute_jump_temperatures(eigvals)
+    T_array = make_optimal_T_array(T_jumps, T_min=T_min, T_max=T_max, n_total=N_Temps)
+else:
+    T_array = np.linspace(T_min, T_max, N_Temps)
 # ───────────────────────────────────────────────────────────────────────────────
 
 # ── ENTRENAMIENTO  ─────────────────────────────────────────────────────────────
@@ -80,6 +171,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 base_data_dir = os.path.join(script_dir, "..", "data")
 data_dir = os.path.join(base_data_dir, f"N{N}")
 params_dir = os.path.join(data_dir, "params")
+results_file = os.path.join(data_dir, f"results_N{N}_vs_T.json")
 os.makedirs(params_dir, exist_ok=True)
 
 for T_idx, T in enumerate(tqdm(T_array, desc="Temperaturas")):
@@ -96,52 +188,24 @@ for T_idx, T in enumerate(tqdm(T_array, desc="Temperaturas")):
     with open(filename, "wb") as f:
         f.write(serialization.to_bytes(best_params))
 
-    energy_results.append(best_energy)
-    entropy_results.append(best_entropy)
-    free_energy_results.append(best_F)
-
-    all_histories.append({
-        "T": T,
-        "free_energy": free_energy_history,
-    })
-
     print(f"  Mejor resultado: E={best_energy:.4f}, S₂={best_entropy:.4f}, F={best_F:.4f}")
 
-    # ── EVALUACIÓN DE FIABILIDAD (coseno entre réplicas del gradiente) ──
     grads = []
     for rep in range(N_REP_COSINE):
         _, grad_est = renyi2_entropy_and_grad_sampled(
             vstate, partition, N_SAMPLES, chunk_size=chunk_size
         )
         grads.append(grad_est)
-    
-    # Calcular coseno medio entre todos los pares de réplicas
-    cos_vals = []
-    for i in range(N_REP_COSINE):
-        for j in range(i+1, N_REP_COSINE):
-            cos_vals.append(cosine_similarity(grads[i], grads[j]))
-    
-    cos_mean = np.mean(cos_vals)
-    cos_std = np.std(cos_vals)
-    
-    reliability_results.append({
-        "cos_mean": float(cos_mean),
-        "cos_std": float(cos_std),
-    })
-    
+
+    cos_vals = [cosine_similarity(grads[i], grads[j])
+                for i in range(N_REP_COSINE) for j in range(i+1, N_REP_COSINE)]
+    cos_mean, cos_std = np.mean(cos_vals), np.std(cos_vals)
     print(f"  Consistencia del gradiente: cos = {cos_mean:.4f} ± {cos_std:.4f}")
 
-results_file = os.path.join(data_dir, f"results_N{N}_vs_T.json")
-data = {
-    "T":           [float(T) for T in T_array],
-    "energy":      [float(x) for x in energy_results],
-    "entropy":     [float(x) for x in entropy_results],
-    "free_energy": [float(x) for x in free_energy_results],
-    "reliability": reliability_results,
-    "param_index": list(range(len(T_array))),
-}
-with open(results_file, "w") as f:
-    json.dump(data, f, indent=2)
+    save_results(results_file, T_idx, T, best_energy, best_entropy, best_F, cos_mean, cos_std)
+    energy_results.append(best_energy)
+    entropy_results.append(best_entropy)
+    free_energy_results.append(best_F)
 # ───────────────────────────────────────────────────────────────────────────────
 
 
