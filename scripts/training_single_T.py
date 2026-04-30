@@ -21,10 +21,15 @@ from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
 N          = 100
 N_SAMPLES  = 2**16
-GAMMA      = -1.5
-V          = -1.0
+
+J_ZZ       = 0.0
+J_XX       = -1.0
+h_x        = -0.5
+h_z        = 1.05
+
 T          = 0.2
 N_STEPS    = 350
+
 chunk_size = N_SAMPLES//16
 clip_norm  = None
 lr         = optax.linear_schedule(0.05, 0.001, N_STEPS)
@@ -51,10 +56,15 @@ hi = nk.hilbert.Spin(s=1/2, N=N+N)
 H_sys=0
 H_extended = 0
 for i in range(N):
-    H_sys+= GAMMA * sigmax(hi_sys, i)
-    H_sys += V * sigmaz(hi_sys, i) @ sigmaz(hi_sys, (i + 1) % N)
-    H_extended += GAMMA * sigmax(hi, i)
-    H_extended += V * sigmaz(hi, i) @ sigmaz(hi, (i + 1) % N)
+    H_sys+= h_x * sigmax(hi_sys, i)
+    H_sys+= h_z * sigmaz(hi_sys, i)
+    H_sys += J_ZZ * sigmaz(hi_sys, i) @ sigmaz(hi_sys, (i + 1) % N)
+    H_sys += J_XX * sigmax(hi_sys, i) @ sigmax(hi_sys, (i + 1) % N)
+    H_extended += h_x * sigmax(hi, i)
+    H_extended += h_z * sigmaz(hi, i)
+    H_extended += J_ZZ * sigmaz(hi, i) @ sigmaz(hi, (i + 1) % N)
+    H_extended += J_XX * sigmax(hi, i) @ sigmax(hi, (i + 1) % N)
+
 
 model = nk.models.ARNNDense(hilbert=hi, layers=1, features=16, activation=jax.nn.gelu)
 sampler = nk.sampler.ARDirectSampler(hi)
