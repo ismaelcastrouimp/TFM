@@ -23,13 +23,13 @@ from tqdm import tqdm
 from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled, free_energy_minimize_exact
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
-N          = 2
+N          = 9
 N_SAMPLES  = 2**18
 
-J_ZZ       = 0.0
-J_XX       = -1.0
+J_ZZ       = -1.0
+J_XX       = 0.0
 h_x        = -0.5
-h_z        = 1.05
+h_z        = 0.0
 
 T_min      = 1.5
 T_max      = 4
@@ -202,20 +202,20 @@ for T_idx, T in enumerate(tqdm(T_array, desc="Temperaturas")):
 
     print(f"  Mejor resultado: E={best_energy:.4f}, S₂={best_entropy:.4f}, F={best_F:.4f}")
 
-    # grads = []
-    # fro rep in range(N_REP_COSINE):
-    #     _, grad_est = renyi2_entropy_and_grad_sampled(
-    #         vstate, partition, N_SAMPLES, chunk_size=chunk_size
-    #     )
-    #     grads.append(grad_est)
+    grads = []
+    for rep in range(N_REP_COSINE):
+        _, grad_est = renyi2_entropy_and_grad_sampled(
+            vstate, partition, N_SAMPLES, chunk_size=chunk_size
+        )
+        grads.append(grad_est)
 
-    # cos_vals = [cosine_similarity(grads[i], grads[j])
-    #             for i in range(N_REP_COSINE) for j in range(i+1, N_REP_COSINE)]
-    # cos_mean, cos_std = np.mean(cos_vals), np.std(cos_vals)
-    # print(f"  Consistencia del gradiente: cos = {cos_mean:.4f} ± {cos_std:.4f}")
+    cos_vals = [cosine_similarity(grads[i], grads[j])
+                for i in range(N_REP_COSINE) for j in range(i+1, N_REP_COSINE)]
+    cos_mean, cos_std = np.mean(cos_vals), np.std(cos_vals)
+    print(f"  Consistencia del gradiente: cos = {cos_mean:.4f} ± {cos_std:.4f}")
 
-    # save_results(results_file, T_idx, T, best_energy, best_entropy, best_F, cos_mean, cos_std)
-    save_results(results_file, T_idx, T, best_energy, best_entropy, best_F, 1, 0)
+    save_results(results_file, T_idx, T, best_energy, best_entropy, best_F, cos_mean, cos_std)
+    # save_results(results_file, T_idx, T, best_energy, best_entropy, best_F, 1, 0)
     energy_results.append(best_energy)
     entropy_results.append(best_entropy)
     free_energy_results.append(best_F)
