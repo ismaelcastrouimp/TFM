@@ -10,7 +10,7 @@ from jax.flatten_util import ravel_pytree
 from scipy.optimize import minimize
 
 from .observables import FreeRenyiEnergyObservable
-from .entropy import renyi2_entropy_and_grad_sampled, renyi2_entropy_sampled, renyi2_entropy_exact, renyi2_entropy_and_grad_lambda_integral
+from .entropy import renyi2_entropy_and_grad_sampled, renyi2_entropy_sampled, renyi2_entropy_exact, renyi2_entropy_and_grad_exact
 
 
 def free_energy_minimize_SR_SGD(
@@ -223,6 +223,165 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbos
         ax.plot(free_energy_history, label=r"$F$")
         ax.set_xlabel("Step")
         ax.set_ylabel(r"$F$")
+        plt.tight_layout()
+        plt.show()
+
+    return (free_energy_history, best_F, E_best, S2_best)
+
+def free_energy_minimize_exact(
+    vstate,         
+    T,
+    partition,
+    Hamiltonian,
+    hilbert,
+    isFullSum = True,
+    n_steps=500,
+    verbose=True,
+    freq=50,
+    plot=True,
+    optimizer=None,
+    learning_rate=None,
+    clip_norm=None,
+    timing=False,
+    sr=None,
+):
+    """
+    Minimiza F = E - T·S₂ usando gradientes exactos.
+
+    El gradiente de E se calcula via vstate.expect_and_grad(H).
+    El gradiente de S2 se calcula via renyi2_entropy_and_grad_exact.
+    No usa FreeRenyiEnergyObservable ni el swap trick.
+
+    Parámetros
+    ----------
+    vstate      : MCState de NetKet con el modelo variacional.
+    T           : Temperatura.
+    partition   : Lista de sitios del subsistema A para S₂.
+    Hamiltonian : Operador H compatible con NetKet.
+    n_steps     : Número de pasos de optimización.
+    verbose     : Si True, imprime progreso cada `freq` pasos.
+    freq        : Frecuencia de impresión.
+    plot        : Si True, muestra gráfica de F al final.
+    optimizer   : optax.GradientTransformation. Por defecto SGD.
+    learning_rate: Schedule o escalar de optax.
+    clip_norm   : float o None. Clipping del gradiente global.
+    timing      : Si True, mide tiempo por step.
+    sr          : nk.optimizer.SR o None.
+
+    Devuelve
+    -------
+    (free_energy_history, best_F, E_best, S2_best)
+    """
+
+    # --- learning rate por defecto ---
+    if learning_rate is None:
+        learning_rate = optax.warmup_cosine_decay_schedule(
+            0.1, 0.1, 100, n_steps, 0.001
+        )
+
+    # --- optimizador por defecto ---
+    if optimizer is None:
+        optimizer = optax.sgd(learning_rate)
+
+    # --- gradient transform ---
+    if clip_norm is not None:
+        gradient_transform = optax.chain(
+            optax.clip_by_global_norm(clip_norm),
+            optimizer
+        )
+    else:
+        gradient_transform = optimizer
+
+    opt_state = gradient_transform.init(vstate.parameters)
+
+    free_energy_history = []
+    E_history = []
+    S2_history = []
+    best_F = float("inf")
+    best_params = None
+
+    for step in range(n_steps):
+
+        if timing:
+            t0 = time.time()
+
+        # ── Gradiente de E (exacto via FullSumState) ──────────────
+        E_stats, grad_E = vstate.expect_and_grad(Hamiltonian)
+        E_val = float(E_stats.mean.real)
+
+        # ── S2 y su gradiente (exacto) ────────────────────────────
+        S2_val, grad_S2 = renyi2_entropy_and_grad_exact(vstate, partition, hilbert, isFullSum=isFullSum)
+        S2_val = float(S2_val)
+
+        # ── Gradiente de F = E - T*S2 ─────────────────────────────
+        grad_F = jax.tree_util.tree_map(
+            lambda ge, gs: ge - T * gs,
+            grad_E, grad_S2
+        )
+
+        F_val = E_val - T * S2_val
+
+        # ── SR (opcional) ─────────────────────────────────────────
+        if sr is not None:
+            grad_F = sr(vstate, grad_F, step)
+
+        # ── Update ────────────────────────────────────────────────
+        updates, opt_state = gradient_transform.update(
+            grad_F, opt_state, vstate.parameters
+        )
+        vstate.parameters = optax.apply_updates(vstate.parameters, updates)
+
+        if timing:
+            jax.tree_util.tree_map(
+                lambda x: x.block_until_ready(), vstate.parameters
+            )
+
+        free_energy_history.append(F_val)
+        E_history.append(E_val)
+        S2_history.append(S2_val)
+
+        if F_val < best_F:
+            best_F = F_val
+            best_params = vstate.parameters
+
+        if step % freq == 0 and verbose:
+            msg = f"Step {step:4d} | F={F_val:.6f} | E={E_val:.6f} | S2={S2_val:.6f}"
+            if timing:
+                msg += f" | t={time.time()-t0:.3f}s"
+            print(msg)
+
+    # ── Restaurar mejores parámetros ──────────────────────────────
+    vstate.parameters = best_params
+
+    # Evaluación final exacta
+    E_best = float(vstate.expect(Hamiltonian).mean.real)
+    S2_best, _ = renyi2_entropy_and_grad_exact(vstate, partition, hilbert, isFullSum=isFullSum)
+    S2_best = float(S2_best)
+    best_F = E_best - T * S2_best
+
+    if verbose:
+        print(f"\nFinal | F={best_F:.6f} | E={E_best:.6f} | S2={S2_best:.6f}")
+
+    if plot:
+        fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+        axes[0].plot(free_energy_history, label=r"$F$")
+        axes[0].set_xlabel("Step")
+        axes[0].set_ylabel(r"$F = E - T \cdot S_2$")
+        axes[0].set_title("Energía libre")
+        axes[0].legend()
+
+        axes[1].plot(E_history, label=r"$\langle H \rangle$", color="tab:orange")
+        axes[1].set_xlabel("Step")
+        axes[1].set_ylabel(r"$\langle H \rangle$")
+        axes[1].set_title("Energía")
+        axes[1].legend()
+
+        axes[2].plot(S2_history, label=r"$S_2$", color="tab:green")
+        axes[2].set_xlabel("Step")
+        axes[2].set_ylabel(r"$S_2$")
+        axes[2].set_title("Entropía Rényi-2")
+        axes[2].legend()
+
         plt.tight_layout()
         plt.show()
 

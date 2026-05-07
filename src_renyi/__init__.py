@@ -9,4 +9,11 @@ from .entropy import (
     renyi2_entropy_and_grad_sampled2,
     renyi2_entropy_and_grad_lambda_integral
 )
-from .training import free_energy_minimize_SR_SGD, free_energy_minimize, free_energy_minimize_scipy, renyi_entropy_maximize_SR_SGD, renyi_entropy_maximize_ADAM
+from .training import (
+    free_energy_minimize_SR_SGD,
+    free_energy_minimize,
+    free_energy_minimize_exact,
+    free_energy_minimize_scipy,
+    renyi_entropy_maximize_SR_SGD,
+    renyi_entropy_maximize_ADAM
+)
