@@ -20,11 +20,11 @@ import json
 import flax.serialization as serialization
 from tqdm import tqdm
 
-from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled
+from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled, free_energy_minimize_exact
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
-N          = 9
-N_SAMPLES  = 2**17
+N          = 2
+N_SAMPLES  = 2**18
 
 J_ZZ       = 0.0
 J_XX       = -1.0
@@ -32,16 +32,17 @@ h_x        = -0.5
 h_z        = 1.05
 
 T_min      = 1.5
-T_max      = 4.0
-N_Temps    = 26
+T_max      = 4
+N_Temps    = 10
 linear_T   = True  #If False, creates non linear T distribution
                     #following cutoff temperatures (only for N<10)
 
-N_STEPS    = 300
+N_STEPS    = 350
 chunk_size = N_SAMPLES//2
 clip_norm  = None
 lr         = optax.linear_schedule(0.05, 0.001, N_STEPS)
-optimizer  = optax.sign_sgd(lr)
+optimizer  = optax.adam(lr)
+sr         = None
 
 N_REP_COSINE = 10
 # ───────────────────────────────────────────────────────────────────────────────
@@ -66,6 +67,7 @@ for i in range(N):
 model = nk.models.ARNNDense(hilbert=hi, layers=1, features=16, activation=jax.nn.gelu)
 sampler = nk.sampler.ARDirectSampler(hi)
 vstate  = nk.vqs.MCState(sampler, model, n_samples=N_SAMPLES)
+# vstate = nk.vqs.FullSumState(hilbert=hi, model=model)
 
 partition = list(range(N))
 # ───────────────────────────────────────────────────────────────────────────────
@@ -186,8 +188,12 @@ for T_idx, T in enumerate(tqdm(T_array, desc="Temperaturas")):
 
     free_energy_history, best_F, best_energy, best_entropy = free_energy_minimize(
         vstate=vstate, T=T, partition=partition, Hamiltonian=H_extended, n_steps=N_STEPS,
-        verbose=True, plot=False, optimizer=optimizer, chunk_size=chunk_size, clip_norm=clip_norm
+        verbose=True, plot=False, optimizer=optimizer, chunk_size=chunk_size, clip_norm=clip_norm,
+        sr=sr, n_samples_sr=2**12
     )
+    # free_energy_history, best_F, best_energy, best_entropy = free_energy_minimize_exact(
+    #     vstate, T, partition, H_extended, hi, N_STEPS, plot=False, optimizer=optimizer, learning_rate=lr
+    # )
     best_params = vstate.parameters
 
     filename = os.path.join(params_dir, f"params_{T_idx:04d}.msgpack")
@@ -196,19 +202,20 @@ for T_idx, T in enumerate(tqdm(T_array, desc="Temperaturas")):
 
     print(f"  Mejor resultado: E={best_energy:.4f}, S₂={best_entropy:.4f}, F={best_F:.4f}")
 
-    grads = []
-    for rep in range(N_REP_COSINE):
-        _, grad_est = renyi2_entropy_and_grad_sampled(
-            vstate, partition, N_SAMPLES, chunk_size=chunk_size
-        )
-        grads.append(grad_est)
+    # grads = []
+    # fro rep in range(N_REP_COSINE):
+    #     _, grad_est = renyi2_entropy_and_grad_sampled(
+    #         vstate, partition, N_SAMPLES, chunk_size=chunk_size
+    #     )
+    #     grads.append(grad_est)
 
-    cos_vals = [cosine_similarity(grads[i], grads[j])
-                for i in range(N_REP_COSINE) for j in range(i+1, N_REP_COSINE)]
-    cos_mean, cos_std = np.mean(cos_vals), np.std(cos_vals)
-    print(f"  Consistencia del gradiente: cos = {cos_mean:.4f} ± {cos_std:.4f}")
+    # cos_vals = [cosine_similarity(grads[i], grads[j])
+    #             for i in range(N_REP_COSINE) for j in range(i+1, N_REP_COSINE)]
+    # cos_mean, cos_std = np.mean(cos_vals), np.std(cos_vals)
+    # print(f"  Consistencia del gradiente: cos = {cos_mean:.4f} ± {cos_std:.4f}")
 
-    save_results(results_file, T_idx, T, best_energy, best_entropy, best_F, cos_mean, cos_std)
+    # save_results(results_file, T_idx, T, best_energy, best_entropy, best_F, cos_mean, cos_std)
+    save_results(results_file, T_idx, T, best_energy, best_entropy, best_F, 1, 0)
     energy_results.append(best_energy)
     entropy_results.append(best_entropy)
     free_energy_results.append(best_F)
