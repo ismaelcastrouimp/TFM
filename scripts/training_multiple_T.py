@@ -23,7 +23,7 @@ from tqdm import tqdm
 from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled, free_energy_minimize_exact, ARNN_Z2
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
-N          = 9
+N          = 2
 N_SAMPLES  = 2**18
 
 J_ZZ       = -1.0
@@ -33,7 +33,7 @@ h_z        = 0.0
 
 T_min      = 0
 T_max      = 4
-N_Temps    = 20
+N_Temps    = 5
 linear_T   = True  #If False, creates non linear T distribution
                     #following cutoff temperatures (only for N<10)
 
@@ -194,7 +194,7 @@ for T_idx, T in enumerate(tqdm(T_array, desc="Temperaturas")):
     # free_energy_history, best_F, best_energy, best_entropy = free_energy_minimize_exact(
     #     vstate, T, partition, H_extended, hi, N_STEPS, plot=False, optimizer=optimizer, learning_rate=lr
     # )
-    # best_params = vstate.parameters
+    best_params = vstate.parameters
 
     filename = os.path.join(params_dir, f"params_{T_idx:04d}.msgpack")
     with open(filename, "wb") as f:
