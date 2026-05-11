@@ -19,7 +19,8 @@ import json
 from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
-N          = 100
+N          = 2
+N_A        = 1
 N_SAMPLES  = 2**16
 
 J_ZZ       = 0.0
@@ -52,7 +53,7 @@ def cosine_similarity(g1, g2):
 # ── construir hilbert, hamiltoniano y vstate ───────────────────────────────────
 hi_sys = nk.hilbert.Spin(s=1/2, N=N)
 hi_anc = nk.hilbert.Spin(s=1/2, N=N)
-hi = nk.hilbert.Spin(s=1/2, N=N+N)
+hi = nk.hilbert.Spin(s=1/2, N=N+N_A)
 H_sys=0
 H_extended = 0
 for i in range(N):
@@ -75,7 +76,7 @@ partition = list(range(N))
 
 
 # ── ENTRENAMIENTO  ─────────────────────────────────────────────────────────────
-print(f"TRAINING N={N} at T={T}")
+print(f"TRAINING N={N} at T={T}, N_A={N_A}")
 _,f_best,E_best,S_best = free_energy_minimize(vstate, T, partition, H_extended, N_STEPS, freq=20,
                                                optimizer=optimizer, clip_norm=clip_norm, timing=True,
                                                chunk_size=chunk_size, plot=False)
@@ -98,7 +99,10 @@ print(f"Consistencia del gradiente: cos = {cos_mean:.4f} ± {cos_std:.4f}")
 # ── guardar parámetros ─────────────────────────────────────────────────────────
 script_dir = os.path.dirname(os.path.abspath(__file__))
 base_data_dir = os.path.join(script_dir, "..", "data")
-data_dir = os.path.join(base_data_dir, f"N{N}")
+if N==N_A:
+    data_dir = os.path.join(base_data_dir, f"N{N}")
+else:
+    data_dir = os.path.join(base_data_dir, f"N{N}_NA_{N_A}")
 params_dir = os.path.join(data_dir, "params")
 os.makedirs(params_dir, exist_ok=True)
 best_params = vstate.parameters

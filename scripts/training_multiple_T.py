@@ -23,7 +23,8 @@ from tqdm import tqdm
 from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled, free_energy_minimize_exact, ARNN_Z2
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
-N          = 2
+N          = 12
+N_A        = N
 N_SAMPLES  = 2**18
 
 J_ZZ       = -1.0
@@ -51,7 +52,7 @@ N_REP_COSINE = 10
 # ── construir hilbert, hamiltoniano y vstate ───────────────────────────────────
 hi_sys = nk.hilbert.Spin(s=1/2, N=N)
 hi_anc = nk.hilbert.Spin(s=1/2, N=N)
-hi = nk.hilbert.Spin(s=1/2, N=N+N)
+hi = nk.hilbert.Spin(s=1/2, N=N+N_A)
 H_sys=0
 H_extended = 0
 for i in range(N):
@@ -67,7 +68,6 @@ for i in range(N):
 model = nk.models.ARNNDense(hilbert=hi, layers=1, features=16, activation=jax.nn.gelu)
 sampler = nk.sampler.ARDirectSampler(hi)
 vstate  = nk.vqs.MCState(sampler, model, n_samples=N_SAMPLES)
-# vstate = nk.vqs.FullSumState(hilbert=hi, model=model)
 
 partition = list(range(N))
 # ───────────────────────────────────────────────────────────────────────────────
@@ -177,11 +177,15 @@ best_params = None
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 base_data_dir = os.path.join(script_dir, "..", "data")
-data_dir = os.path.join(base_data_dir, f"N{N}")
+if N==N_A:
+    data_dir = os.path.join(base_data_dir, f"N{N}")
+else:
+    data_dir = os.path.join(base_data_dir, f"N{N}_NA_{N_A}")
 params_dir = os.path.join(data_dir, "params")
 results_file = os.path.join(data_dir, f"results_N{N}_vs_T.json")
 os.makedirs(params_dir, exist_ok=True)
 
+print(f"TRAINING N={N}, N_A={N_A}")
 for T_idx, T in enumerate(tqdm(T_array, desc="Temperaturas")):
     print(f"\n=== Temperatura T = {T:.3f} ===")
     vstate.init_parameters()
@@ -191,9 +195,6 @@ for T_idx, T in enumerate(tqdm(T_array, desc="Temperaturas")):
         verbose=True, plot=False, optimizer=optimizer, chunk_size=chunk_size, clip_norm=clip_norm,
         sr=sr, n_samples_sr=2**12
     )
-    # free_energy_history, best_F, best_energy, best_entropy = free_energy_minimize_exact(
-    #     vstate, T, partition, H_extended, hi, N_STEPS, plot=False, optimizer=optimizer, learning_rate=lr
-    # )
     best_params = vstate.parameters
 
     filename = os.path.join(params_dir, f"params_{T_idx:04d}.msgpack")
@@ -215,7 +216,6 @@ for T_idx, T in enumerate(tqdm(T_array, desc="Temperaturas")):
     print(f"  Consistencia del gradiente: cos = {cos_mean:.4f} ± {cos_std:.4f}")
 
     save_results(results_file, T_idx, T, best_energy, best_entropy, best_F, cos_mean, cos_std)
-    # save_results(results_file, T_idx, T, best_energy, best_entropy, best_F, 1, 0)
     energy_results.append(best_energy)
     entropy_results.append(best_entropy)
     free_energy_results.append(best_F)
