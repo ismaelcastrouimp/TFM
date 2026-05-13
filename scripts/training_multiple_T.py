@@ -23,26 +23,26 @@ from tqdm import tqdm
 from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled, free_energy_minimize_exact, ARNN_Z2
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
-N          = 12
+N          = 30
 N_A        = N
-N_SAMPLES  = 2**18
+N_SAMPLES  = 2**21
 
 J_ZZ       = -1.0
 J_XX       = 0.0
-h_x        = -1.1
+h_x        = -1.5
 h_z        = 0.0
 
 T_min      = 0
 T_max      = 4
-N_Temps    = 5
+N_Temps    = 41
 linear_T   = True  #If False, creates non linear T distribution
                     #following cutoff temperatures (only for N<10)
 
 N_STEPS    = 300
-chunk_size = N_SAMPLES//2
+chunk_size = N_SAMPLES//16
 clip_norm  = None
 lr         = optax.linear_schedule(0.05, 0.001, N_STEPS)
-optimizer  = optax.adam(lr)
+optimizer  = optax.sign_sgd(lr)
 sr         = None
 
 N_REP_COSINE = 10
@@ -51,7 +51,6 @@ N_REP_COSINE = 10
 
 # ── construir hilbert, hamiltoniano y vstate ───────────────────────────────────
 hi_sys = nk.hilbert.Spin(s=1/2, N=N)
-hi_anc = nk.hilbert.Spin(s=1/2, N=N)
 hi = nk.hilbert.Spin(s=1/2, N=N+N_A)
 H_sys=0
 H_extended = 0

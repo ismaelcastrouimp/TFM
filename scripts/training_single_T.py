@@ -52,7 +52,6 @@ def cosine_similarity(g1, g2):
 
 # ── construir hilbert, hamiltoniano y vstate ───────────────────────────────────
 hi_sys = nk.hilbert.Spin(s=1/2, N=N)
-hi_anc = nk.hilbert.Spin(s=1/2, N=N)
 hi = nk.hilbert.Spin(s=1/2, N=N+N_A)
 H_sys=0
 H_extended = 0
