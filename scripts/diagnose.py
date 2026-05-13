@@ -25,8 +25,9 @@ import optax
 from src_renyi.observables import FreeRenyiEnergyObservable
 
 # ── CONFIGURACIÓN  ────────────────────────────────────────────────────────────
-N         = 3
-N_SAMPLES = 2**20
+N         = 30
+N_A       = 5
+N_SAMPLES = 2**21
 GAMMA     = -1.5
 V         = -1.0
 T         = 1.0         # temperatura de diagnóstico
@@ -37,8 +38,7 @@ LR        = 0.05         # lr para el diagnóstico (no afecta a los resultados)
 
 # ── construir hilbert, hamiltoniano y vstate ──────────────────────────────────
 hi_sys = nk.hilbert.Spin(s=1/2, N=N)
-hi_anc = nk.hilbert.Spin(s=1/2, N=N)
-hi = nk.hilbert.Spin(s=1/2, N=N+N)
+hi = nk.hilbert.Spin(s=1/2, N=N+N_A)
 H_sys=0
 H_extended = 0
 for i in range(N):
