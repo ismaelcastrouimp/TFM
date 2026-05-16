@@ -192,28 +192,30 @@ fig, axes = plt.subplots(1, 2, figsize=(10, 3.5))
 ax = axes[0]
 ax.plot(S2_arr, err_sw_mean, 'o-', color='C0', label='Swap trick')
 ax.fill_between(S2_arr, sw_p25, sw_p75, alpha=0.25, color='C0')
-ax.plot(S2_arr, err_ti_mean, 's-', color='C1', label='TI')
+ax.plot(S2_arr, err_ti_mean, 's-', color='C1', label=r'$\lambda$-i')
 ax.fill_between(S2_arr, ti_p25, ti_p75, alpha=0.25, color='C1')
-# Referencia teórica corregida: std ~ e^{S2/2} / sqrt(N_samp)
+# Referencia teórica: std ~ e^{S2/2} / sqrt(N_samp)
 S2_ref = np.linspace(S2_arr.min(), S2_arr.max(), 100)
 ax.plot(S2_ref, np.exp(S2_ref / 2) / np.sqrt(n_samples_diag), 'k--',
         label=r'$e^{S_2/2}/\sqrt{N_\mathrm{samp}}$')
-ax.set_xlabel(r'$S_2$ (exacto)')
+ax.set_xlabel(r'$S_2$ (exact)')
 ax.set_ylabel(r'$|\Delta S_2|$')
 ax.set_yscale('log')
 ax.legend()
-ax.set_title(r'Error absoluto en $S_2$')
+ax.set_title(r'$S_2$ absolute error')
+ax.grid(True, alpha=0.3)
 
 # Panel derecho: error relativo (sin escala log, más legible)
 ax = axes[1]
 ax.plot(S2_arr, rel_sw_mean, 'o-', color='C0', label='Swap trick')
 ax.fill_between(S2_arr, rel_sw_p25, rel_sw_p75, alpha=0.25, color='C0')
-ax.plot(S2_arr, rel_ti_mean, 's-', color='C1', label='TI')
+ax.plot(S2_arr, rel_ti_mean, 's-', color='C1', label=r'$\lambda$-i')
 ax.fill_between(S2_arr, rel_ti_p25, rel_ti_p75, alpha=0.25, color='C1')
-ax.set_xlabel(r'$S_2$ (exacto)')
+ax.set_xlabel(r'$S_2$ (exact)')
 ax.set_ylabel(r'$|\Delta S_2| / S_2$')
-ax.set_title(r'Error relativo en $S_2$')
+ax.set_title(r'$S_2$ relative error')
 ax.legend()
+ax.grid(True, alpha=0.3)
 
 fig.tight_layout()
 save_fig(fig, "s2_error_vs_entropy")
@@ -229,16 +231,16 @@ ax.plot(S2_arr, cos_sw_mean, 'o-', color='C0', label='Swap trick')
 ax.fill_between(S2_arr, cos_sw_mean - cos_sw_std, cos_sw_mean + cos_sw_std, 
                 alpha=0.2, color='C0')
 
-ax.plot(S2_arr, cos_ti_mean, 's-', color='C1', label='TI')
+ax.plot(S2_arr, cos_ti_mean, 's-', color='C1', label=r'$\lambda$-i')
 ax.fill_between(S2_arr, cos_ti_mean - cos_ti_std, cos_ti_mean + cos_ti_std, 
                 alpha=0.2, color='C1')
 
 ax.axhline(1.0, color='k', linestyle='--', alpha=0.3)
 
-ax.set_xlabel(r'$S_2$ (exacto)')
+ax.set_xlabel(r'$S_2$ (exact)')
 ax.set_ylabel(r'$\langle \cos(\nabla S_2^\mathrm{est}, \nabla S_2^\mathrm{ex}) \rangle$')
 ax.legend()
-ax.set_title(r"Calidad del gradiente vs entropía")
+ax.set_title(r"Gradient quality vs entropy")
 ax.grid(True, alpha=0.3)
 
 fig.tight_layout()
@@ -252,7 +254,7 @@ print("\n" + "=" * 60)
 print("2. Error vs n_samples")
 print("=" * 60)
 
-for label, T in [("baja", TEMPS[0]), ("alta", TEMPS[-1])]:
+for label, T in [("low", TEMPS[0]), ("high", TEMPS[-1])]:
     vstate = trained_vstates[T]
     S2_ex, grad_ex = renyi2_entropy_and_grad_exact(vstate, subsystem, hi)
     S2_ex = float(S2_ex)
@@ -307,28 +309,30 @@ for label, T in [("baja", TEMPS[0]), ("alta", TEMPS[-1])]:
     fig, ax = plt.subplots(figsize=(5, 3.5))
     ax.loglog(ns_arr, err_sw_m, 'o-', color='C0', label='Swap trick')
     ax.fill_between(ns_arr, sw_p25, sw_p75, alpha=0.25, color='C0')
-    ax.loglog(ns_arr, err_ti_m, 's-', color='C1', label='TI')
+    ax.loglog(ns_arr, err_ti_m, 's-', color='C1', label=r'$\lambda$-i')
     ax.fill_between(ns_arr, ti_p25, ti_p75, alpha=0.25, color='C1')
     ax.loglog(ns_fit, inv_sqrt(ns_fit, alpha_sw), '--', color='C0',
               label=rf'$\alpha_\mathrm{{sw}}/\sqrt{{N}}$, $\alpha={alpha_sw[0]:.3f}$')
     ax.loglog(ns_fit, inv_sqrt(ns_fit, alpha_ti), '--', color='C1',
-              label=rf'$\alpha_\mathrm{{TI}}/\sqrt{{N}}$, $\alpha={alpha_ti[0]:.3f}$')
+              label=rf'$\alpha_{{\lambda-i}}/\sqrt{{N}}$, $\alpha={alpha_ti[0]:.3f}$')
     ax.set_xlabel(r'$N_\mathrm{samples}$')
     ax.set_ylabel(r'$|\Delta S_2|$')
-    ax.set_title(fr'Error absoluto — $S_2$ {label} ($S_2={S2_ex:.2f}$)')
-    ax.legend(fontsize=7)
+    ax.set_title(fr'Absolute error — {label} $S_2$ ($S_2={S2_ex:.2f}$)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
     fig.tight_layout()
     save_fig(fig, f"s2_error_vs_nsamples_{label}")
 
     # ── plot coseno (sin cambios) ──────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(5, 3.5))
     ax.semilogx(ns_arr, cos_sw_ns, 'o-', label='Swap trick')
-    ax.semilogx(ns_arr, cos_ti_ns, 's-', label='TI')
+    ax.semilogx(ns_arr, cos_ti_ns, 's-', label=r'$\lambda$-i')
     ax.axhline(1.0, color='k', linestyle='--', alpha=0.3)
     ax.set_xlabel(r'$N_\mathrm{samples}$')
     ax.set_ylabel(r'$\cos(\nabla S_2^\mathrm{est},\, \nabla S_2^\mathrm{ex})$')
-    ax.set_title(f'Calidad del gradiente  --  $S_2$ {label}')
+    ax.set_title(f'Gradient quality  --  {label} $S_2$')
     ax.legend()
+    ax.grid(True, alpha=0.3)
     fig.tight_layout()
     save_fig(fig, f"grad_cosine_vs_nsamples_{label}")
 
