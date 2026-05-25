@@ -23,18 +23,18 @@ from tqdm import tqdm
 from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled, free_energy_minimize_exact, ARNN_Z2
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
-N          = 30
-N_A        = N
+N          = 15
+N_A        = 10
 N_SAMPLES  = 2**21
 
 J_ZZ       = -1.0
 J_XX       = 0.0
-h_x        = -1.5
+h_x        = -1.1
 h_z        = 0.0
 
-T_min      = 0
-T_max      = 4
-N_Temps    = 41
+T_min      = 0.2
+T_max      = 0.9
+N_Temps    = 21
 linear_T   = True  #If False, creates non linear T distribution
                     #following cutoff temperatures (only for N<10)
 
