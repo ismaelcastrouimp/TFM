@@ -7,7 +7,9 @@ from .entropy import (
     renyi2_entropy_sampled,
     renyi2_entropy_and_grad_sampled,
     renyi2_entropy_and_grad_sampled2,
-    renyi2_entropy_and_grad_lambda_integral
+    renyi2_entropy_and_grad_lambda_integral,
+    renyi2_drut_sampling,
+    renyi2_increment_sampling
 )
 from .training import (
     free_energy_minimize_SR_SGD,

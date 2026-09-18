@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import netket as nk
+from netket.jax import jacobian
 
 
 # ── Utilidades ────────────────────────────────────────────────────────────────
@@ -120,6 +121,7 @@ def renyi2_entropy_and_grad_exact(vstate, subsystem_sites, hi_extended, isFullSu
 
 # ── Rényi-2 muestreado ────────────────────────────────────────────────────────
 
+#SWAP TRICK: S₂ = -ln ⟨R⟩, R = ψ(swapped1)ψ(swapped2)/ψ(samples1)ψ(samples2)
 @partial(jax.jit, static_argnames=("apply_fun", "chunk_size"))
 def _renyi2_forward_jit(apply_fun, params, model_state,
                          samples1, samples2, swapped1, swapped2,
@@ -282,7 +284,7 @@ def renyi2_entropy_and_grad_sampled(vstate, subsystem_sites, n_samples, key=0, d
 
     return S2, grad_S2
 
-from netket.jax import jacobian
+#Jacobian for gradient computation
 def renyi2_entropy_and_grad_sampled2(vstate, subsystem_sites, n_samples, key=0, debug=False):
     subsystem_sites = jnp.array(subsystem_sites, dtype=int)
     """
@@ -380,18 +382,17 @@ def renyi2_entropy_and_grad_sampled2(vstate, subsystem_sites, n_samples, key=0, 
     
     return S2, grad_S2
 
-
+#Lamda integral method, S₂ = -∫₀¹ dλ ⟨ln R⟩_λ, with ⟨·⟩_λ = ⟨· R^λ⟩ / ⟨R^λ⟩
+#Reweighting: ⟨ln R⟩_λ = ⟨w ln R⟩, w = R^λ / ⟨R^λ⟩
 def _renyi2_lambda_integral_jit(apply_fun, params, model_state,
                                  samples1, samples2, swapped1, swapped2,
                                  subsystem_sites, complement_sites,
                                  n_lambda):
-
     def log_psi(p, s):
         return apply_fun({"params": p, **model_state}, s)
 
     lambda_grid = jnp.linspace(0.0, 1.0, n_lambda)
 
-    # Calculados una sola vez, fuera del vmap
     log_o1 = log_psi(params, samples1)
     log_o2 = log_psi(params, samples2)
     log_s1 = log_psi(params, swapped1)
@@ -404,6 +405,10 @@ def _renyi2_lambda_integral_jit(apply_fun, params, model_state,
         w = jnp.exp(log_w)
         f_lam = jnp.sum(w * log_R)
 
+        # ── ESS(λ): pesos SIN normalizar, Kish formula ───────────────
+        w_unnorm = jnp.exp(lam * log_R - jnp.max(lam * log_R))  # estabilidad
+        ess_lam = (jnp.sum(w_unnorm))**2 / jnp.sum(w_unnorm**2)
+
         def loss_fn(p):
             lo1 = log_psi(p, samples1)
             lo2 = log_psi(p, samples2)
@@ -411,7 +416,6 @@ def _renyi2_lambda_integral_jit(apply_fun, params, model_state,
             ls2 = log_psi(p, swapped2)
 
             log_R_ = jnp.real(ls1 + ls2 - lo1 - lo2)
-
             log_w_ = lam * log_R_
             log_w_ -= jax.nn.logsumexp(log_w_)
             w_ = jnp.exp(log_w_)
@@ -422,17 +426,15 @@ def _renyi2_lambda_integral_jit(apply_fun, params, model_state,
             reinforce = 2.0 * jnp.sum(
                 w_stopped * lnR_centered * jnp.real(lo1 + lo2)
             )
-
             return f_ + reinforce
 
         grad_f = jax.grad(loss_fn)(params)
-        return f_lam, grad_f
+        return f_lam, grad_f, ess_lam
 
-    f_vals, grad_vals = jax.vmap(compute_for_lambda)(lambda_grid)
+    f_vals, grad_vals, ess_vals = jax.vmap(compute_for_lambda)(lambda_grid)
 
     dlam = lambda_grid[1] - lambda_grid[0]
     trap_w = jnp.ones(n_lambda).at[0].set(0.5).at[-1].set(0.5)
-
     S2_max = subsystem_sites.shape[0] * jnp.log(2.0)
     S2 = jnp.minimum(-dlam * jnp.sum(trap_w * f_vals), S2_max)
 
@@ -442,8 +444,7 @@ def _renyi2_lambda_integral_jit(apply_fun, params, model_state,
         ),
         grad_vals,
     )
-
-    return S2, grad_S2
+    return S2, grad_S2, ess_vals, lambda_grid
 
 def renyi2_entropy_and_grad_lambda_integral(vstate, subsystem_sites, n_samples,
                                             n_lambda=10, key=0, debug=False):
@@ -463,7 +464,7 @@ def renyi2_entropy_and_grad_lambda_integral(vstate, subsystem_sites, n_samples,
     swapped1 = jnp.concatenate([samples2[:, subsystem_sites], samples1[:, complement_sites]], axis=1)
     swapped2 = jnp.concatenate([samples1[:, subsystem_sites], samples2[:, complement_sites]], axis=1)
 
-    S2, grad_S2 = _renyi2_lambda_integral_jit(
+    S2, grad_S2, ess_vals, lambda_grid = _renyi2_lambda_integral_jit(
         vstate._apply_fun,
         vstate.parameters,
         vstate.model_state,
@@ -473,8 +474,582 @@ def renyi2_entropy_and_grad_lambda_integral(vstate, subsystem_sites, n_samples,
     )
 
     if debug:
+        #grad_flat, _ = jax.flatten_util.ravel_pytree(grad_S2)
+        #print(f"S₂    = {float(S2):.6f}")
+        #print(f"|∇S₂| = {jnp.linalg.norm(grad_flat):.6f}")
+        M = n_samples
+        print("── ESS de TI (Kish) ──")
+        for lam, ess in zip(lambda_grid, ess_vals):
+            print(f"  λ={float(lam):.3f}  ESS/M={float(ess)/M:.4f}  ({int(ess)} de {M})")
         grad_flat, _ = jax.flatten_util.ravel_pytree(grad_S2)
         print(f"S₂    = {float(S2):.6f}")
         print(f"|∇S₂| = {jnp.linalg.norm(grad_flat):.6f}")
 
     return float(S2), grad_S2
+
+#Metropolis-Hastings sampling for lambda integral method
+def _log_target_and_lnR(apply_fun, params, model_state, s1, s2, A, B, lam):
+    """log P̃(λ) y ln R, ambos salvo constante independiente de λ."""
+    sw1 = jnp.concatenate([s2[A], s1[B]])
+    sw2 = jnp.concatenate([s1[A], s2[B]])
+
+    def lpsi(s):
+        return jnp.real(apply_fun({"params": params, **model_state}, s[None])[0])
+
+    lp1  = lpsi(s1)
+    lp2  = lpsi(s2)
+    lsw1 = lpsi(sw1)
+    lsw2 = lpsi(sw2)
+
+    lnR    = (lsw1 + lsw2) - (lp1 + lp2)
+    log_P  = (2.0 - lam) * (lp1 + lp2) + lam * (lsw1 + lsw2)
+    return log_P, lnR
+
+def _lnR_single(apply_fun, params, model_state, s1, s2, A, B):
+    """ln R(s1, s2) para un par de configuraciones (sin batch)."""
+    sw1 = jnp.concatenate([s2[A], s1[B]])
+    sw2 = jnp.concatenate([s1[A], s2[B]])
+
+    def lpsi(s):
+        return jnp.real(apply_fun({"params": params, **model_state}, s[None])[0])
+
+    return (lpsi(sw1) + lpsi(sw2)) - (lpsi(s1) + lpsi(s2))
+
+def _metropolis_step(key, s1, s2, A, B, apply_fun, params, model_state,
+                     lam, spin_min, spin_max):
+    N = s1.shape[0]
+    k_site, k_unif = jax.random.split(key)
+
+    j     = jax.random.randint(k_site, (), 0, 2 * N)
+    is_s1 = j < N
+    site  = jnp.where(is_s1, j, j - N)
+
+    cur_val = jnp.where(is_s1, s1[site], s2[site])
+    new_val = ((spin_min + spin_max) - cur_val).astype(s1.dtype)
+
+    s1_prop = jax.lax.cond(is_s1, lambda s: s.at[site].set(new_val), lambda s: s, s1)
+    s2_prop = jax.lax.cond(is_s1, lambda s: s, lambda s: s.at[site].set(new_val), s2)
+
+    lp_cur,  _ = _log_target_and_lnR(apply_fun, params, model_state,
+                                     s1, s2, A, B, lam)
+    lp_prop, _ = _log_target_and_lnR(apply_fun, params, model_state,
+                                     s1_prop, s2_prop, A, B, lam)
+
+    accept = jnp.log(jax.random.uniform(k_unif)) < (lp_prop - lp_cur)
+
+    s1_new = jnp.where(accept, s1_prop, s1)
+    s2_new = jnp.where(accept, s2_prop, s2)
+    return s1_new, s2_new, accept.astype(jnp.float32)
+
+def _sweep_single_chain(key, s1, s2, A, B, apply_fun, params, model_state,
+                        lam, n_props, spin_min, spin_max):
+    """Versión rápida: n_props propuestas en un solo scan."""
+    keys = jax.random.split(key, n_props)
+
+    def body(carry, k):
+        s1, s2, acc_sum = carry
+        s1, s2, a = _metropolis_step(k, s1, s2, A, B, apply_fun, params,
+                                     model_state, lam, spin_min, spin_max)
+        return (s1, s2, acc_sum + a), None
+
+    (s1, s2, acc_sum), _ = jax.lax.scan(
+        body, (s1, s2, jnp.float32(0.0)), keys
+    )
+    return s1, s2, acc_sum / n_props
+
+def _make_sweep_batch(spin_min, spin_max):
+    def _fn(key, s1, s2, A, B, apply_fun, params, model_state, lam, n_props):
+        return _sweep_single_chain(key, s1, s2, A, B, apply_fun, params,
+                                   model_state, lam, n_props,
+                                   spin_min, spin_max)
+    return jax.vmap(
+        _fn,
+        in_axes=(0, 0, 0, None, None, None, None, None, None, None),
+    )
+
+def _sweep_single_chain_with_traj(key, s1, s2, A, B,
+                                   apply_fun, params, model_state,
+                                   lam, n_sweeps, n_props_per_sweep,
+                                   spin_min, spin_max):
+    """
+    Igual que _sweep_single_chain, pero divide el sweep total en
+    n_sweeps bloques de n_props_per_sweep propuestas cada uno, y
+    registra:
+        - ln R tras cada bloque  (n_sweeps,)
+        - acceptance rate por bloque (n_sweeps,)
+    """
+    keys_outer = jax.random.split(key, n_sweeps)
+
+    def block(carry, k_outer):
+        s1, s2, acc_sum = carry
+        keys_inner = jax.random.split(k_outer, n_props_per_sweep)
+
+        def single_prop(c, k):
+            s1, s2, acc = c
+            s1, s2, a = _metropolis_step(k, s1, s2, A, B, apply_fun, params,
+                                         model_state, lam, spin_min, spin_max)
+            return (s1, s2, acc + a), None
+
+        (s1_new, s2_new, acc_block), _ = jax.lax.scan(
+            single_prop, (s1, s2, jnp.float32(0.0)), keys_inner
+        )
+
+        lnR_block = _lnR_single(apply_fun, params, model_state,
+                                 s1_new, s2_new, A, B)
+        acc_rate = acc_block / n_props_per_sweep
+
+        return (s1_new, s2_new, acc_sum + acc_rate), (lnR_block, acc_rate)
+
+    (s1_final, s2_final, acc_total), (lnR_traj, acc_traj) = jax.lax.scan(
+        block, (s1, s2, jnp.float32(0.0)), keys_outer
+    )
+    return s1_final, s2_final, acc_total / n_sweeps, lnR_traj, acc_traj
+
+def _make_sweep_batch_with_traj(spin_min, spin_max):
+    def _fn(key, s1, s2, A, B, apply_fun, params, model_state,
+            lam, n_sweeps, n_props_per_sweep):
+        return _sweep_single_chain_with_traj(
+            key, s1, s2, A, B, apply_fun, params, model_state,
+            lam, n_sweeps, n_props_per_sweep, spin_min, spin_max
+        )
+    return jax.vmap(
+        _fn,
+        in_axes=(0, 0, 0, None, None, None, None, None, None, None, None),
+    )
+
+def _tau_int_per_chain(lnR_traj):
+    n_chains, n = lnR_traj.shape
+    x = lnR_traj - jnp.mean(lnR_traj, axis=1, keepdims=True)
+
+    # Varianza por cadena
+    var = jnp.mean(x**2, axis=1)                # (n_chains,)
+    good = var > 1e-10                          # cadenas con varianza no nula
+
+    # Autocovarianza vía FFT
+    fft = jnp.fft.rfft(x, n=2 * n, axis=1)
+    acov = jnp.fft.irfft(fft * jnp.conj(fft), n=2 * n, axis=1)[:, :n]
+
+    # Normalizar solo donde var>0; usar 'where' para evitar 0/0
+    acov_norm = jnp.where(
+        var[:, None] > 1e-10,
+        acov / jnp.where(acov[:, :1] > 1e-30, acov[:, :1], 1.0),
+        1.0,                                     # para cadenas "malas", ponemos rho_0=1
+    )
+
+    T = max(1, n // 4)
+    tau = 1.0 + 2.0 * jnp.sum(acov_norm[:, 1:T + 1], axis=1)
+    tau = jnp.maximum(tau, 1.0)
+
+    # Solo promediar sobre cadenas buenas
+    return jnp.where(good, tau, jnp.nan)
+
+def _lnR_batch(apply_fun, params, model_state, s1, s2, A, B):
+    sw1 = jnp.concatenate([s2[:, A], s1[:, B]], axis=1)
+    sw2 = jnp.concatenate([s1[:, A], s2[:, B]], axis=1)
+
+    def lpsi(s):
+        return jnp.real(apply_fun({"params": params, **model_state}, s))
+
+    return (jax.vmap(lpsi)(sw1) + jax.vmap(lpsi)(sw2)) \
+         - (jax.vmap(lpsi)(s1) + jax.vmap(lpsi)(s2))
+
+def _renyi2_drut_jit(apply_fun, params, model_state,
+                     s1_init, s2_init, A, B,
+                     n_lambda, n_sweeps_per_lam, n_props_per_sweep,
+                     key, spin_min, spin_max, debug):
+
+    lambda_grid = jnp.linspace(0.0, 1.0, n_lambda)
+
+    sweep_batch_fast = _make_sweep_batch(spin_min, spin_max)
+    sweep_batch_traj = _make_sweep_batch_with_traj(spin_min, spin_max)
+
+    def scan_lam(carry, lam):
+        s1, s2, k = carry
+        k_burn, k_next = jax.random.split(k)
+        keys_batch = jax.random.split(k_burn, s1.shape[0])
+
+        if debug:
+            # ── Ruta con diagnóstico: registra lnR por sweep, calcula τ_int ─
+            s1, s2, acc_mean, lnR_traj, acc_traj = sweep_batch_traj(
+                keys_batch, s1, s2, A, B,
+                apply_fun, params, model_state,
+                lam, n_sweeps_per_lam, n_props_per_sweep,
+            )
+            #tau = _tau_int_per_chain(lnR_traj)          # (n_chains,)
+            n_total = s1.shape[0] * n_sweeps_per_lam
+            tau = _tau_int_per_chain(lnR_traj)
+            tau_mean = jnp.nanmean(tau)                      # ignora NaN
+            ess_lam = n_total / tau_mean
+            #ess_lam = n_total / jnp.mean(tau)            # ESS efectivo
+            f_lam = jnp.mean(lnR_traj[:, -1])            # lnR del estado final
+
+            jax.debug.print(
+                "λ={lam:.3f}  f(λ)={f:.4f}  accept={acc:.3f}  "
+                "τ_int={tau:.2f}  ESS/M={ess:.4f}",
+                lam=lam,
+                f=jnp.mean(f_lam),                    # ← media sobre cadenas
+                acc=jnp.mean(acc_mean),               # ← media sobre cadenas
+                tau=jnp.mean(tau),
+                ess=jnp.mean(ess_lam) / n_total,
+            )
+        else:
+            # ── Ruta rápida sin diagnóstico ────────────────────────────────
+            n_props = n_sweeps_per_lam * n_props_per_sweep
+            s1, s2, _ = sweep_batch_fast(
+                keys_batch, s1, s2, A, B,
+                apply_fun, params, model_state, lam, n_props,
+            )
+
+        return (s1, s2, k_next), (s1, s2)
+
+    (_, _, _), (s1_stack, s2_stack) = jax.lax.scan(
+        scan_lam, (s1_init, s2_init, key), lambda_grid
+    )
+
+    lnR_stack = jax.vmap(
+        lambda a, b: _lnR_batch(apply_fun, params, model_state, a, b, A, B)
+    )(s1_stack, s2_stack)
+    f_vals = jnp.mean(lnR_stack, axis=1)
+
+    dlam   = lambda_grid[1] - lambda_grid[0]
+    trap_w = jnp.ones(n_lambda).at[0].set(0.5).at[-1].set(0.5)
+    S2     = -dlam * jnp.sum(trap_w * f_vals)
+
+    return S2, s1_stack, s2_stack, lambda_grid
+
+def _drut_loss(apply_fun, params, model_state, s1_stack, s2_stack,
+               lambda_grid, A, B):
+    """loss tal que ∇loss = ∇S₂ estimado (con REINFORCE)."""
+    def lpsi(s):
+        return jnp.real(apply_fun({"params": params, **model_state}, s))
+
+    def per_lambda(s1_b, s2_b, lam):
+        sw1 = jnp.concatenate([s2_b[:, A], s1_b[:, B]], axis=1)
+        sw2 = jnp.concatenate([s1_b[:, A], s2_b[:, B]], axis=1)
+
+        lp1  = jax.vmap(lpsi)(s1_b)
+        lp2  = jax.vmap(lpsi)(s2_b)
+        lsw1 = jax.vmap(lpsi)(sw1)
+        lsw2 = jax.vmap(lpsi)(sw2)
+
+        lnR   = (lsw1 + lsw2) - (lp1 + lp2)
+        log_P = (2.0 - lam) * (lp1 + lp2) + lam * (lsw1 + lsw2)
+
+        f_lam = jnp.mean(lnR)
+        lnR_c = jax.lax.stop_gradient(lnR - f_lam)
+        return f_lam + jnp.mean(lnR_c * log_P)
+
+    contribs = jax.vmap(per_lambda)(s1_stack, s2_stack, lambda_grid)
+    dlam   = lambda_grid[1] - lambda_grid[0]
+    trap_w = jnp.ones_like(lambda_grid).at[0].set(0.5).at[-1].set(0.5)
+    return dlam * jnp.sum(trap_w * contribs)
+
+def renyi2_drut_sampling(vstate, subsystem_sites, n_chains,
+                         n_sweeps_per_lam=50, n_props_per_sweep=None,
+                         n_lambda=10, key=0, debug=False):
+
+    N_sites = vstate.hilbert.size
+    A = jnp.array(subsystem_sites, dtype=int)
+    B = jnp.setdiff1d(jnp.arange(N_sites), A)
+
+    if n_props_per_sweep is None:
+        n_props_per_sweep = 2 * N_sites
+
+    local_states = jnp.array(vstate.hilbert.local_states)
+    spin_min = float(local_states.min())
+    spin_max = float(local_states.max())
+    if debug:
+        flip_const = spin_min + spin_max
+        print(f"[renyi2_drut] local_states = {local_states.tolist()}  "
+              f"→ flip: new = ({spin_min} + {spin_max}) - cur = "
+              f"{flip_const:.1f} - cur")
+
+    all_init = vstate.sample(n_samples=2 * n_chains)
+    all_init = all_init.reshape(2 * n_chains, N_sites)
+    all_init = jax.random.permutation(jax.random.PRNGKey(key), all_init, axis=0)
+    s1_init = all_init[:n_chains]
+    s2_init = all_init[n_chains:]
+
+    S2, s1_stack, s2_stack, lambda_grid = _renyi2_drut_jit(
+        vstate._apply_fun, vstate.parameters, vstate.model_state,
+        s1_init, s2_init, A, B,
+        n_lambda, n_sweeps_per_lam, n_props_per_sweep,
+        jax.random.PRNGKey(key + 1),
+        spin_min, spin_max, debug,
+    )
+
+    grad_loss = jax.grad(lambda p: _drut_loss(
+        vstate._apply_fun, p, vstate.model_state,
+        s1_stack, s2_stack, lambda_grid, A, B,
+    ))(vstate.parameters)
+    grad_S2 = jax.tree_util.tree_map(lambda g: -g, grad_loss)
+
+    if debug:
+        gf, _ = jax.flatten_util.ravel_pytree(grad_S2)
+        print(f"S₂    = {float(jnp.asarray(S2)):.6f}")
+        print(f"|∇S₂| = {jnp.linalg.norm(gf):.6f}")
+
+    return float(S2), grad_S2
+
+
+#Increment trick, Metropolis-Hastings sampling for log(R_{A^{i+1}} / R_{A^i})
+def _swap_A(s, s_other, A_sites):
+    """
+    Devuelve una copia de s en la que los sitios indicados por A_sites
+    se han sustituido por los correspondientes de s_other, manteniendo el
+    orden original de los sitios.
+
+    Si A_sites está vacío, devuelve s sin tocar.
+    """
+    N = s.shape[-1]
+    mask = jnp.zeros(N, dtype=bool).at[A_sites].set(True)
+    return jnp.where(mask, s_other, s)
+
+def _log_q_i_scalar(apply_fun, params, model_state, s1, s2, A_i):
+    """log q_i para un único par (s1, s2). Sin batch."""
+    def lpsi(s):
+        return jnp.real(apply_fun({"params": params, **model_state}, s[None])[0])
+
+    if A_i.shape[0] == 0:
+        return 2.0 * lpsi(s1) + 2.0 * lpsi(s2)
+
+    sw1 = _swap_A(s1, s2, A_i)
+    sw2 = _swap_A(s2, s1, A_i)
+    return lpsi(s1) + lpsi(s2) + lpsi(sw1) + lpsi(sw2)
+
+def _metropolis_step_q(key, s1, s2, A_i, apply_fun, params, model_state,
+                       spin_min, spin_max):
+    """Un paso Metropolis: elige un sitio al azar de s1 o s2, lo flipea."""
+    N = s1.shape[0]
+    k_site, k_unif = jax.random.split(key)
+
+    j     = jax.random.randint(k_site, (), 0, 2 * N)
+    is_s1 = j < N
+    site  = jnp.where(is_s1, j, j - N)
+
+    cur_val = jnp.where(is_s1, s1[site], s2[site])
+    new_val = ((spin_min + spin_max) - cur_val).astype(s1.dtype)
+
+    s1_prop = jax.lax.cond(is_s1, lambda s: s.at[site].set(new_val), lambda s: s, s1)
+    s2_prop = jax.lax.cond(is_s1, lambda s: s, lambda s: s.at[site].set(new_val), s2)
+
+    lp_cur  = _log_q_i_scalar(apply_fun, params, model_state, s1,      s2,      A_i)
+    lp_prop = _log_q_i_scalar(apply_fun, params, model_state, s1_prop, s2_prop, A_i)
+
+    accept = jnp.log(jax.random.uniform(k_unif)) < (lp_prop - lp_cur)
+    s1_new = jnp.where(accept, s1_prop, s1)
+    s2_new = jnp.where(accept, s2_prop, s2)
+    return s1_new, s2_new, accept.astype(jnp.float32)
+
+def _sweep_q(key, s1, s2, A_i, apply_fun, params, model_state, n_props,
+             spin_min, spin_max):
+    keys = jax.random.split(key, n_props)
+
+    def body(carry, k):
+        s1, s2, acc = carry
+        s1, s2, a = _metropolis_step_q(k, s1, s2, A_i, apply_fun, params,
+                                       model_state, spin_min, spin_max)
+        return (s1, s2, acc + a), None
+
+    (s1, s2, acc), _ = jax.lax.scan(body, (s1, s2, jnp.float32(0.0)), keys)
+    return s1, s2, acc / n_props
+
+def _make_sweep_batch_increment(spin_min, spin_max):
+    """vmap de _sweep_q sobre las cadenas."""
+    def _fn(key, s1, s2, A_i, apply_fun, params, model_state, n_props):
+        return _sweep_q(key, s1, s2, A_i, apply_fun, params, model_state,
+                        n_props, spin_min, spin_max)
+    return jax.vmap(
+        _fn,
+        in_axes=(0, 0, 0, None, None, None, None, None),
+    )
+
+def _log_ratio_single(apply_fun, params, model_state, s1, s2, A_i, A_ip1):
+    """
+    log(R_{A^{i+1}} / R_{A^i}) = ℓ(s1^(i+1)) + ℓ(s2^(i+1))
+                                - ℓ(s1^(i))   - ℓ(s2^(i)).
+    """
+    def lpsi(s):
+        return jnp.real(apply_fun({"params": params, **model_state}, s[None])[0])
+
+    sw1_i   = _swap_A(s1, s2, A_i)
+    sw2_i   = _swap_A(s2, s1, A_i)
+    sw1_ip1 = _swap_A(s1, s2, A_ip1)
+    sw2_ip1 = _swap_A(s2, s1, A_ip1)
+
+    return (lpsi(sw1_ip1) + lpsi(sw2_ip1)) - (lpsi(sw1_i) + lpsi(sw2_i))
+
+def _increment_kernel(apply_fun, params, model_state,
+                      s1_init, s2_init, A_list, n_props,
+                      key, spin_min, spin_max, debug):
+    """
+    A_list: lista de arrays [A^0, A^1, ..., A^n], con A^{i+1} = A^i + 1 sitio.
+    Devuelve: ratios ⟨R_{A^{i+1}}/R_{A^i}⟩_{q_i}, y los estados finales.
+
+    Nota: el bucle sobre regiones es un `for` Python (no scan), porque
+    las A^i tienen shapes distintas y jax.lax.scan exige formas iguales.
+    """
+    sweep_batch = _make_sweep_batch_increment(spin_min, spin_max)
+
+    s1, s2 = s1_init, s2_init
+    k      = key
+
+    ratios   = []
+    s1_list  = []
+    s2_list  = []
+
+    for i in range(len(A_list) - 1):
+        A_i, A_ip1 = A_list[i], A_list[i + 1]
+
+        k_sweep, k = jax.random.split(k)
+        keys = jax.random.split(k_sweep, s1.shape[0])
+
+        s1, s2, acc = sweep_batch(keys, s1, s2, A_i,
+                                  apply_fun, params, model_state, n_props)
+
+        log_r = jax.vmap(lambda a, b: _log_ratio_single(
+            apply_fun, params, model_state, a, b, A_i, A_ip1,
+        ))(s1, s2)
+        ratio_i = jnp.mean(jnp.exp(log_r))
+
+        if debug:
+            jax.debug.print(
+                "i: |A^i|={size:2d}  accept={acc:.3f}  ratio={r:.6f}  "
+                "-log ratio={lr:.6f}",
+                size=A_i.shape[0],
+                acc=jnp.mean(acc),
+                r=ratio_i,
+                lr=-jnp.log(ratio_i),
+            )
+
+        ratios.append(ratio_i)
+        s1_list.append(s1)
+        s2_list.append(s2)
+
+    ratios   = jnp.stack(ratios)     # (n_sub,)
+    s1_stack = jnp.stack(s1_list)    # (n_sub, n_chains, N)
+    s2_stack = jnp.stack(s2_list)
+
+    return ratios, s1_stack, s2_stack
+
+def _increment_loss(apply_fun, params, model_state, s1_stack, s2_stack, A_list):
+    """
+    Loss tal que ∇_θ loss = ∇_θ S₂ estimado, con corrección REINFORCE.
+
+    En cada región A^i:
+        ratio_i = E_{q_i}[ r_i ],   r_i = R_{A^{i+1}}/R_{A^i}
+        ∇_θ ratio_i = E_{q_i}[ r_i · ∇_θ( log r_i + log q_i ) ]
+    (porque ∇_θ E_q[f] = E_q[f · ∇_θ log q] + E_q[∇_θ f]
+     y ∇_θ log q = ∇_θ log q, mientras que ∇_θ f = f ∇_θ log f).
+
+    La loss es -log(∏ ratio_i), y su gradiente es ∇S₂.
+    """
+    def lpsi(s):
+        return jnp.real(apply_fun({"params": params, **model_state}, s))
+
+    total = 0.0
+    for i in range(len(s1_stack)):
+        s1, s2 = s1_stack[i], s2_stack[i]
+        A_i, A_ip1 = A_list[i], A_list[i + 1]
+
+        # swaps para el peso q_i
+        sw1_i = _swap_A(s1, s2, A_i)
+        sw2_i = _swap_A(s2, s1, A_i)
+        # swaps para el ratio r_i
+        sw1_ip1 = _swap_A(s1, s2, A_ip1)
+        sw2_ip1 = _swap_A(s2, s1, A_ip1)
+
+        lo1   = jax.vmap(lpsi)(s1)
+        lo2   = jax.vmap(lpsi)(s2)
+        lsi1  = jax.vmap(lpsi)(sw1_i)
+        lsi2  = jax.vmap(lpsi)(sw2_i)
+        lsip1 = jax.vmap(lpsi)(sw1_ip1)
+        lsip2 = jax.vmap(lpsi)(sw2_ip1)
+
+        log_r = (lsip1 + lsip2) - (lsi1 + lsi2)     # log r_i
+        log_q = (lo1 + lo2) + (lsi1 + lsi2)         # log q_i  (salvo cte)
+
+        # stop-gradient del ratio medio, para construir REINFORCE
+        ratio_sg = jax.lax.stop_gradient(jnp.mean(jnp.exp(log_r)))
+        log_r_c  = jax.lax.stop_gradient(log_r - jnp.log(ratio_sg))
+        exp_r_sg = jax.lax.stop_gradient(jnp.exp(log_r))
+
+        # término REINFORCE: E_q[ r · (log r - <log r>) + r · log q ]
+        # (el log r - <log r> es stop-grad, y log q es lo diferenciable)
+        total = total + ratio_sg + jnp.mean(exp_r_sg * (log_r_c + log_q))
+
+    return -jnp.log(total)
+
+def renyi2_increment_sampling(vstate, subsystem_sites, n_chains,
+                              n_sweeps_per_site=50,
+                              n_props_per_sweep=None,
+                              key=0, debug=False):
+    """
+    Estima S₂(A) con el increment trick de Hastings et al.
+
+    Parámetros
+    ----------
+    vstate              : MCState de NetKet.
+    subsystem_sites     : lista/array con los sitios del subsistema A.
+    n_chains            : número de cadenas Metropolis paralelas.
+    n_sweeps_per_site   : propuestas Metropolis totales por sitio nuevo
+                          (= n_props_per_sweep × n_sweeps_per_site).
+    n_props_per_sweep   : si None, 2*N.
+    key                 : semilla.
+    debug               : imprime diagnóstico por sitio.
+
+    Devuelve
+    --------
+    S2       : float, entropía de Rényi-2 de A.
+    grad_S2  : gradiente respecto a vstate.parameters (misma estructura).
+    ratios   : array (n_sub,), los ⟨r_i⟩_{q_i}.
+    A_list   : lista de arrays [A^0, ..., A^n].
+    """
+    N_sites = vstate.hilbert.size
+    A_sites = jnp.array(subsystem_sites, dtype=int)
+    n_sub   = len(subsystem_sites)
+
+    if n_props_per_sweep is None:
+        n_props_per_sweep = 2 * N_sites
+
+    n_props = n_sweeps_per_site * n_props_per_sweep
+
+    local_states = jnp.array(vstate.hilbert.local_states)
+    spin_min = float(local_states.min())
+    spin_max = float(local_states.max())
+
+    # Regiones anidadas: A^i = primeros i sitios del subsistema
+    A_list = [A_sites[:i] for i in range(n_sub + 1)]
+
+    # Estado inicial: muestras del vstate (que es q_0 = p⊗p)
+    all_init = vstate.sample(n_samples=2 * n_chains).reshape(2 * n_chains, N_sites)
+    all_init = jax.random.permutation(jax.random.PRNGKey(key), all_init, axis=0)
+    s1_init = all_init[:n_chains]
+    s2_init = all_init[n_chains:]
+
+    # ── Núcleo: annealing + ratios ────────────────────────────────────────
+    ratios, s1_stack, s2_stack = _increment_kernel(
+        vstate._apply_fun, vstate.parameters, vstate.model_state,
+        s1_init, s2_init, A_list, n_props,
+        jax.random.PRNGKey(key + 1),
+        spin_min, spin_max, debug,
+    )
+
+    purity = jnp.prod(ratios)
+    S2     = -jnp.log(purity)
+
+    # ── Gradiente vía REINFORCE sobre la loss ────────────────────────────
+    loss_fn = lambda p: _increment_loss(
+        vstate._apply_fun, p, vstate.model_state,
+        s1_stack, s2_stack, A_list,
+    )
+    grad_loss = jax.grad(loss_fn)(vstate.parameters)
+    grad_S2   = jax.tree_util.tree_map(lambda g: -g, grad_loss)
+
+    if debug:
+        gf, _ = jax.flatten_util.ravel_pytree(grad_S2)
+        print(f"  S₂ (increment) = {float(S2):.6f}")
+        print(f"  Tr(ρ_A²)       = {float(purity):.6e}")
+        print(f"  |∇S₂|          = {jnp.linalg.norm(gf):.6f}")
+
+    return float(S2), grad_S2, ratios, A_list
