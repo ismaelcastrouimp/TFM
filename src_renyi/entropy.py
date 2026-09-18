@@ -515,108 +515,6 @@ def _lnR_single(apply_fun, params, model_state, s1, s2, A, B):
 
     return (lpsi(sw1) + lpsi(sw2)) - (lpsi(s1) + lpsi(s2))
 
-def _metropolis_step(key, s1, s2, A, B, apply_fun, params, model_state,
-                     lam, spin_min, spin_max):
-    N = s1.shape[0]
-    k_site, k_unif = jax.random.split(key)
-
-    j     = jax.random.randint(k_site, (), 0, 2 * N)
-    is_s1 = j < N
-    site  = jnp.where(is_s1, j, j - N)
-
-    cur_val = jnp.where(is_s1, s1[site], s2[site])
-    new_val = ((spin_min + spin_max) - cur_val).astype(s1.dtype)
-
-    s1_prop = jax.lax.cond(is_s1, lambda s: s.at[site].set(new_val), lambda s: s, s1)
-    s2_prop = jax.lax.cond(is_s1, lambda s: s, lambda s: s.at[site].set(new_val), s2)
-
-    lp_cur,  _ = _log_target_and_lnR(apply_fun, params, model_state,
-                                     s1, s2, A, B, lam)
-    lp_prop, _ = _log_target_and_lnR(apply_fun, params, model_state,
-                                     s1_prop, s2_prop, A, B, lam)
-
-    accept = jnp.log(jax.random.uniform(k_unif)) < (lp_prop - lp_cur)
-
-    s1_new = jnp.where(accept, s1_prop, s1)
-    s2_new = jnp.where(accept, s2_prop, s2)
-    return s1_new, s2_new, accept.astype(jnp.float32)
-
-def _sweep_single_chain(key, s1, s2, A, B, apply_fun, params, model_state,
-                        lam, n_props, spin_min, spin_max):
-    """Versión rápida: n_props propuestas en un solo scan."""
-    keys = jax.random.split(key, n_props)
-
-    def body(carry, k):
-        s1, s2, acc_sum = carry
-        s1, s2, a = _metropolis_step(k, s1, s2, A, B, apply_fun, params,
-                                     model_state, lam, spin_min, spin_max)
-        return (s1, s2, acc_sum + a), None
-
-    (s1, s2, acc_sum), _ = jax.lax.scan(
-        body, (s1, s2, jnp.float32(0.0)), keys
-    )
-    return s1, s2, acc_sum / n_props
-
-def _make_sweep_batch(spin_min, spin_max):
-    def _fn(key, s1, s2, A, B, apply_fun, params, model_state, lam, n_props):
-        return _sweep_single_chain(key, s1, s2, A, B, apply_fun, params,
-                                   model_state, lam, n_props,
-                                   spin_min, spin_max)
-    return jax.vmap(
-        _fn,
-        in_axes=(0, 0, 0, None, None, None, None, None, None, None),
-    )
-
-def _sweep_single_chain_with_traj(key, s1, s2, A, B,
-                                   apply_fun, params, model_state,
-                                   lam, n_sweeps, n_props_per_sweep,
-                                   spin_min, spin_max):
-    """
-    Igual que _sweep_single_chain, pero divide el sweep total en
-    n_sweeps bloques de n_props_per_sweep propuestas cada uno, y
-    registra:
-        - ln R tras cada bloque  (n_sweeps,)
-        - acceptance rate por bloque (n_sweeps,)
-    """
-    keys_outer = jax.random.split(key, n_sweeps)
-
-    def block(carry, k_outer):
-        s1, s2, acc_sum = carry
-        keys_inner = jax.random.split(k_outer, n_props_per_sweep)
-
-        def single_prop(c, k):
-            s1, s2, acc = c
-            s1, s2, a = _metropolis_step(k, s1, s2, A, B, apply_fun, params,
-                                         model_state, lam, spin_min, spin_max)
-            return (s1, s2, acc + a), None
-
-        (s1_new, s2_new, acc_block), _ = jax.lax.scan(
-            single_prop, (s1, s2, jnp.float32(0.0)), keys_inner
-        )
-
-        lnR_block = _lnR_single(apply_fun, params, model_state,
-                                 s1_new, s2_new, A, B)
-        acc_rate = acc_block / n_props_per_sweep
-
-        return (s1_new, s2_new, acc_sum + acc_rate), (lnR_block, acc_rate)
-
-    (s1_final, s2_final, acc_total), (lnR_traj, acc_traj) = jax.lax.scan(
-        block, (s1, s2, jnp.float32(0.0)), keys_outer
-    )
-    return s1_final, s2_final, acc_total / n_sweeps, lnR_traj, acc_traj
-
-def _make_sweep_batch_with_traj(spin_min, spin_max):
-    def _fn(key, s1, s2, A, B, apply_fun, params, model_state,
-            lam, n_sweeps, n_props_per_sweep):
-        return _sweep_single_chain_with_traj(
-            key, s1, s2, A, B, apply_fun, params, model_state,
-            lam, n_sweeps, n_props_per_sweep, spin_min, spin_max
-        )
-    return jax.vmap(
-        _fn,
-        in_axes=(0, 0, 0, None, None, None, None, None, None, None, None),
-    )
-
 def _tau_int_per_chain(lnR_traj):
     n_chains, n = lnR_traj.shape
     x = lnR_traj - jnp.mean(lnR_traj, axis=1, keepdims=True)
@@ -653,6 +551,160 @@ def _lnR_batch(apply_fun, params, model_state, s1, s2, A, B):
     return (jax.vmap(lpsi)(sw1) + jax.vmap(lpsi)(sw2)) \
          - (jax.vmap(lpsi)(s1) + jax.vmap(lpsi)(s2))
 
+def _drut_loss(apply_fun, params, model_state, s1_stack, s2_stack,
+               lambda_grid, A, B):
+    """loss tal que ∇loss = ∇S₂ estimado (con REINFORCE)."""
+    def lpsi(s):
+        return jnp.real(apply_fun({"params": params, **model_state}, s))
+
+    def per_lambda(s1_b, s2_b, lam):
+        sw1 = jnp.concatenate([s2_b[:, A], s1_b[:, B]], axis=1)
+        sw2 = jnp.concatenate([s1_b[:, A], s2_b[:, B]], axis=1)
+
+        lp1  = jax.vmap(lpsi)(s1_b)
+        lp2  = jax.vmap(lpsi)(s2_b)
+        lsw1 = jax.vmap(lpsi)(sw1)
+        lsw2 = jax.vmap(lpsi)(sw2)
+
+        lnR   = (lsw1 + lsw2) - (lp1 + lp2)
+        log_P = (2.0 - lam) * (lp1 + lp2) + lam * (lsw1 + lsw2)
+
+        f_lam = jnp.mean(lnR)
+        lnR_c = jax.lax.stop_gradient(lnR - f_lam)
+        return f_lam + jnp.mean(lnR_c * log_P)
+
+    contribs = jax.vmap(per_lambda)(s1_stack, s2_stack, lambda_grid)
+    dlam   = lambda_grid[1] - lambda_grid[0]
+    trap_w = jnp.ones_like(lambda_grid).at[0].set(0.5).at[-1].set(0.5)
+    return dlam * jnp.sum(trap_w * contribs)
+
+def _metropolis_step_cached(key, s1, s2, log_P_cur,
+                             A, B, apply_fun, params, model_state,
+                             lam, spin_min, spin_max):
+    """
+    Paso MH que reutiliza log_P del estado actual (evita recalcularlo).
+
+    Convención: log_P_cur es log P̃(λ; s1, s2) evaluado en el estado actual.
+    Al aceptar la propuesta, actualizamos log_P_cur con el valor de la propuesta.
+    Al rechazar, log_P_cur no cambia.
+    """
+    N = s1.shape[0]
+    k_site, k_unif = jax.random.split(key)
+
+    j     = jax.random.randint(k_site, (), 0, 2 * N)
+    is_s1 = j < N
+    site  = jnp.where(is_s1, j, j - N)
+
+    cur_val = jnp.where(is_s1, s1[site], s2[site])
+    new_val = ((spin_min + spin_max) - cur_val).astype(s1.dtype)
+
+    s1_prop = jax.lax.cond(is_s1, lambda s: s.at[site].set(new_val), lambda s: s, s1)
+    s2_prop = jax.lax.cond(is_s1, lambda s: s, lambda s: s.at[site].set(new_val), s2)
+
+    # ── Solo evaluamos la PROPUESTA (log_P_cur ya lo tenemos) ──────────
+    lp_prop, _ = _log_target_and_lnR(apply_fun, params, model_state,
+                                     s1_prop, s2_prop, A, B, lam)
+
+    accept = jnp.log(jax.random.uniform(k_unif)) < (lp_prop - log_P_cur)
+
+    s1_new    = jnp.where(accept, s1_prop, s1)
+    s2_new    = jnp.where(accept, s2_prop, s2)
+    log_P_new = jnp.where(accept, lp_prop, log_P_cur)
+
+    return s1_new, s2_new, log_P_new, accept.astype(jnp.float32)
+
+def _sweep_single_chain_cached(key, s1, s2, A, B,
+                               apply_fun, params, model_state,
+                               lam, n_props, spin_min, spin_max):
+    """
+    Sweep con caching: inicializa log_P_cur UNA VEZ y luego reutiliza.
+
+    Para n_props pasos, esto hace:
+      - 1 evaluación inicial (para log_P_cur)
+      - n_props evaluaciones (una por propuesta)
+    vs. las 2*n_props del original. Ahorro ~2×.
+    """
+    # ── Inicializar log_P_cur UNA VEZ ────────────────────────────────────
+    log_P_cur, _ = _log_target_and_lnR(apply_fun, params, model_state,
+                                       s1, s2, A, B, lam)
+
+    keys = jax.random.split(key, n_props)
+
+    def body(carry, k):
+        s1, s2, log_P, acc_sum = carry
+        s1, s2, log_P, a = _metropolis_step_cached(
+            k, s1, s2, log_P, A, B, apply_fun, params, model_state,
+            lam, spin_min, spin_max
+        )
+        return (s1, s2, log_P, acc_sum + a), None
+
+    (s1, s2, _, acc_sum), _ = jax.lax.scan(
+        body, (s1, s2, log_P_cur, jnp.float32(0.0)), keys
+    )
+    return s1, s2, acc_sum / n_props
+
+def _make_sweep_batch_cached(spin_min, spin_max):
+    def _fn(key, s1, s2, A, B, apply_fun, params, model_state, lam, n_props):
+        return _sweep_single_chain_cached(
+            key, s1, s2, A, B, apply_fun, params, model_state,
+            lam, n_props, spin_min, spin_max
+        )
+    return jax.vmap(
+        _fn,
+        in_axes=(0, 0, 0, None, None, None, None, None, None, None),
+    )
+
+def _sweep_single_chain_with_traj_cached(key, s1, s2, A, B,
+                                          apply_fun, params, model_state,
+                                          lam, n_sweeps, n_props_per_sweep,
+                                          spin_min, spin_max):
+    """
+    Versión con traza + caching. log_P_cur se pasa entre bloques.
+    """
+    log_P_cur, _ = _log_target_and_lnR(apply_fun, params, model_state,
+                                       s1, s2, A, B, lam)
+
+    keys_outer = jax.random.split(key, n_sweeps)
+
+    def block(carry, k_outer):
+        s1, s2, log_P, acc_sum = carry
+        keys_inner = jax.random.split(k_outer, n_props_per_sweep)
+
+        def single_prop(c, k):
+            s1, s2, log_P, acc = c
+            s1, s2, log_P, a = _metropolis_step_cached(
+                k, s1, s2, log_P, A, B, apply_fun, params, model_state,
+                lam, spin_min, spin_max
+            )
+            return (s1, s2, log_P, acc + a), None
+
+        (s1_new, s2_new, log_P_new, acc_block), _ = jax.lax.scan(
+            single_prop, (s1, s2, log_P, jnp.float32(0.0)), keys_inner
+        )
+
+        lnR_block = _lnR_single(apply_fun, params, model_state,
+                                 s1_new, s2_new, A, B)
+        acc_rate = acc_block / n_props_per_sweep
+
+        return (s1_new, s2_new, log_P_new, acc_sum + acc_rate), (lnR_block, acc_rate)
+
+    (s1_final, s2_final, _, acc_total), (lnR_traj, acc_traj) = jax.lax.scan(
+        block, (s1, s2, log_P_cur, jnp.float32(0.0)), keys_outer
+    )
+    return s1_final, s2_final, acc_total / n_sweeps, lnR_traj, acc_traj
+
+def _make_sweep_batch_with_traj_cached(spin_min, spin_max):
+    def _fn(key, s1, s2, A, B, apply_fun, params, model_state,
+            lam, n_sweeps, n_props_per_sweep):
+        return _sweep_single_chain_with_traj_cached(
+            key, s1, s2, A, B, apply_fun, params, model_state,
+            lam, n_sweeps, n_props_per_sweep, spin_min, spin_max
+        )
+    return jax.vmap(
+        _fn,
+        in_axes=(0, 0, 0, None, None, None, None, None, None, None, None),
+    )
+
 def _renyi2_drut_jit(apply_fun, params, model_state,
                      s1_init, s2_init, A, B,
                      n_lambda, n_sweeps_per_lam, n_props_per_sweep,
@@ -660,8 +712,8 @@ def _renyi2_drut_jit(apply_fun, params, model_state,
 
     lambda_grid = jnp.linspace(0.0, 1.0, n_lambda)
 
-    sweep_batch_fast = _make_sweep_batch(spin_min, spin_max)
-    sweep_batch_traj = _make_sweep_batch_with_traj(spin_min, spin_max)
+    sweep_batch_fast = _make_sweep_batch_cached(spin_min, spin_max)
+    sweep_batch_traj = _make_sweep_batch_with_traj_cached(spin_min, spin_max)
 
     def scan_lam(carry, lam):
         s1, s2, k = carry
@@ -717,35 +769,8 @@ def _renyi2_drut_jit(apply_fun, params, model_state,
 
     return S2, s1_stack, s2_stack, lambda_grid
 
-def _drut_loss(apply_fun, params, model_state, s1_stack, s2_stack,
-               lambda_grid, A, B):
-    """loss tal que ∇loss = ∇S₂ estimado (con REINFORCE)."""
-    def lpsi(s):
-        return jnp.real(apply_fun({"params": params, **model_state}, s))
-
-    def per_lambda(s1_b, s2_b, lam):
-        sw1 = jnp.concatenate([s2_b[:, A], s1_b[:, B]], axis=1)
-        sw2 = jnp.concatenate([s1_b[:, A], s2_b[:, B]], axis=1)
-
-        lp1  = jax.vmap(lpsi)(s1_b)
-        lp2  = jax.vmap(lpsi)(s2_b)
-        lsw1 = jax.vmap(lpsi)(sw1)
-        lsw2 = jax.vmap(lpsi)(sw2)
-
-        lnR   = (lsw1 + lsw2) - (lp1 + lp2)
-        log_P = (2.0 - lam) * (lp1 + lp2) + lam * (lsw1 + lsw2)
-
-        f_lam = jnp.mean(lnR)
-        lnR_c = jax.lax.stop_gradient(lnR - f_lam)
-        return f_lam + jnp.mean(lnR_c * log_P)
-
-    contribs = jax.vmap(per_lambda)(s1_stack, s2_stack, lambda_grid)
-    dlam   = lambda_grid[1] - lambda_grid[0]
-    trap_w = jnp.ones_like(lambda_grid).at[0].set(0.5).at[-1].set(0.5)
-    return dlam * jnp.sum(trap_w * contribs)
-
-def renyi2_drut_sampling(vstate, subsystem_sites, n_chains,
-                         n_sweeps_per_lam=50, n_props_per_sweep=None,
+def renyi2_drut_sampling(vstate, subsystem_sites, n_chains=256,
+                         n_sweeps_per_lam=20, n_props_per_sweep=None,
                          n_lambda=10, key=0, debug=False):
 
     N_sites = vstate.hilbert.size
@@ -790,7 +815,6 @@ def renyi2_drut_sampling(vstate, subsystem_sites, n_chains,
         print(f"|∇S₂| = {jnp.linalg.norm(gf):.6f}")
 
     return float(S2), grad_S2
-
 
 #Increment trick, Metropolis-Hastings sampling for log(R_{A^{i+1}} / R_{A^i})
 def _swap_A(s, s_other, A_sites):
@@ -934,15 +958,15 @@ def _increment_kernel(apply_fun, params, model_state,
 
 def _increment_loss(apply_fun, params, model_state, s1_stack, s2_stack, A_list):
     """
-    Loss tal que ∇_θ loss = ∇_θ S₂ estimado, con corrección REINFORCE.
+    Loss tal que ∇_θ loss = ∇_θ S₂ (con signo correcto).
 
-    En cada región A^i:
-        ratio_i = E_{q_i}[ r_i ],   r_i = R_{A^{i+1}}/R_{A^i}
-        ∇_θ ratio_i = E_{q_i}[ r_i · ∇_θ( log r_i + log q_i ) ]
-    (porque ∇_θ E_q[f] = E_q[f · ∇_θ log q] + E_q[∇_θ f]
-     y ∇_θ log q = ∇_θ log q, mientras que ∇_θ f = f ∇_θ log f).
+    S₂ = -Σ_i log(r_i),  r_i = E_{q_i}[f_i],  f_i = R_{A^{i+1}}/R_{A^i}
 
-    La loss es -log(∏ ratio_i), y su gradiente es ∇S₂.
+    La pérdida se construye como suma de:
+
+      log(mean(f_i))                     ← diferenciable en θ (vía f_i)
+    + mean(stop_grad(w_i - 1) * log q_i) ← REINFORCE por la dependencia
+                                            de q_i en θ (con baseline)
     """
     def lpsi(s):
         return jnp.real(apply_fun({"params": params, **model_state}, s))
@@ -952,10 +976,9 @@ def _increment_loss(apply_fun, params, model_state, s1_stack, s2_stack, A_list):
         s1, s2 = s1_stack[i], s2_stack[i]
         A_i, A_ip1 = A_list[i], A_list[i + 1]
 
-        # swaps para el peso q_i
-        sw1_i = _swap_A(s1, s2, A_i)
-        sw2_i = _swap_A(s2, s1, A_i)
-        # swaps para el ratio r_i
+        # ── Swaps y log-amplitudes ────────────────────────────────────────
+        sw1_i   = _swap_A(s1, s2, A_i)
+        sw2_i   = _swap_A(s2, s1, A_i)
         sw1_ip1 = _swap_A(s1, s2, A_ip1)
         sw2_ip1 = _swap_A(s2, s1, A_ip1)
 
@@ -966,19 +989,23 @@ def _increment_loss(apply_fun, params, model_state, s1_stack, s2_stack, A_list):
         lsip1 = jax.vmap(lpsi)(sw1_ip1)
         lsip2 = jax.vmap(lpsi)(sw2_ip1)
 
-        log_r = (lsip1 + lsip2) - (lsi1 + lsi2)     # log r_i
-        log_q = (lo1 + lo2) + (lsi1 + lsi2)         # log q_i  (salvo cte)
+        log_r = (lsip1 + lsip2) - (lsi1 + lsi2)      # log f_i (per-sample)
+        log_q = (lo1 + lo2) + (lsi1 + lsi2)          # log q_i (sin normalizar)
 
-        # stop-gradient del ratio medio, para construir REINFORCE
-        ratio_sg = jax.lax.stop_gradient(jnp.mean(jnp.exp(log_r)))
-        log_r_c  = jax.lax.stop_gradient(log_r - jnp.log(ratio_sg))
-        exp_r_sg = jax.lax.stop_gradient(jnp.exp(log_r))
+        # ── Término diferenciable: log(mean(f_i)) = log(r_i) ──────────────
+        f_i          = jnp.exp(log_r)
+        r_i          = jnp.mean(f_i)                  # diferenciable
+        log_r_mean   = jnp.log(r_i)
 
-        # término REINFORCE: E_q[ r · (log r - <log r>) + r · log q ]
-        # (el log r - <log r> es stop-grad, y log q es lo diferenciable)
-        total = total + ratio_sg + jnp.mean(exp_r_sg * (log_r_c + log_q))
+        # ── Corrección REINFORCE con baseline ─────────────────────────────
+        # w_i = f_i / r_i. Se usa (w_i - 1) para aprovechar E[∇log q] = 0.
+        w_sg     = jax.lax.stop_gradient(f_i / r_i)
+        baseline = jax.lax.stop_gradient(jnp.ones_like(w_sg))
+        reinforce = jnp.mean((w_sg - baseline) * log_q)
 
-    return -jnp.log(total)
+        total = total + log_r_mean + reinforce
+
+    return -total
 
 def renyi2_increment_sampling(vstate, subsystem_sites, n_chains,
                               n_sweeps_per_site=50,
@@ -1044,7 +1071,7 @@ def renyi2_increment_sampling(vstate, subsystem_sites, n_chains,
         s1_stack, s2_stack, A_list,
     )
     grad_loss = jax.grad(loss_fn)(vstate.parameters)
-    grad_S2   = jax.tree_util.tree_map(lambda g: -g, grad_loss)
+    grad_S2   = grad_loss
 
     if debug:
         gf, _ = jax.flatten_util.ravel_pytree(grad_S2)
