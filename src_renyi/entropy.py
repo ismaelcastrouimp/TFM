@@ -552,8 +552,8 @@ def _lnR_batch(apply_fun, params, model_state, s1, s2, A, B):
          - (jax.vmap(lpsi)(s1) + jax.vmap(lpsi)(s2))
 
 def _drut_loss(apply_fun, params, model_state, s1_stack, s2_stack,
-               lambda_grid, A, B):
-    """loss tal que ∇loss = ∇S₂ estimado (con REINFORCE)."""
+               lambda_grid, gl_weights, A, B):
+    """loss tal que ∇loss = ∇S₂ estimado (con REINFORCE), integrado con Gauss-Legendre."""
     def lpsi(s):
         return jnp.real(apply_fun({"params": params, **model_state}, s))
 
@@ -574,9 +574,9 @@ def _drut_loss(apply_fun, params, model_state, s1_stack, s2_stack,
         return f_lam + jnp.mean(lnR_c * log_P)
 
     contribs = jax.vmap(per_lambda)(s1_stack, s2_stack, lambda_grid)
-    dlam   = lambda_grid[1] - lambda_grid[0]
-    trap_w = jnp.ones_like(lambda_grid).at[0].set(0.5).at[-1].set(0.5)
-    return dlam * jnp.sum(trap_w * contribs)
+
+    # ← Gauss-Legendre: pesos distintos por nodo, sin el "trap_w"
+    return jnp.sum(gl_weights * contribs)
 
 def _metropolis_step_cached(key, s1, s2, log_P_cur,
                              A, B, apply_fun, params, model_state,
@@ -705,12 +705,26 @@ def _make_sweep_batch_with_traj_cached(spin_min, spin_max):
         in_axes=(0, 0, 0, None, None, None, None, None, None, None, None),
     )
 
+def _gauss_legendre_01(n):
+    """
+    Nodos y pesos de Gauss-Legendre en [0, 1].
+
+    Devuelve
+    --------
+    nodes   : (n,) array en [0, 1]
+    weights : (n,) array, suman 1
+    """
+    x, w = np.polynomial.legendre.leggauss(n)  # en [-1, 1]
+    nodes   = 0.5 * (x + 1.0)                  # mapear a [0, 1]
+    weights = 0.5 * w                          # pesos escalados
+    return jnp.array(nodes), jnp.array(weights)
+
 def _renyi2_drut_jit(apply_fun, params, model_state,
                      s1_init, s2_init, A, B,
                      n_lambda, n_sweeps_per_lam, n_props_per_sweep,
                      key, spin_min, spin_max, debug):
 
-    lambda_grid = jnp.linspace(0.0, 1.0, n_lambda)
+    lambda_grid, gl_weights = _gauss_legendre_01(n_lambda)
 
     sweep_batch_fast = _make_sweep_batch_cached(spin_min, spin_max)
     sweep_batch_traj = _make_sweep_batch_with_traj_cached(spin_min, spin_max)
@@ -721,31 +735,24 @@ def _renyi2_drut_jit(apply_fun, params, model_state,
         keys_batch = jax.random.split(k_burn, s1.shape[0])
 
         if debug:
-            # ── Ruta con diagnóstico: registra lnR por sweep, calcula τ_int ─
             s1, s2, acc_mean, lnR_traj, acc_traj = sweep_batch_traj(
                 keys_batch, s1, s2, A, B,
                 apply_fun, params, model_state,
                 lam, n_sweeps_per_lam, n_props_per_sweep,
             )
-            #tau = _tau_int_per_chain(lnR_traj)          # (n_chains,)
             n_total = s1.shape[0] * n_sweeps_per_lam
             tau = _tau_int_per_chain(lnR_traj)
-            tau_mean = jnp.nanmean(tau)                      # ignora NaN
+            tau_mean = jnp.nanmean(tau)
             ess_lam = n_total / tau_mean
-            #ess_lam = n_total / jnp.mean(tau)            # ESS efectivo
-            f_lam = jnp.mean(lnR_traj[:, -1])            # lnR del estado final
+            f_lam = jnp.mean(lnR_traj[:, -1])
 
             jax.debug.print(
                 "λ={lam:.3f}  f(λ)={f:.4f}  accept={acc:.3f}  "
                 "τ_int={tau:.2f}  ESS/M={ess:.4f}",
-                lam=lam,
-                f=jnp.mean(f_lam),                    # ← media sobre cadenas
-                acc=jnp.mean(acc_mean),               # ← media sobre cadenas
-                tau=jnp.mean(tau),
-                ess=jnp.mean(ess_lam) / n_total,
+                lam=lam, f=jnp.mean(f_lam), acc=jnp.mean(acc_mean),
+                tau=jnp.mean(tau), ess=jnp.mean(ess_lam) / n_total,
             )
         else:
-            # ── Ruta rápida sin diagnóstico ────────────────────────────────
             n_props = n_sweeps_per_lam * n_props_per_sweep
             s1, s2, _ = sweep_batch_fast(
                 keys_batch, s1, s2, A, B,
@@ -763,9 +770,8 @@ def _renyi2_drut_jit(apply_fun, params, model_state,
     )(s1_stack, s2_stack)
     f_vals = jnp.mean(lnR_stack, axis=1)
 
-    dlam   = lambda_grid[1] - lambda_grid[0]
-    trap_w = jnp.ones(n_lambda).at[0].set(0.5).at[-1].set(0.5)
-    S2     = -dlam * jnp.sum(trap_w * f_vals)
+    # ← Integración de Gauss-Legendre (en lugar de trapezoidal)
+    S2 = -jnp.sum(gl_weights * f_vals)
 
     return S2, s1_stack, s2_stack, lambda_grid
 
@@ -784,10 +790,8 @@ def renyi2_drut_sampling(vstate, subsystem_sites, n_chains=256,
     spin_min = float(local_states.min())
     spin_max = float(local_states.max())
     if debug:
-        flip_const = spin_min + spin_max
         print(f"[renyi2_drut] local_states = {local_states.tolist()}  "
-              f"→ flip: new = ({spin_min} + {spin_max}) - cur = "
-              f"{flip_const:.1f} - cur")
+              f"→ flip: new = ({spin_min} + {spin_max}) - cur")
 
     all_init = vstate.sample(n_samples=2 * n_chains)
     all_init = all_init.reshape(2 * n_chains, N_sites)
@@ -803,9 +807,12 @@ def renyi2_drut_sampling(vstate, subsystem_sites, n_chains=256,
         spin_min, spin_max, debug,
     )
 
+    # ← Mismos pesos que en el kernel
+    _, gl_weights = _gauss_legendre_01(n_lambda)
+
     grad_loss = jax.grad(lambda p: _drut_loss(
         vstate._apply_fun, p, vstate.model_state,
-        s1_stack, s2_stack, lambda_grid, A, B,
+        s1_stack, s2_stack, lambda_grid, gl_weights, A, B,
     ))(vstate.parameters)
     grad_S2 = jax.tree_util.tree_map(lambda g: -g, grad_loss)
 
