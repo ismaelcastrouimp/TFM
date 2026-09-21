@@ -578,30 +578,35 @@ def _drut_loss(apply_fun, params, model_state, s1_stack, s2_stack,
     # ← Gauss-Legendre: pesos distintos por nodo, sin el "trap_w"
     return jnp.sum(gl_weights * contribs)
 
-def _metropolis_step_cached(key, s1, s2, log_P_cur,
+def _block_flip_step_cached(key, s1, s2, log_P_cur,
                              A, B, apply_fun, params, model_state,
-                             lam, spin_min, spin_max):
+                             lam, spin_min, spin_max, K):
     """
-    Paso MH que reutiliza log_P del estado actual (evita recalcularlo).
+    Paso MH con propuesta simétrica: flip de K sitios elegidos al azar
+    (sin reemplazo) de la concatenación (s1, s2).
 
-    Convención: log_P_cur es log P̃(λ; s1, s2) evaluado en el estado actual.
-    Al aceptar la propuesta, actualizamos log_P_cur con el valor de la propuesta.
-    Al rechazar, log_P_cur no cambia.
+    Si K=1, es equivalente al flip local original.
     """
     N = s1.shape[0]
-    k_site, k_unif = jax.random.split(key)
+    N_total = 2 * N
+    k_sites, k_unif = jax.random.split(key)
 
-    j     = jax.random.randint(k_site, (), 0, 2 * N)
-    is_s1 = j < N
-    site  = jnp.where(is_s1, j, j - N)
+    # K sitios distintos de {0, ..., 2N-1} (más eficiente que choice)
+    sites = jax.random.permutation(k_sites, N_total)[:K]
 
-    cur_val = jnp.where(is_s1, s1[site], s2[site])
-    new_val = ((spin_min + spin_max) - cur_val).astype(s1.dtype)
+    # Máscaras de qué sitios flipen en cada réplica
+    all_mask = jnp.zeros(N_total, dtype=bool).at[sites].set(True)
+    mask_s1 = all_mask[:N]
+    mask_s2 = all_mask[N:]
 
-    s1_prop = jax.lax.cond(is_s1, lambda s: s.at[site].set(new_val), lambda s: s, s1)
-    s2_prop = jax.lax.cond(is_s1, lambda s: s, lambda s: s.at[site].set(new_val), s2)
+    def flip_masked(s, mask):
+        flipped = (spin_min + spin_max) - s
+        return jnp.where(mask, flipped, s).astype(s.dtype)
 
-    # ── Solo evaluamos la PROPUESTA (log_P_cur ya lo tenemos) ──────────
+    s1_prop = flip_masked(s1, mask_s1)
+    s2_prop = flip_masked(s2, mask_s2)
+
+    # Solo evaluamos la PROPUESTA
     lp_prop, _ = _log_target_and_lnR(apply_fun, params, model_state,
                                      s1_prop, s2_prop, A, B, lam)
 
@@ -615,16 +620,7 @@ def _metropolis_step_cached(key, s1, s2, log_P_cur,
 
 def _sweep_single_chain_cached(key, s1, s2, A, B,
                                apply_fun, params, model_state,
-                               lam, n_props, spin_min, spin_max):
-    """
-    Sweep con caching: inicializa log_P_cur UNA VEZ y luego reutiliza.
-
-    Para n_props pasos, esto hace:
-      - 1 evaluación inicial (para log_P_cur)
-      - n_props evaluaciones (una por propuesta)
-    vs. las 2*n_props del original. Ahorro ~2×.
-    """
-    # ── Inicializar log_P_cur UNA VEZ ────────────────────────────────────
+                               lam, n_props, spin_min, spin_max, K):
     log_P_cur, _ = _log_target_and_lnR(apply_fun, params, model_state,
                                        s1, s2, A, B, lam)
 
@@ -632,9 +628,9 @@ def _sweep_single_chain_cached(key, s1, s2, A, B,
 
     def body(carry, k):
         s1, s2, log_P, acc_sum = carry
-        s1, s2, log_P, a = _metropolis_step_cached(
+        s1, s2, log_P, a = _block_flip_step_cached(
             k, s1, s2, log_P, A, B, apply_fun, params, model_state,
-            lam, spin_min, spin_max
+            lam, spin_min, spin_max, K
         )
         return (s1, s2, log_P, acc_sum + a), None
 
@@ -643,23 +639,14 @@ def _sweep_single_chain_cached(key, s1, s2, A, B,
     )
     return s1, s2, acc_sum / n_props
 
-def _make_sweep_batch_cached(spin_min, spin_max):
-    def _fn(key, s1, s2, A, B, apply_fun, params, model_state, lam, n_props):
-        return _sweep_single_chain_cached(
-            key, s1, s2, A, B, apply_fun, params, model_state,
-            lam, n_props, spin_min, spin_max
-        )
-    return jax.vmap(
-        _fn,
-        in_axes=(0, 0, 0, None, None, None, None, None, None, None),
-    )
-
 def _sweep_single_chain_with_traj_cached(key, s1, s2, A, B,
                                           apply_fun, params, model_state,
                                           lam, n_sweeps, n_props_per_sweep,
-                                          spin_min, spin_max):
+                                          spin_min, spin_max, K):
     """
-    Versión con traza + caching. log_P_cur se pasa entre bloques.
+    Versión con traza + caching + block moves (K sitios por propuesta).
+
+    log_P_cur se pasa entre bloques. K=1 recupera el comportamiento original.
     """
     log_P_cur, _ = _log_target_and_lnR(apply_fun, params, model_state,
                                        s1, s2, A, B, lam)
@@ -672,9 +659,9 @@ def _sweep_single_chain_with_traj_cached(key, s1, s2, A, B,
 
         def single_prop(c, k):
             s1, s2, log_P, acc = c
-            s1, s2, log_P, a = _metropolis_step_cached(
+            s1, s2, log_P, a = _block_flip_step_cached(
                 k, s1, s2, log_P, A, B, apply_fun, params, model_state,
-                lam, spin_min, spin_max
+                lam, spin_min, spin_max, K
             )
             return (s1, s2, log_P, acc + a), None
 
@@ -693,12 +680,23 @@ def _sweep_single_chain_with_traj_cached(key, s1, s2, A, B,
     )
     return s1_final, s2_final, acc_total / n_sweeps, lnR_traj, acc_traj
 
-def _make_sweep_batch_with_traj_cached(spin_min, spin_max):
+def _make_sweep_batch_cached(spin_min, spin_max, K):
+    def _fn(key, s1, s2, A, B, apply_fun, params, model_state, lam, n_props):
+        return _sweep_single_chain_cached(
+            key, s1, s2, A, B, apply_fun, params, model_state,
+            lam, n_props, spin_min, spin_max, K
+        )
+    return jax.vmap(
+        _fn,
+        in_axes=(0, 0, 0, None, None, None, None, None, None, None),
+    )
+
+def _make_sweep_batch_with_traj_cached(spin_min, spin_max, K):
     def _fn(key, s1, s2, A, B, apply_fun, params, model_state,
             lam, n_sweeps, n_props_per_sweep):
         return _sweep_single_chain_with_traj_cached(
             key, s1, s2, A, B, apply_fun, params, model_state,
-            lam, n_sweeps, n_props_per_sweep, spin_min, spin_max
+            lam, n_sweeps, n_props_per_sweep, spin_min, spin_max, K
         )
     return jax.vmap(
         _fn,
@@ -722,12 +720,11 @@ def _gauss_legendre_01(n):
 def _renyi2_drut_jit(apply_fun, params, model_state,
                      s1_init, s2_init, A, B,
                      n_lambda, n_sweeps_per_lam, n_props_per_sweep,
-                     key, spin_min, spin_max, debug):
-
+                     key, spin_min, spin_max, debug, K):
     lambda_grid, gl_weights = _gauss_legendre_01(n_lambda)
 
-    sweep_batch_fast = _make_sweep_batch_cached(spin_min, spin_max)
-    sweep_batch_traj = _make_sweep_batch_with_traj_cached(spin_min, spin_max)
+    sweep_batch_fast = _make_sweep_batch_cached(spin_min, spin_max, K)
+    sweep_batch_traj = _make_sweep_batch_with_traj_cached(spin_min, spin_max, K)
 
     def scan_lam(carry, lam):
         s1, s2, k = carry
@@ -750,7 +747,7 @@ def _renyi2_drut_jit(apply_fun, params, model_state,
                 "λ={lam:.3f}  f(λ)={f:.4f}  accept={acc:.3f}  "
                 "τ_int={tau:.2f}  ESS/M={ess:.4f}",
                 lam=lam, f=jnp.mean(f_lam), acc=jnp.mean(acc_mean),
-                tau=jnp.mean(tau), ess=jnp.mean(ess_lam) / n_total,
+                tau=jnp.nanmean(tau), ess=jnp.mean(ess_lam) / n_total,
             )
         else:
             n_props = n_sweeps_per_lam * n_props_per_sweep
@@ -772,12 +769,14 @@ def _renyi2_drut_jit(apply_fun, params, model_state,
 
     # ← Integración de Gauss-Legendre (en lugar de trapezoidal)
     S2 = -jnp.sum(gl_weights * f_vals)
+    S2_max = A.shape[0] * jnp.log(2.0)
+    S2 = jnp.minimum(S2, S2_max)
 
     return S2, s1_stack, s2_stack, lambda_grid
 
 def renyi2_drut_sampling(vstate, subsystem_sites, n_chains=256,
                          n_sweeps_per_lam=20, n_props_per_sweep=None,
-                         n_lambda=10, key=0, debug=False):
+                         n_lambda=10, key=0, debug=False, K=1):
 
     N_sites = vstate.hilbert.size
     A = jnp.array(subsystem_sites, dtype=int)
@@ -804,7 +803,7 @@ def renyi2_drut_sampling(vstate, subsystem_sites, n_chains=256,
         s1_init, s2_init, A, B,
         n_lambda, n_sweeps_per_lam, n_props_per_sweep,
         jax.random.PRNGKey(key + 1),
-        spin_min, spin_max, debug,
+        spin_min, spin_max, debug, K,
     )
 
     # ← Mismos pesos que en el kernel
