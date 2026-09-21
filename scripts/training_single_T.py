@@ -16,27 +16,32 @@ import netket as nk
 from netket.operator.spin import sigmax, sigmaz
 import optax
 import json
-from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled
+from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled, renyi2_entropy_and_grad_exact, renyi2_drut_sampling
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
-N          = 2
-N_A        = 1
-N_SAMPLES  = 2**16
+N          = 10
+N_A        = 10
+N_SAMPLES  = 2**10
 
-J_ZZ       = 0.0
-J_XX       = -1.0
-h_x        = -0.5
-h_z        = 1.05
+J_ZZ       = -1.0
+J_XX       = 0.0
+h_x        = -1.5
+h_z        = 0.0
 
-T          = 0.2
+T          = 4
 N_STEPS    = 350
+N_STEPS_FINE   = 20
 
-chunk_size = N_SAMPLES//16
+chunk_size = N_SAMPLES//2
 clip_norm  = None
 lr         = optax.linear_schedule(0.05, 0.001, N_STEPS)
+lr_fine    = None
 optimizer  = optax.sign_sgd(lr)
 
+drut_kwargs = dict(n_chains=512, n_lambda=20, n_sweeps_per_lam=100, n_props_per_sweep=4*N, K=1)
+
 N_REP_COSINE = 10
+N_REP_DRUT = 3
 # ───────────────────────────────────────────────────────────────────────────────
 
 # ── funciones auxiliares ───────────────────────────────────────────────────────
@@ -78,22 +83,44 @@ partition = list(range(N))
 print(f"TRAINING N={N} at T={T}, N_A={N_A}")
 _,f_best,E_best,S_best = free_energy_minimize(vstate, T, partition, H_extended, N_STEPS, freq=20,
                                                optimizer=optimizer, clip_norm=clip_norm, timing=True,
-                                               chunk_size=chunk_size, plot=False)
+                                               chunk_size=chunk_size, plot=True, 
+                                               fine_steps=N_STEPS_FINE, fine_drut_kwargs=drut_kwargs, fine_lr=lr_fine)
 
 print(f"Best solution: S₂={S_best:.6f}, E={E_best:.6f}, F={f_best:.6f}")
 
-# ── consistencia del gradiente ─────────────────────────────────────────────────
-grads = []
+# ── consistencia del gradiente: SWAP ─────────────────────────────────────────
+grads_swap = []
 for rep in range(N_REP_COSINE):
-    _, grad_est = renyi2_entropy_and_grad_sampled(vstate, partition, N_SAMPLES, chunk_size=chunk_size)
-    grads.append(grad_est)
-cos_vals = []
+    _, grad_est = renyi2_entropy_and_grad_sampled(
+        vstate, partition, N_SAMPLES, chunk_size=chunk_size
+    )
+    grads_swap.append(grad_est)
+
+cos_vals_swap = []
 for i in range(N_REP_COSINE):
-    for j in range(i+1, N_REP_COSINE):
-        cos_vals.append(cosine_similarity(grads[i], grads[j]))
-cos_mean = np.mean(cos_vals)
-cos_std = np.std(cos_vals)
-print(f"Consistencia del gradiente: cos = {cos_mean:.4f} ± {cos_std:.4f}")
+    for j in range(i + 1, N_REP_COSINE):
+        cos_vals_swap.append(cosine_similarity(grads_swap[i], grads_swap[j]))
+cos_swap_mean = np.mean(cos_vals_swap)
+cos_swap_std  = np.std(cos_vals_swap)
+print(f"[swap] cos = {cos_swap_mean:.4f} ± {cos_swap_std:.4f}")
+
+# ── consistencia del gradiente: DRUT ─────────────────────────────────────────
+grads_drut = []
+for rep in range(N_REP_DRUT):
+    _, grad_est = renyi2_drut_sampling(
+        vstate, partition,
+        n_chains=512, n_lambda=20, n_sweeps_per_lam=100,
+        n_props_per_sweep=4 * N, K=1, key=rep,
+    )
+    grads_drut.append(grad_est)
+
+cos_vals_drut = []
+for i in range(N_REP_DRUT):
+    for j in range(i + 1, N_REP_DRUT):
+        cos_vals_drut.append(cosine_similarity(grads_drut[i], grads_drut[j]))
+cos_drut_mean = np.mean(cos_vals_drut)
+cos_drut_std  = np.std(cos_vals_drut)
+print(f"[drut] cos = {cos_drut_mean:.4f} ± {cos_drut_std:.4f}")
 
 # ── guardar parámetros ─────────────────────────────────────────────────────────
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -132,7 +159,7 @@ else:
 all_data["energy"][idx]      = float(E_best)
 all_data["entropy"][idx]     = float(S_best)
 all_data["free_energy"][idx] = float(f_best)
-all_data["reliability"][idx] = {"cos_mean": float(cos_mean), "cos_std": float(cos_std)}
+all_data["reliability"][idx] = {"cos_mean": float(cos_swap_mean), "cos_std": float(cos_swap_std)}
 
 # Guardar parámetros con índice
 filename = os.path.join(params_dir, f"params_{idx:04d}.msgpack")

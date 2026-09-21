@@ -10,7 +10,7 @@ from jax.flatten_util import ravel_pytree
 from scipy.optimize import minimize
 
 from .observables import FreeRenyiEnergyObservable
-from .entropy import renyi2_entropy_and_grad_sampled, renyi2_entropy_sampled, renyi2_entropy_exact, renyi2_entropy_and_grad_exact
+from .entropy import renyi2_entropy_and_grad_sampled, renyi2_entropy_sampled, renyi2_entropy_exact, renyi2_entropy_and_grad_exact, renyi2_drut_sampling
 
 
 def free_energy_minimize_SR_SGD(
@@ -108,11 +108,14 @@ def free_energy_minimize_SR_SGD(
 
     return free_energy_history, best_F, E_best, S2_best
 
-def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbose=True, freq=50,
-    plot=True, optimizer=None, learning_rate=None, clip_norm=None, timing=False, chunk_size=256,
-    sr=None, n_samples_sr=None):
+def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000,
+                         fine_steps=0, fine_drut_kwargs=None, fine_lr=None,
+                         verbose=True, freq=50, plot=True, optimizer=None,
+                         learning_rate=None, clip_norm=None, timing=False,
+                         chunk_size=256, sr=None, n_samples_sr=None):
     """
-    Minimiza F = E - T·S₂ con optimizador general.
+    Minimiza F = E - T·S₂ con dos fases: coarse (swap) + fine (Drut).
+
 
     Parámetros
     ----------
@@ -131,43 +134,74 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbos
     chunk_size   : tamaño de los chunks para procesar FreeRenyiEnergyObservable.
     sr           : nk.optimizer.SR
     n_samples_sr : Muestras usadas en el paso de SR (< n_samples completo).
+    fine_steps      : nº de pasos con Drut. Si 0, no se ejecuta la fase 2.
+    fine_drut_kwargs: dict con argumentos para renyi2_drut_sampling
+                      (n_chains, n_lambda, n_sweeps_per_lam, n_props_per_sweep, K, ...).
+    fine_lr : float o None. Si None, hereda el LR final del coarse.
 
     Devuelve
     -------
     (free_energy_history, best_F, E_best, S2_best)
     """
-    
-    # --- learning rate por defecto ---
+    # ── Defaults ────────────────────────────────────────────────────────
     if learning_rate is None:
         learning_rate = optax.warmup_cosine_decay_schedule(
             0.1, 0.1, 100, n_steps, 0.001
         )
-
-    # --- optimizador por defecto ---
     if optimizer is None:
         optimizer = optax.sgd(learning_rate)
 
-    # --- construir gradient_transform ---
+    # ── Extraer LR final del coarse ─────────────────────────────────────
+    coarse_final_lr = None
+    if learning_rate is not None:
+        try:
+            if callable(learning_rate):
+                coarse_final_lr = float(learning_rate(n_steps - 1))
+            else:
+                coarse_final_lr = float(learning_rate)
+        except Exception:
+            coarse_final_lr = None
+
+    # ── Resolver fine_lr ────────────────────────────────────────────────
+    if fine_steps > 0 and fine_lr is None:
+        if coarse_final_lr is not None:
+            fine_lr = coarse_final_lr
+            if verbose:
+                print(f"[fine] fine_lr no especificado → "
+                      f"usando LR final del coarse: {fine_lr:.6e}")
+        else:
+            fine_lr = 0.001
+            if verbose:
+                print("[fine] no se pudo extraer LR final del coarse; "
+                      "usando fine_lr=1e-3 por defecto")
+
+    # ── Construcción del optimizer ──────────────────────────────────────
     if clip_norm is not None:
         gradient_transform = optax.chain(
-            optax.clip_by_global_norm(clip_norm),
-            optimizer
+            optax.clip_by_global_norm(clip_norm), optimizer
         )
     else:
         gradient_transform = optimizer
-
     opt_state = gradient_transform.init(vstate.parameters)
 
-    free_renyi_op = FreeRenyiEnergyObservable(vstate.hilbert, Hamiltonian, partition, T, chunk_size)
-
+    free_renyi_op = FreeRenyiEnergyObservable(
+        vstate.hilbert, Hamiltonian, partition, T, chunk_size
+    )
     n_samples_full = vstate.n_samples
 
     free_energy_history = []
-    best_F = float("inf")
-    best_params = None
+    coarse_best_F = float("inf")
+    coarse_best_params = None
+    fine_best_F = float("inf")
+    fine_best_params = None
+
+    # ═══════════════════════════════════════════════════════════════════
+    # FASE 1: coarse (swap)
+    # ═══════════════════════════════════════════════════════════════════
+    if verbose:
+        print(f"[coarse] {n_steps} pasos con swap trick")
 
     for step in range(n_steps):
-
         if timing:
             t0 = time.time()
 
@@ -180,53 +214,143 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000, verbos
             if n_samples_sr is not None:
                 vstate.n_samples = n_samples_full
 
-        updates, opt_state = gradient_transform.update(F_grad, opt_state, vstate.parameters)
-
+        updates, opt_state = gradient_transform.update(
+            F_grad, opt_state, vstate.parameters
+        )
         vstate.parameters = optax.apply_updates(vstate.parameters, updates)
 
         if timing:
-            jax.tree_util.tree_map(lambda x: x.block_until_ready(), vstate.parameters)
+            jax.tree_util.tree_map(
+                lambda x: x.block_until_ready(), vstate.parameters
+            )
 
         F_val = float(F_stats.mean.real)
         free_energy_history.append(F_val)
 
-        if F_val < best_F:
-            best_F = F_val
-            best_params = vstate.parameters
+        # Guardamos el mejor coarse SIEMPRE (para diagnóstico),
+        # pero solo lo usaremos como "best" final si fine_steps == 0.
+        if F_val < coarse_best_F:
+            coarse_best_F = F_val
+            coarse_best_params = vstate.parameters
 
         if step % freq == 0 and verbose:
+            msg = f"  Step {step:4d} | F={F_val:.6f}"
             if timing:
-                print(
-                    f"Step {step:4d} | "
-                    f"F={F_val:.6f} | "
-                    f"t={time.time()-t0:.3f}s"
-                )
-            else:
-                print(
-                    f"Step {step:4d} | "
-                    f"F={F_val:.6f}"
+                msg += f" | t={time.time()-t0:.3f}s"
+            print(msg)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # FASE 2: fine (Drut)
+    # ═══════════════════════════════════════════════════════════════════
+    if fine_steps > 0:
+        if fine_drut_kwargs is None:
+            fine_drut_kwargs = dict(
+                n_chains=256,
+                n_lambda=12,
+                n_sweeps_per_lam=50,
+                n_props_per_sweep=2 * vstate.hilbert.size,
+                K=2,
+            )
+        if verbose:
+            print(f"[fine] {fine_steps} pasos con Drut")
+            print(f"       kwargs: {fine_drut_kwargs}")
+
+        # Optimizer del fine con LR constante heredado
+        fine_opt = optax.sgd(fine_lr)
+        if clip_norm is not None:
+            fine_opt = optax.chain(
+                optax.clip_by_global_norm(clip_norm), fine_opt
+            )
+        fine_opt_state = fine_opt.init(vstate.parameters)
+
+        for step in range(fine_steps):
+            if timing:
+                t0 = time.time()
+
+            # ∇E
+            E_stats, grad_E = vstate.expect_and_grad(Hamiltonian)
+            E_val = float(E_stats.mean.real)
+
+            # ∇S₂ por Drut
+            S2_val, grad_S2 = renyi2_drut_sampling(
+                vstate, partition, key=step + 12345, **fine_drut_kwargs
+            )
+
+            # ∇F = ∇E - T·∇S₂
+            grad_F = jax.tree_util.tree_map(
+                lambda ge, gs: ge - T * gs, grad_E, grad_S2
+            )
+
+            updates, fine_opt_state = fine_opt.update(
+                grad_F, fine_opt_state, vstate.parameters
+            )
+            vstate.parameters = optax.apply_updates(vstate.parameters, updates)
+
+            if timing:
+                jax.tree_util.tree_map(
+                    lambda x: x.block_until_ready(), vstate.parameters
                 )
 
-    # --- restaurar mejores parámetros ---
+            F_val = E_val - T * S2_val
+            free_energy_history.append(F_val)
+
+            # Best del fine (el único que cuenta si fine_steps > 0)
+            if F_val < fine_best_F:
+                fine_best_F = F_val
+                fine_best_params = vstate.parameters
+
+            if step % max(1, freq // 5) == 0 and verbose:
+                msg = (f"  [fine] Step {step:3d} | F={F_val:.6f} | "
+                       f"E={E_val:.6f} | S₂={S2_val:.6f}")
+                if timing:
+                    msg += f" | t={time.time()-t0:.2f}s"
+                print(msg)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Selección del best final
+    # ═══════════════════════════════════════════════════════════════════
+    if fine_steps > 0 and fine_best_params is not None:
+        best_params = fine_best_params
+        best_F = fine_best_F
+        if verbose:
+            print(f"[best] fine: F={fine_best_F:.6f} | "
+                  f"coarse (referencia): F={coarse_best_F:.6f}")
+    elif coarse_best_params is not None:
+        best_params = coarse_best_params
+        best_F = coarse_best_F
+        if verbose:
+            print(f"[best] coarse: F={best_F:.6f}")
+    else:
+        best_params = vstate.parameters
+        best_F = float("inf")
+
+    # ── Restaurar y reevaluar ───────────────────────────────────────────
     vstate.parameters = best_params
     jax.clear_caches()
 
     vstate.chunk_size = chunk_size
     E_best = float(vstate.expect(Hamiltonian).mean.real)
     vstate.chunk_size = None
-    S2_best = renyi2_entropy_sampled(vstate, partition, n_samples_full, chunk_size=chunk_size)
+    S2_best = renyi2_entropy_sampled(
+        vstate, partition, n_samples_full, chunk_size=chunk_size
+    )
     best_F = E_best - T * S2_best
-    
 
     if plot:
         fig, ax = plt.subplots(figsize=(8, 4))
         ax.plot(free_energy_history, label=r"$F$")
+        if fine_steps > 0:
+            ax.axvline(n_steps, color='k', ls='--', alpha=0.4,
+                       label=f'inicio fine')
+            ax.axhline(coarse_best_F, color='r', ls=':', alpha=0.4,
+                       label=f'coarse best = {coarse_best_F:.2f}')
         ax.set_xlabel("Step")
         ax.set_ylabel(r"$F$")
+        ax.legend()
         plt.tight_layout()
         plt.show()
 
-    return (free_energy_history, best_F, E_best, S2_best)
+    return free_energy_history, best_F, E_best, S2_best
 
 def free_energy_minimize_exact(
     vstate,         
