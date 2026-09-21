@@ -23,9 +23,9 @@ from tqdm import tqdm
 from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled, free_energy_minimize_exact, ARNN_Z2
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
-N          = 30
+N          = 10
 N_A        = N
-N_SAMPLES  = 2**21
+N_SAMPLES  = 2**10
 
 J_ZZ       = -1.0
 J_XX       = 0.0
@@ -39,12 +39,16 @@ linear_T   = True  #If False, creates non linear T distribution
                     #following cutoff temperatures (only for N<10)
 
 N_STEPS    = 300
-chunk_size = N_SAMPLES//16
+N_STEPS_FINE   = 30
+
+chunk_size = N_SAMPLES//2
 clip_norm  = None
 lr         = optax.linear_schedule(0.05, 0.001, N_STEPS)
+lr_fine    = None
 optimizer  = optax.sign_sgd(lr)
 sr         = None
 
+drut_kwargs = dict(n_chains=512, n_lambda=20, n_sweeps_per_lam=100, n_props_per_sweep=4*N, K=2)
 N_REP_COSINE = 10
 # ───────────────────────────────────────────────────────────────────────────────
 
@@ -192,7 +196,8 @@ for T_idx, T in enumerate(tqdm(T_array, desc="Temperaturas")):
     free_energy_history, best_F, best_energy, best_entropy = free_energy_minimize(
         vstate=vstate, T=T, partition=partition, Hamiltonian=H_extended, n_steps=N_STEPS,
         verbose=True, plot=False, optimizer=optimizer, chunk_size=chunk_size, clip_norm=clip_norm,
-        sr=sr, n_samples_sr=2**12
+        sr=sr, n_samples_sr=2**12,
+        fine_steps=N_STEPS_FINE, fine_drut_kwargs=drut_kwargs, fine_lr=lr_fine
     )
     best_params = vstate.parameters
 
