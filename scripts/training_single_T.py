@@ -28,17 +28,22 @@ J_XX       = 0.0
 h_x        = -1.5
 h_z        = 0.0
 
-T          = 4
-N_STEPS    = 350
-N_STEPS_FINE   = 20
+T          = 2.5
+N_STEPS    = 0
+N_STEPS_FINE   = 60
 
 chunk_size = N_SAMPLES//2
 clip_norm  = None
-lr         = optax.linear_schedule(0.05, 0.001, N_STEPS)
-lr_fine    = None
-optimizer  = optax.sign_sgd(lr)
+lr         = optax.linear_schedule(0.05, 0.01, N_STEPS_FINE)
+lr_fine    = 0.01
 
-drut_kwargs = dict(n_chains=512, n_lambda=20, n_sweeps_per_lam=100, n_props_per_sweep=4*N, K=1)
+if N_STEPS > 0:
+    lr = optax.linear_schedule(0.05, 0.01, N_STEPS)
+    optimizer = optax.sgd(lr)
+else:
+    optimizer = optax.sgd(0.01)
+
+drut_kwargs = dict(n_chains=512, n_lambda=20, n_sweeps_per_lam=100, n_props_per_sweep=4*N, K=3)
 
 N_REP_COSINE = 10
 N_REP_DRUT = 3

@@ -145,9 +145,12 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000,
     """
     # ── Defaults ────────────────────────────────────────────────────────
     if learning_rate is None:
-        learning_rate = optax.warmup_cosine_decay_schedule(
-            0.1, 0.1, 100, n_steps, 0.001
-        )
+        if n_steps > 0:
+            learning_rate = optax.warmup_cosine_decay_schedule(
+                0.1, 0.1, 100, n_steps, 0.001
+            )
+        else:
+            learning_rate = 0.001
     if optimizer is None:
         optimizer = optax.sgd(learning_rate)
 
