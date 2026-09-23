@@ -72,7 +72,7 @@ for i in range(N):
     H_extended += J_ZZ * sigmaz(hi, i) @ sigmaz(hi, (i + 1) % N)
     H_extended += J_XX * sigmax(hi, i) @ sigmax(hi, (i + 1) % N)
 
-model = nk.models.ARNNDense(hilbert=hi, layers=1, features=16, activation=jax.nn.tanh)
+model = nk.models.ARNNDense(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
 sampler = nk.sampler.ARDirectSampler(hi)
 vstate  = nk.vqs.MCState(sampler, model, n_samples=N_SAMPLES)
 
