@@ -32,23 +32,27 @@ J_XX       = 0.0
 h_x        = -1.5
 h_z        = 0.0
 
-T_min      = 0
+T_min      = 1
 T_max      = 4
-N_Temps    = 41
+N_Temps    = 31
 linear_T   = True  #If False, creates non linear T distribution
                     #following cutoff temperatures (only for N<10)
 
-N_STEPS    = 300
-N_STEPS_FINE   = 30
+N_STEPS    = 0
+N_STEPS_FINE   = 150
 
 chunk_size = N_SAMPLES//2
 clip_norm  = None
-lr         = optax.linear_schedule(0.05, 0.001, N_STEPS)
-lr_fine    = None
-optimizer  = optax.sign_sgd(lr)
+if N_STEPS > 0:
+    lr = optax.linear_schedule(0.05, 0.01, N_STEPS)
+    optimizer = optax.adam(lr)
+else:
+    lr = optax.linear_schedule(0.01, 0.001, N_STEPS)
+    optimizer = optax.adam(lr)
+lr_fine    = optax.linear_schedule(0.01, 0.001, N_STEPS)
 sr         = None
 
-drut_kwargs = dict(n_chains=512, n_lambda=20, n_sweeps_per_lam=100, n_props_per_sweep=4*N, K=2)
+drut_kwargs = dict(n_chains=512*2, n_lambda=20, n_sweeps_per_lam=150, n_props_per_sweep=4*N, K=3)
 N_REP_COSINE = 10
 # ───────────────────────────────────────────────────────────────────────────────
 
@@ -68,7 +72,7 @@ for i in range(N):
     H_extended += J_ZZ * sigmaz(hi, i) @ sigmaz(hi, (i + 1) % N)
     H_extended += J_XX * sigmax(hi, i) @ sigmax(hi, (i + 1) % N)
 
-model = nk.models.ARNNDense(hilbert=hi, layers=1, features=16, activation=jax.nn.gelu)
+model = nk.models.ARNNDense(hilbert=hi, layers=1, features=16, activation=jax.nn.tanh)
 sampler = nk.sampler.ARDirectSampler(hi)
 vstate  = nk.vqs.MCState(sampler, model, n_samples=N_SAMPLES)
 

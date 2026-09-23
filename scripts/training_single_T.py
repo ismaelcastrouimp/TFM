@@ -34,14 +34,13 @@ N_STEPS_FINE   = 60
 
 chunk_size = N_SAMPLES//2
 clip_norm  = None
-lr         = optax.linear_schedule(0.05, 0.01, N_STEPS_FINE)
-lr_fine    = 0.01
-
 if N_STEPS > 0:
-    lr = optax.linear_schedule(0.05, 0.01, N_STEPS)
-    optimizer = optax.sgd(lr)
+    lr = optax.linear_schedule(0.01, 0.01, N_STEPS)
+    optimizer = optax.adam(lr)
 else:
-    optimizer = optax.sgd(0.01)
+    lr = optax.linear_schedule(0.01, 0.001, N_STEPS)
+    optimizer = optax.adam(lr)
+lr_fine    = optax.linear_schedule(0.01, 0.001, N_STEPS)
 
 drut_kwargs = dict(n_chains=512, n_lambda=20, n_sweeps_per_lam=100, n_props_per_sweep=4*N, K=3)
 
@@ -76,7 +75,7 @@ for i in range(N):
     H_extended += J_XX * sigmax(hi, i) @ sigmax(hi, (i + 1) % N)
 
 
-model = nk.models.ARNNDense(hilbert=hi, layers=1, features=16, activation=jax.nn.gelu)
+model = nk.models.ARNNDense(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
 sampler = nk.sampler.ARDirectSampler(hi)
 vstate  = nk.vqs.MCState(sampler, model, n_samples=N_SAMPLES)
 
