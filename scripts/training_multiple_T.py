@@ -52,7 +52,7 @@ else:
 lr_fine    = optax.linear_schedule(0.01, 0.001, N_STEPS)
 sr         = None
 
-drut_kwargs = dict(n_chains=512*2, n_lambda=20, n_sweeps_per_lam=150, n_props_per_sweep=4*N, K=3)
+drut_kwargs = dict(n_chains=512, n_lambda=20, n_sweeps_per_lam=150, n_props_per_sweep=4*N, K=3)
 N_REP_COSINE = 10
 # ───────────────────────────────────────────────────────────────────────────────
 
