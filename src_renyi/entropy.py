@@ -822,6 +822,161 @@ def renyi2_drut_sampling(vstate, subsystem_sites, n_chains=256,
 
     return float(S2), grad_S2
 
+#Gradiente sin integral
+def _renyi2_drut_jit_direct(apply_fun, params, model_state,
+                             s1_init, s2_init, A, B,
+                             n_lambda, n_sweeps_per_lam, n_props_per_sweep,
+                             key, spin_min, spin_max, debug, K):
+    """
+    Igual que _renyi2_drut_jit pero devuelve SOLO las muestras finales (λ≈1).
+    Usado por el estimador directo del gradiente.
+    """
+    lambda_grid, gl_weights = _gauss_legendre_01(n_lambda)
+
+    sweep_batch_fast = _make_sweep_batch_cached(spin_min, spin_max, K)
+    sweep_batch_traj = _make_sweep_batch_with_traj_cached(spin_min, spin_max, K)
+
+    def scan_lam(carry, lam):
+        s1, s2, k = carry
+        k_burn, k_next = jax.random.split(k)
+        keys_batch = jax.random.split(k_burn, s1.shape[0])
+
+        if debug:
+            s1, s2, acc_mean, lnR_traj, acc_traj = sweep_batch_traj(
+                keys_batch, s1, s2, A, B,
+                apply_fun, params, model_state,
+                lam, n_sweeps_per_lam, n_props_per_sweep,
+            )
+            n_total = s1.shape[0] * n_sweeps_per_lam
+            tau = _tau_int_per_chain(lnR_traj)
+            tau_mean = jnp.nanmean(tau)
+            ess_lam = n_total / tau_mean
+            f_lam = jnp.mean(lnR_traj[:, -1])
+
+            jax.debug.print(
+                "λ={lam:.3f}  f(λ)={f:.4f}  accept={acc:.3f}  "
+                "τ_int={tau:.2f}  ESS/M={ess:.4f}",
+                lam=lam, f=jnp.mean(f_lam), acc=jnp.mean(acc_mean),
+                tau=jnp.nanmean(tau), ess=jnp.mean(ess_lam) / n_total,
+            )
+        else:
+            n_props = n_sweeps_per_lam * n_props_per_sweep
+            s1, s2, _ = sweep_batch_fast(
+                keys_batch, s1, s2, A, B,
+                apply_fun, params, model_state, lam, n_props,
+            )
+
+        return (s1, s2, k_next), (s1, s2)
+
+    (_, _, _), (s1_stack, s2_stack) = jax.lax.scan(
+        scan_lam, (s1_init, s2_init, key), lambda_grid
+    )
+
+    # ── S₂: integración completa Gauss-Legendre (necesita todos los λ) ──
+    lnR_stack = jax.vmap(
+        lambda a, b: _lnR_batch(apply_fun, params, model_state, a, b, A, B)
+    )(s1_stack, s2_stack)
+    f_vals = jnp.mean(lnR_stack, axis=1)
+    S2 = -jnp.sum(gl_weights * f_vals)
+    S2_max = A.shape[0] * jnp.log(2.0)
+    S2 = jnp.minimum(S2, S2_max)
+
+    # ── Solo las muestras del último λ (≈ q₁) ──
+    s1_final = s1_stack[-1]
+    s2_final = s2_stack[-1]
+
+    # ── Short MCMC extra a λ=1 exacto (opcional pero elimina sesgo residual) ──
+    # n_extra = n_sweeps_per_lam
+    # keys_extra = jax.random.split(key, s1_final.shape[0])
+    # s1_final, s2_final, _ = sweep_batch_fast(
+    #     keys_extra, s1_final, s2_final, A, B,
+    #     apply_fun, params, model_state,
+    #     1.0,                                # ← lam, POSICIONAL
+    #     n_extra * n_props_per_sweep,        # ← n_props, POSICIONAL
+    # )
+
+    return S2, s1_final, s2_final
+
+def _drut_direct_loss(apply_fun, params, model_state, s1_final, s2_final, A, B):
+    """
+    Loss tal que ∇loss = ∇S₂ estimado directamente desde q₁.
+
+    Identidad: ∇S₂ = -E_{q₁}[∇ log ρ]
+    con ρ(s1,s2) = ψ(s1)ψ(s2)ψ(sw1)ψ(sw2) (salvo constante en Z).
+
+    Las muestras s1_final, s2_final se tratan como CONSTANTES (stop_gradient
+    implícito): JAX solo diferencia respecto a params, no respecto a ellas.
+    """
+    def lpsi(s):
+        return jnp.real(apply_fun({"params": params, **model_state}, s))
+
+    # Swaps para el último λ
+    sw1 = jnp.concatenate([s2_final[:, A], s1_final[:, B]], axis=1)
+    sw2 = jnp.concatenate([s1_final[:, A], s2_final[:, B]], axis=1)
+
+    lp1  = jax.vmap(lpsi)(s1_final)
+    lp2  = jax.vmap(lpsi)(s2_final)
+    lsw1 = jax.vmap(lpsi)(sw1)
+    lsw2 = jax.vmap(lpsi)(sw2)
+
+    # E_{q₁}[log ρ]  (salvo constante -2 log Z, irrelevante para ∇)
+    return jnp.mean(lp1 + lp2 + lsw1 + lsw2)
+
+def renyi2_drut_sampling_direct(vstate, subsystem_sites, n_chains=256,
+                                 n_sweeps_per_lam=20, n_props_per_sweep=None,
+                                 n_lambda=10, key=0, debug=False, K=1):
+    """
+    Versión simplificada de renyi2_drut_sampling:
+
+      - S₂  : integración Gauss-Legendre completa (necesita todos los λ)
+      - ∇S₂ : fórmula directa desde muestras de q₁ (último λ de la rejilla),
+              sin REINFORCE ni suma sobre la rejilla.
+
+    Referencia teórica:
+        ∇S₂ = -E_{q₁}[∇ log ρ],  q₁ ∝ p·p·R = ρ/Γ
+
+    Idéntica signatura que renyi2_drut_sampling, para sustituirla directamente.
+    """
+    N_sites = vstate.hilbert.size
+    A = jnp.array(subsystem_sites, dtype=int)
+    B = jnp.setdiff1d(jnp.arange(N_sites), A)
+
+    if n_props_per_sweep is None:
+        n_props_per_sweep = 2 * N_sites
+
+    local_states = jnp.array(vstate.hilbert.local_states)
+    spin_min = float(local_states.min())
+    spin_max = float(local_states.max())
+    if debug:
+        print(f"[renyi2_drut_direct] local_states = {local_states.tolist()}")
+
+    all_init = vstate.sample(n_samples=2 * n_chains)
+    all_init = all_init.reshape(2 * n_chains, N_sites)
+    all_init = jax.random.permutation(jax.random.PRNGKey(key), all_init, axis=0)
+    s1_init = all_init[:n_chains]
+    s2_init = all_init[n_chains:]
+
+    S2, s1_final, s2_final = _renyi2_drut_jit_direct(
+        vstate._apply_fun, vstate.parameters, vstate.model_state,
+        s1_init, s2_init, A, B,
+        n_lambda, n_sweeps_per_lam, n_props_per_sweep,
+        jax.random.PRNGKey(key + 1),
+        spin_min, spin_max, debug, K,
+    )
+
+    grad_loss = jax.grad(lambda p: _drut_direct_loss(
+        vstate._apply_fun, p, vstate.model_state,
+        s1_final, s2_final, A, B,
+    ))(vstate.parameters)
+    grad_S2 = jax.tree_util.tree_map(lambda g: -g, grad_loss)
+
+    if debug:
+        gf, _ = jax.flatten_util.ravel_pytree(grad_S2)
+        print(f"S₂    = {float(jnp.asarray(S2)):.6f}")
+        print(f"|∇S₂| = {jnp.linalg.norm(gf):.6f}")
+
+    return float(S2), grad_S2
+
 #Increment trick, Metropolis-Hastings sampling for log(R_{A^{i+1}} / R_{A^i})
 def _swap_A(s, s_other, A_sites):
     """

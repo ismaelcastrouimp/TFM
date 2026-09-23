@@ -42,6 +42,7 @@ from src_renyi.entropy import (
     renyi2_entropy_and_grad_lambda_integral,
     renyi2_entropy_and_grad_exact,
     renyi2_drut_sampling,
+    renyi2_drut_sampling_direct,
     renyi2_increment_sampling
 )
 from src_renyi.training import free_energy_minimize
@@ -73,7 +74,7 @@ def cosine_similarity(g1, g2):
 N              = 6
 GAMMA          = -1.5
 V              = -1.0
-TEMPS          = [3.5, 3.75, 4.0]
+TEMPS          = [1.0, 3.5, 3.75, 4.0]
 n_rep          = 10
 n_samples_diag = 16384
 N_SAMPLES_LIST = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
@@ -134,6 +135,7 @@ S2_exact_list                = []
 err_swap_list, cos_swap_list = [], []
 err_ti_list,   cos_ti_list   = [], []
 err_drut_list, cos_drut_list = [], []
+err_drut_direct_list, cos_drut_direct_list = [], []
 err_inc_list, cos_inc_list   = [], []
 
 for T, vstate in trained_vstates.items():
@@ -145,6 +147,7 @@ for T, vstate in trained_vstates.items():
     s2_sw, cos_sw = [], []
     s2_ti, cos_ti = [], []
     s2_drut, cos_drut = [], []
+    s2_drut_direct, cos_drut_direct = [], []
     s2_inc, cos_inc = [], []
 
     for rep in range(n_rep):
@@ -171,11 +174,22 @@ for T, vstate in trained_vstates.items():
         s2_drut.append(float(S2_est))
         cos_drut.append(cosine_similarity(grad_est, grad_ex))
 
+        S2_est, grad_est = renyi2_drut_sampling_direct(vstate, subsystem,
+            n_chains=512,
+            n_sweeps_per_lam=100,
+            n_props_per_sweep=24,
+            n_lambda=20,
+            debug=False,
+            K=2
+        )
+        s2_drut_direct.append(float(S2_est))
+        cos_drut_direct.append(cosine_similarity(grad_est, grad_ex))
+
         S2_est, grad_est, _, _    = renyi2_increment_sampling(vstate, partition,
             n_chains=512,
             n_sweeps_per_site=100,
             n_props_per_sweep=24,
-            debug=False,
+            debug=False
         )
         s2_inc.append(float(S2_est))
         cos_inc.append(cosine_similarity(grad_est, grad_ex))
@@ -186,12 +200,15 @@ for T, vstate in trained_vstates.items():
     cos_ti_list.append(np.array(cos_ti))
     err_drut_list.append(np.abs(np.array(s2_drut) - S2_ex))
     cos_drut_list.append(np.array(cos_drut))
+    err_drut_direct_list.append(np.abs(np.array(s2_drut_direct) - S2_ex))
+    cos_drut_direct_list.append(np.array(cos_drut_direct))
     err_inc_list.append(np.abs(np.array(s2_inc) - S2_ex))
     cos_inc_list.append(np.array(cos_inc))
 
     print(f"    swap  |ΔS₂|={err_swap_list[-1].mean():.4f}  cos={np.mean(cos_sw):.4f}")
     print(f"    TI    |ΔS₂|={err_ti_list[-1].mean():.4f}  cos={np.mean(cos_ti):.4f}")
     print(f"    DRUT  |ΔS₂|={err_drut_list[-1].mean():.4f}  cos={np.mean(cos_drut):.4f}")
+    print(f"    DRUTd |ΔS₂|={err_drut_direct_list[-1].mean():.4f}  cos={np.mean(cos_drut_direct):.4f}")
     print(f"    INC   |ΔS₂|={err_inc_list[-1].mean():.4f}  cos={np.mean(cos_inc):.4f}")
 
 S2_arr      = np.array(S2_exact_list)
@@ -199,6 +216,7 @@ err_sw_mean = np.array([e.mean() for e in err_swap_list])
 err_ti_mean = np.array([e.mean() for e in err_ti_list])
 cos_sw_mean = np.array([c.mean() for c in cos_swap_list])
 cos_ti_mean = np.array([c.mean() for c in cos_ti_list])
+cos_drut_direct_mean = np.array([c.mean() for c in cos_drut_direct_list])
 
 # Percentiles para barras asimétricas robustas
 def percentile_bands(err_list):

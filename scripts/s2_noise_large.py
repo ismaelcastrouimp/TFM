@@ -47,6 +47,7 @@ from src_renyi.entropy import (
     renyi2_entropy_and_grad_sampled,
     renyi2_entropy_and_grad_lambda_integral,
     renyi2_drut_sampling,
+    renyi2_drut_sampling_direct,
     renyi2_increment_sampling,
 )
 from src_renyi.training import free_energy_minimize
@@ -88,7 +89,7 @@ V              = -1.0                     # coeficiente de σᶻσᶻ
 TEMPS          = [3.0, 4.0, 5.0, 7.0]
 
 n_rep          = 10                       # nº de réplicas por método y T
-n_samples_diag = 16384                    # para swap y λ-i (nº de muestras)
+n_samples_diag = 1024                    # para swap y λ-i (nº de muestras)
 
 # Parámetros de Metropolis (Drut e Increment)
 n_chains       = 512
@@ -133,16 +134,17 @@ for i, T in enumerate(TEMPS):
     trained_vstates[T] = vstate
 
 
-# ── evaluación de los 4 métodos ────────────────────────────────────────────────
+# ── evaluación de los 5 métodos ────────────────────────────────────────────────
 print("\n" + "=" * 70)
 print("Comparación de estimadores  (sin ED)")
 print("=" * 70)
 
-METHODS = ["swap", "lambda_i", "drut", "increment"]
-COLORS  = {"swap": "C0", "lambda_i": "C1", "drut": "C2", "increment": "C3"}
+METHODS = ["swap", "lambda_i", "drut", "drut_direct", "increment"]
+COLORS  = {"swap": "C0", "lambda_i": "C1", "drut": "C2", "drut_direct": "C3", "increment": "C4"}
 LABELS  = {"swap": "Swap trick",
            "lambda_i": r"$\lambda$-i",
            "drut": r"$\lambda$-i (TI-2)",
+           "drut_direct": r"$\lambda$-i (TI-2, direct)",
            "increment": "Increment"}
 
 # Resultados: por T, por método → listas de S₂, listas de gradientes, tiempos
@@ -185,6 +187,20 @@ for T, vstate in trained_vstates.items():
         results[T]["drut"]["S2"].append(float(S2))
         results[T]["drut"]["grads"].append(g)
         results[T]["drut"]["time"].append(time.time() - t0)
+        
+        # ── Drut (direct) (Metropolis + annealing en λ) ───────────────
+        t0 = time.time()
+        S2, g = renyi2_drut_sampling_direct(
+            vstate, partition,
+            n_chains=n_chains,
+            n_sweeps_per_lam=n_sweeps_met,
+            n_props_per_sweep=n_props_sweep,
+            n_lambda=n_lambda,
+            debug=False,
+        )
+        results[T]["drut_direct"]["S2"].append(float(S2))
+        results[T]["drut_direct"]["grads"].append(g)
+        results[T]["drut_direct"]["time"].append(time.time() - t0)
 
         # ── Increment (Metropolis + annealing en regiones) ───────────
         t0 = time.time()
