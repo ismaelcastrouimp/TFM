@@ -16,7 +16,7 @@ import netket as nk
 from netket.operator.spin import sigmax, sigmaz
 import optax
 import json
-from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled, renyi2_entropy_and_grad_exact, renyi2_drut_sampling
+from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled, renyi2_entropy_and_grad_exact, renyi2_drut_sampling, MODARNN, InterleavedARNNDense
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
 N          = 10
@@ -75,7 +75,9 @@ for i in range(N):
     H_extended += J_XX * sigmax(hi, i) @ sigmax(hi, (i + 1) % N)
 
 
-model = nk.models.ARNNDense(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
+# model = nk.models.ARNNDense(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
+# model = MODARNN(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
+model = InterleavedARNNDense(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
 sampler = nk.sampler.ARDirectSampler(hi)
 vstate  = nk.vqs.MCState(sampler, model, n_samples=N_SAMPLES)
 

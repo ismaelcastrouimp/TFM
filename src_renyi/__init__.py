@@ -1,4 +1,4 @@
-from .models import ARNN_Z2, RBM_Z2
+from .models import ARNN_Z2, RBM_Z2, MODARNN, InterleavedARNNDense
 from .observables import FreeRenyiEnergyObservable, expect_and_grad_free_renyi
 from .entropy import (
     vstate_to_vector,
