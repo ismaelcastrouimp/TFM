@@ -20,7 +20,7 @@ import json
 import flax.serialization as serialization
 from tqdm import tqdm
 
-from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled, free_energy_minimize_exact, ARNN_Z2
+from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled, free_energy_minimize_exact, ARNN_Z2, InterleavedARNNDense
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
 N          = 10
@@ -73,8 +73,8 @@ for i in range(N):
     H_extended += J_XX * sigmax(hi, i) @ sigmax(hi, (i + 1) % N)
 
 model = nk.models.ARNNDense(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
+# model = InterleavedARNNDense(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
 sampler = nk.sampler.ARDirectSampler(hi)
-vstate  = nk.vqs.MCState(sampler, model, n_samples=N_SAMPLES)
 
 partition = list(range(N))
 # ───────────────────────────────────────────────────────────────────────────────
@@ -195,7 +195,7 @@ os.makedirs(params_dir, exist_ok=True)
 print(f"TRAINING N={N}, N_A={N_A}")
 for T_idx, T in enumerate(tqdm(T_array, desc="Temperaturas")):
     print(f"\n=== Temperatura T = {T:.3f} ===")
-    vstate.init_parameters()
+    vstate  = nk.vqs.MCState(sampler, model, n_samples=N_SAMPLES)
 
     free_energy_history, best_F, best_energy, best_entropy = free_energy_minimize(
         vstate=vstate, T=T, partition=partition, Hamiltonian=H_extended, n_steps=N_STEPS,

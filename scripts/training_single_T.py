@@ -16,7 +16,7 @@ import netket as nk
 from netket.operator.spin import sigmax, sigmaz
 import optax
 import json
-from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled, renyi2_entropy_and_grad_exact, renyi2_drut_sampling, MODARNN, InterleavedARNNDense
+from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled, renyi2_entropy_and_grad_exact, renyi2_drut_sampling, MODARNN, InterleavedARNNDense, ARSpinViT_Causal
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
 N          = 10
@@ -42,7 +42,7 @@ else:
     optimizer = optax.adam(lr)
 lr_fine    = optax.linear_schedule(0.01, 0.001, N_STEPS)
 
-drut_kwargs = dict(n_chains=512, n_lambda=20, n_sweeps_per_lam=100, n_props_per_sweep=4*N, K=3)
+drut_kwargs = dict(n_chains=512//2, n_lambda=20, n_sweeps_per_lam=100, n_props_per_sweep=4*N, K=3)
 
 N_REP_COSINE = 10
 N_REP_DRUT = 3
@@ -75,9 +75,10 @@ for i in range(N):
     H_extended += J_XX * sigmax(hi, i) @ sigmax(hi, (i + 1) % N)
 
 
-# model = nk.models.ARNNDense(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
+model = nk.models.ARNNDense(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
 # model = MODARNN(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
-model = InterleavedARNNDense(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
+# model = InterleavedARNNDense(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
+# model = ARSpinViT_Causal(hilbert=hi, embedding_d=8, n_heads=2, n_blocks=2, n_ffn_layers=1)
 sampler = nk.sampler.ARDirectSampler(hi)
 vstate  = nk.vqs.MCState(sampler, model, n_samples=N_SAMPLES)
 
