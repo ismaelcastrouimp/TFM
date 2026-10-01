@@ -24,3 +24,8 @@ dist/
 # IDE / sistema
 .vscode/
 .DS_Store
+
+
+
+#Data
+data
