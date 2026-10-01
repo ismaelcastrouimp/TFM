@@ -5,19 +5,31 @@ import jax.numpy as jnp
 import netket as nk
 from netket.experimental.observable import AbstractObservable
 
+from .entropy import renyi2_drut_sampling
+
 
 class FreeRenyiEnergyObservable(AbstractObservable):
     """
-    Observable F = E - T·S₂ cuyo gradiente se computa de forma fusionada
-    en un único jit, reutilizando las muestras del vstate.
+    Observable F = E - T·S₂.
+
+    Con method="swap", calcula energía y S₂ en un kernel fusionado usando
+    las muestras del vstate. Con method="drut", calcula ambos gradientes
+    mediante las rutinas estándar de energía y Drut.
     """
 
-    def __init__(self, hilbert, H, partition, T, chunk_size=128):
+    def __init__(self, hilbert, H, partition, T, chunk_size=128,
+                 method="swap", drut_kwargs=None, drut_seed=0):
         super().__init__(hilbert)
+        if method not in ("swap", "drut"):
+            raise ValueError(f"method must be 'swap' or 'drut', got {method!r}")
         self.H = H
         self.partition = partition
         self.T = T
         self.chunk_size = chunk_size
+        self.method = method
+        self.drut_kwargs = dict(drut_kwargs or {})
+        self.drut_seed = drut_seed
+        self._drut_step = 0
 
     @property
     def dtype(self):
@@ -100,6 +112,26 @@ def _free_renyi_grad_jit(logpsi, params, model_state,
 
 @nk.vqs.expect_and_grad.dispatch
 def expect_and_grad_free_renyi(vstate, op, chunk_size, **kwargs):
+    if op.method == "drut":
+        E_stats, grad_E = vstate.expect_and_grad(op.H)
+        drut_kwargs = {
+            **op.drut_kwargs,
+            "key": op.drut_seed + op._drut_step,
+        }
+        S2, grad_S2 = renyi2_drut_sampling(
+            vstate, op.partition, **drut_kwargs
+        )
+        op._drut_step += 1
+
+        grad_F = jax.tree_util.tree_map(
+            lambda grad_energy, grad_entropy: grad_energy - op.T * grad_entropy,
+            grad_E,
+            grad_S2,
+        )
+        F = float(E_stats.mean.real) - op.T * float(S2)
+        F_stats = nk.stats.statistics(jnp.array([[F]]))
+        return F_stats, grad_F
+
     subsystem_sites = jnp.array(op.partition, dtype=int)
     all_sites = jnp.arange(vstate.hilbert.size)
     complement_sites = jnp.setdiff1d(all_sites, subsystem_sites)

@@ -144,14 +144,12 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000,
     (free_energy_history, best_F, E_best, S2_best)
     """
     # ── Defaults ────────────────────────────────────────────────────────
-    if learning_rate is None:
-        if n_steps > 0:
-            learning_rate = optax.warmup_cosine_decay_schedule(
-                0.1, 0.1, 100, n_steps, 0.001
-            )
-        else:
-            learning_rate = 0.001
     if optimizer is None:
+        if learning_rate is None:
+            if n_steps > 0:
+                learning_rate = optax.linear_schedule(0.01, 0.001, n_steps)
+            else:
+                learning_rate = 0.001
         optimizer = optax.sgd(learning_rate)
 
     # ── Extraer LR final del coarse ─────────────────────────────────────
@@ -254,6 +252,16 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000,
                 n_props_per_sweep=2 * vstate.hilbert.size,
                 K=2,
             )
+        fine_renyi_op = FreeRenyiEnergyObservable(
+            vstate.hilbert,
+            Hamiltonian,
+            partition,
+            T,
+            chunk_size=chunk_size,
+            method="drut",
+            drut_kwargs=fine_drut_kwargs,
+            drut_seed=12345,
+        )
         if verbose:
             print(f"[fine] {fine_steps} pasos con Drut")
             print(f"       kwargs: {fine_drut_kwargs}")
@@ -270,19 +278,7 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000,
             if timing:
                 t0 = time.time()
 
-            # ∇E
-            E_stats, grad_E = vstate.expect_and_grad(Hamiltonian)
-            E_val = float(E_stats.mean.real)
-
-            # ∇S₂ por Drut
-            S2_val, grad_S2 = renyi2_drut_sampling(
-                vstate, partition, key=step + 12345, **fine_drut_kwargs
-            )
-
-            # ∇F = ∇E - T·∇S₂
-            grad_F = jax.tree_util.tree_map(
-                lambda ge, gs: ge - T * gs, grad_E, grad_S2
-            )
+            F_stats, grad_F = vstate.expect_and_grad(fine_renyi_op)
 
             updates, fine_opt_state = fine_opt.update(
                 grad_F, fine_opt_state, vstate.parameters
@@ -294,7 +290,7 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000,
                     lambda x: x.block_until_ready(), vstate.parameters
                 )
 
-            F_val = E_val - T * S2_val
+            F_val = float(F_stats.mean.real)
             free_energy_history.append(F_val)
 
             # Best del fine (el único que cuenta si fine_steps > 0)
@@ -303,8 +299,7 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000,
                 fine_best_params = vstate.parameters
 
             if step % max(1, freq // 5) == 0 and verbose:
-                msg = (f"  [fine] Step {step:3d} | F={F_val:.6f} | "
-                       f"E={E_val:.6f} | S₂={S2_val:.6f}")
+                msg = f"  [fine] Step {step:3d} | F={F_val:.6f}"
                 if timing:
                     msg += f" | t={time.time()-t0:.2f}s"
                 print(msg)
