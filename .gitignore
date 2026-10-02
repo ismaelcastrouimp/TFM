@@ -29,4 +29,5 @@ dist/
 
 #Folders
 data
+plots
 slurm
