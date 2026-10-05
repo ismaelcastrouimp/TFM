@@ -822,6 +822,185 @@ def renyi2_drut_sampling(vstate, subsystem_sites, n_chains=256,
 
     return float(S2), grad_S2
 
+
+def _sweep_single_chain_with_samples_cached(key, s1, s2, A, B,
+                                              apply_fun, params, model_state,
+                                              lam, n_sweeps, n_props_per_sweep,
+                                              spin_min, spin_max, K,
+                                              sample_every):
+    """
+    Sweep MCMC que devuelve MÚLTIPLES configuraciones por cadena.
+
+    Corre n_sweeps bloques MCMC y extrae las configuraciones en los
+    últimos (n_sweeps // sample_every) checkpoints, espaciados por
+    sample_every sweeps.
+
+    Devuelve
+    --------
+    s1_final, s2_final : (N,) estado final para warm-start del siguiente λ
+    s1_samples, s2_samples : (n_checkpoints, N) muestras extraídas
+    acc_mean : aceptance media
+    """
+    log_P_cur, _ = _log_target_and_lnR(apply_fun, params, model_state,
+                                        s1, s2, A, B, lam)
+
+    keys_outer = jax.random.split(key, n_sweeps)
+
+    def block(carry, k_outer):
+        s1, s2, log_P, acc_sum = carry
+        keys_inner = jax.random.split(k_outer, n_props_per_sweep)
+
+        def single_prop(c, k):
+            s1, s2, log_P, acc = c
+            s1, s2, log_P, a = _block_flip_step_cached(
+                k, s1, s2, log_P, A, B, apply_fun, params, model_state,
+                lam, spin_min, spin_max, K
+            )
+            return (s1, s2, log_P, acc + a), None
+
+        (s1_new, s2_new, log_P_new, acc_block), _ = jax.lax.scan(
+            single_prop, (s1, s2, log_P, jnp.float32(0.0)), keys_inner
+        )
+        acc_rate = acc_block / n_props_per_sweep
+        return (s1_new, s2_new, log_P_new, acc_sum + acc_rate), (s1_new, s2_new)
+
+    (s1_final, s2_final, _, acc_total), (s1_traj, s2_traj) = jax.lax.scan(
+        block, (s1, s2, log_P_cur, jnp.float32(0.0)), keys_outer
+    )
+
+    # Extraer muestras: los últimos n_checkpoints checkpoints,
+    # espaciados por sample_every sweeps
+    # s1_traj tiene shape (n_sweeps, N)
+    # Índices: los últimos n_checkpoints * sample_every sweeps,
+    # tomando el último de cada bloque de sample_every
+    n_checkpoints = n_sweeps // sample_every
+    # Tomamos los índices: n_sweeps-1, n_sweeps-1-sample_every, ...
+    idx = n_sweeps - 1 - sample_every * jnp.arange(n_checkpoints)
+    # idx va de n_sweeps-1 hacia atrás, dando los últimos checkpoints
+    # Pero queremos orden temporal ascendente para claridad:
+    idx = jnp.sort(idx)
+
+    s1_samples = s1_traj[idx]  # (n_checkpoints, N)
+    s2_samples = s2_traj[idx]
+
+    return s1_final, s2_final, s1_samples, s2_samples, acc_total / n_sweeps
+
+def _make_sweep_batch_with_samples(spin_min, spin_max, K, sample_every):
+    def _fn(key, s1, s2, A, B, apply_fun, params, model_state,
+            lam, n_sweeps, n_props_per_sweep):
+        return _sweep_single_chain_with_samples_cached(
+            key, s1, s2, A, B, apply_fun, params, model_state,
+            lam, n_sweeps, n_props_per_sweep, spin_min, spin_max, K,
+            sample_every
+        )
+    return jax.vmap(
+        _fn,
+        in_axes=(0, 0, 0, None, None, None, None, None, None, None, None),
+    )
+
+def _renyi2_drut_jit2(apply_fun, params, model_state,
+                     s1_init, s2_init, A, B,
+                     n_lambda, n_sweeps_per_lam, n_props_per_sweep,
+                     key, spin_min, spin_max, debug, K,
+                     sample_every=10):
+    lambda_grid, gl_weights = _gauss_legendre_01(n_lambda)
+
+    sweep_batch = _make_sweep_batch_with_samples(spin_min, spin_max, K, sample_every)
+
+    def scan_lam(carry, lam):
+        s1, s2, k = carry
+        k_burn, k_next = jax.random.split(k)
+        keys_batch = jax.random.split(k_burn, s1.shape[0])
+
+        s1_final, s2_final, s1_smp, s2_smp, acc_mean = sweep_batch(
+            keys_batch, s1, s2, A, B, apply_fun, params, model_state,
+            lam, n_sweeps_per_lam, n_props_per_sweep,
+        )
+        # s1_smp: (n_chains, n_checkpoints, N)
+
+        if debug:
+            n_ch, n_cp = s1_smp.shape[0], s1_smp.shape[1]
+            jax.debug.print(
+                "λ={lam:.3f}  accept={acc:.3f}  "
+                "n_chains={nc}  n_samples/chain={np_}  total={tot}",
+                lam=lam, acc=jnp.mean(acc_mean),
+                nc=n_ch, np_=n_cp, tot=n_ch * n_cp,
+            )
+
+        # Aplastar (n_chains, n_checkpoints) → (n_chains * n_checkpoints)
+        n_ch, n_cp, N_ = s1_smp.shape
+        s1_flat = s1_smp.reshape(n_ch * n_cp, N_)
+        s2_flat = s2_smp.reshape(n_ch * n_cp, N_)
+
+        return (s1_final, s2_final, k_next), (s1_flat, s2_flat)
+
+    (_, _, _), (s1_stack, s2_stack) = jax.lax.scan(
+        scan_lam, (s1_init, s2_init, key), lambda_grid
+    )
+    # s1_stack: (n_lambda, n_chains * n_checkpoints, N)
+
+    lnR_stack = jax.vmap(
+        lambda a, b: _lnR_batch(apply_fun, params, model_state, a, b, A, B)
+    )(s1_stack, s2_stack)
+    # lnR_stack: (n_lambda, n_chains * n_checkpoints)
+
+    f_vals = jnp.mean(lnR_stack, axis=1)  # (n_lambda,)
+
+    S2 = -jnp.sum(gl_weights * f_vals)
+    S2_max = A.shape[0] * jnp.log(2.0)
+    S2 = jnp.minimum(S2, S2_max)
+
+    return S2, s1_stack, s2_stack, lambda_grid
+
+def renyi2_drut_sampling2(vstate, subsystem_sites, n_chains=256,
+                         n_sweeps_per_lam=20, n_props_per_sweep=None,
+                         n_lambda=10, key=0, debug=False, K=1):
+
+    N_sites = vstate.hilbert.size
+    A = jnp.array(subsystem_sites, dtype=int)
+    B = jnp.setdiff1d(jnp.arange(N_sites), A)
+
+    if n_props_per_sweep is None:
+        n_props_per_sweep = 2 * N_sites
+
+    local_states = jnp.array(vstate.hilbert.local_states)
+    spin_min = float(local_states.min())
+    spin_max = float(local_states.max())
+    if debug:
+        print(f"[renyi2_drut] local_states = {local_states.tolist()}  "
+              f"→ flip: new = ({spin_min} + {spin_max}) - cur")
+
+    all_init = vstate.sample(n_samples=2 * n_chains)
+    all_init = all_init.reshape(2 * n_chains, N_sites)
+    all_init = jax.random.permutation(jax.random.PRNGKey(key), all_init, axis=0)
+    s1_init = all_init[:n_chains]
+    s2_init = all_init[n_chains:]
+
+    S2, s1_stack, s2_stack, lambda_grid = _renyi2_drut_jit2(
+        vstate._apply_fun, vstate.parameters, vstate.model_state,
+        s1_init, s2_init, A, B,
+        n_lambda, n_sweeps_per_lam, n_props_per_sweep,
+        jax.random.PRNGKey(key + 1),
+        spin_min, spin_max, debug, K
+    )
+
+    # ← Mismos pesos que en el kernel
+    _, gl_weights = _gauss_legendre_01(n_lambda)
+
+    grad_loss = jax.grad(lambda p: _drut_loss(
+        vstate._apply_fun, p, vstate.model_state,
+        s1_stack, s2_stack, lambda_grid, gl_weights, A, B,
+    ))(vstate.parameters)
+    grad_S2 = jax.tree_util.tree_map(lambda g: -g, grad_loss)
+
+    if debug:
+        gf, _ = jax.flatten_util.ravel_pytree(grad_S2)
+        print(f"S₂    = {float(jnp.asarray(S2)):.6f}")
+        print(f"|∇S₂| = {jnp.linalg.norm(gf):.6f}")
+
+    return float(S2), grad_S2
+
+
 #Gradiente sin integral
 def _renyi2_drut_jit_direct(apply_fun, params, model_state,
                              s1_init, s2_init, A, B,
@@ -1241,3 +1420,210 @@ def renyi2_increment_sampling(vstate, subsystem_sites, n_chains,
         print(f"  |∇S₂|          = {jnp.linalg.norm(gf):.6f}")
 
     return float(S2), grad_S2, ratios, A_list
+
+
+# Wang & Davis (2020) — Conditional sampling para S₂
+import optax
+
+def _per_site_log_psi(vstate, s, reverse=False):
+    """
+    log ψ(s_i | cond_i) por sitio, en orden ORIGINAL de sitios.
+
+    reverse=False → cond_i = {s_j : j < i}   (forward)
+    reverse=True  → cond_i = {s_j : j > i}   (reverse)
+
+    El flip es EXPLÍCITO porque NetKet no aplica reorder/inverse_reorder
+    dentro de conditionals_log_psi.
+    """
+    s_in = jnp.flip(s, axis=-1) if reverse else s
+    cond = vstate.model.apply(
+        {"params": vstate.parameters, **vstate.model_state},
+        s_in, method="conditionals_log_psi",
+    )
+    if reverse:
+        cond = jnp.flip(cond, axis=-2)
+    return cond
+
+def _value_index(s_sel, local_states):
+    """Índice en local_states correspondiente a s_sel (robusto al orden)."""
+    diff = jnp.abs(local_states[None, None, :] - s_sel[..., None])
+    return jnp.argmin(diff, axis=-1).astype(jnp.int32)
+
+def _log_cond_sum(cond, s_sel, site_indices, local_states):
+    """Σ_i log p(s_i | cond) sobre los sitios dados (machine_pow=2)."""
+    idx = _value_index(s_sel, local_states)
+    cond_sel = cond[:, site_indices, :]
+    log_psi_sel = jnp.take_along_axis(
+        cond_sel, idx[..., None], axis=-1
+    ).squeeze(-1)
+    return 2.0 * log_psi_sel.sum(axis=-1)
+
+def _sample_ar_sites(key, vstate, s_init, sites, reverse=False):
+    local_states = jnp.asarray(vstate.hilbert.local_states)
+    sites_arr = jnp.asarray(sites, dtype=int)
+    keys = jax.random.split(key, sites_arr.shape[0])
+
+    def step(carry, inputs):
+        s, _ = carry
+        k, i = inputs
+        cond_i = _per_site_log_psi(vstate, s[None], reverse=reverse)[0, i]
+        log_p_i = 2.0 * cond_i                           # machine_pow = 2
+        choice = jax.random.categorical(k, log_p_i)
+        return (s.at[i].set(local_states[choice]), None), None
+
+    (s_final, _), _ = jax.lax.scan(step, (s_init, None), (keys, sites_arr))
+    return s_final
+
+def _sample_ar_sites_batch(key, vstate, s_init_batch, sites, reverse=False):
+    keys = jax.random.split(key, s_init_batch.shape[0])
+    return jax.vmap(lambda k, s: _sample_ar_sites(k, vstate, s, sites, reverse))(
+        keys, s_init_batch
+    )
+
+def _wang_sample_quadruples(key, vstate, vstate_R, n_samples, N_S, N_total):
+    """
+    σ_a¹ ~ p(σ_a)              [forward]
+    σ_b¹ ~ p(σ_b | σ_a¹)        [forward]
+    σ_a² ~ p_R(σ_a | σ_b¹)      [reverse]
+    σ_b² ~ p(σ_b | σ_a²)        [forward]
+    """
+    local_states = jnp.asarray(vstate.hilbert.local_states)
+    blank = jnp.full((n_samples, N_total), local_states[0],
+                     dtype=local_states.dtype)
+
+    A_fwd = jnp.arange(N_S)
+    B_fwd = jnp.arange(N_S, N_total)
+    A_rev = jnp.arange(N_S - 1, -1, -1)
+
+    k1, k2, k3, k4 = jax.random.split(key, 4)
+
+    sa1_full = _sample_ar_sites_batch(k1, vstate, blank, A_fwd, reverse=False)
+    sa1 = sa1_full[:, :N_S]
+
+    s_init = blank.at[:, :N_S].set(sa1)
+    sb1_full = _sample_ar_sites_batch(k2, vstate, s_init, B_fwd, reverse=False)
+    sb1 = sb1_full[:, N_S:]
+
+    s_init = blank.at[:, N_S:].set(sb1)
+    sa2_full = _sample_ar_sites_batch(k3, vstate_R, s_init, A_rev, reverse=True)
+    sa2 = sa2_full[:, :N_S]
+
+    s_init = blank.at[:, :N_S].set(sa2)
+    sb2_full = _sample_ar_sites_batch(k4, vstate, s_init, B_fwd, reverse=False)
+    sb2 = sb2_full[:, N_S:]
+
+    return sa1, sb1, sa2, sb2
+
+def renyi2_wang_cs(vstate, vstate_R, subsystem_sites, n_samples,
+                   key=0, debug=False):
+    """S₂ = -ln Tr[ρ_A²] y su gradiente vía Wang & Davis (2020)."""
+    N_total = vstate.hilbert.size
+    N_S = len(subsystem_sites)
+
+    assert list(subsystem_sites) == list(range(N_S)), (
+        "Wang CS requiere subsystem_sites = [0, 1, ..., N_S-1]"
+    )
+
+    local_states = jnp.asarray(vstate.hilbert.local_states)
+    A_sites = jnp.arange(N_S)
+    B_sites = jnp.arange(N_S, N_total)
+
+    sa1, sb1, sa2, sb2 = _wang_sample_quadruples(
+        jax.random.PRNGKey(key), vstate, vstate_R, n_samples, N_S, N_total
+    )
+    sa1 = jax.lax.stop_gradient(sa1); sb1 = jax.lax.stop_gradient(sb1)
+    sa2 = jax.lax.stop_gradient(sa2); sb2 = jax.lax.stop_gradient(sb2)
+
+    c11 = jnp.concatenate([sa1, sb1], axis=-1)
+    c21 = jnp.concatenate([sa2, sb1], axis=-1)
+    c22 = jnp.concatenate([sa2, sb2], axis=-1)
+    c12 = jnp.concatenate([sa1, sb2], axis=-1)
+
+    cond_fwd_11 = _per_site_log_psi(vstate,   c11, reverse=False)
+    cond_rev_21 = _per_site_log_psi(vstate_R, c21, reverse=True)
+    cond_fwd_22 = _per_site_log_psi(vstate,   c22, reverse=False)
+
+    log_p_a1  = _log_cond_sum(cond_fwd_11, sa1, A_sites, local_states)
+    log_p_b1  = _log_cond_sum(cond_fwd_11, sb1, B_sites, local_states)
+    log_pR_a2 = _log_cond_sum(cond_rev_21, sa2, A_sites, local_states)
+    log_p_b2  = _log_cond_sum(cond_fwd_22, sb2, B_sites, local_states)
+
+    logP = jax.lax.stop_gradient(
+        log_p_a1 + log_p_b1 + log_pR_a2 + log_p_b2
+    )
+
+    # ── Pesos para diagnóstico (Re(Ω)/P_CS), SIN diferenciar ──
+    def _log_Omega_only(s):
+        def logpsi(x):
+            return vstate._apply_fun(
+                {"params": vstate.parameters, **vstate.model_state}, x
+            )
+        return jnp.real(logpsi(s))
+
+    log_Omega_det = (
+        _log_Omega_only(c11)
+        + _log_Omega_only(c21)
+        + _log_Omega_only(c22)
+        + _log_Omega_only(c12)
+    )
+    w_raw = jnp.exp(log_Omega_det - logP)   # Re(Ω)/P_CS por muestra
+
+    def loss_fn(params):
+        def logpsi(s):
+            return vstate._apply_fun(
+                {"params": params, **vstate.model_state}, s
+            )
+        lp11 = logpsi(c11); lp21 = logpsi(c21)
+        lp22 = logpsi(c22); lp12 = logpsi(c12)
+        log_Omega = lp11 + jnp.conj(lp21) + lp22 + jnp.conj(lp12)
+        return jnp.mean(jnp.real(jnp.exp(log_Omega)) * jnp.exp(-logP))
+
+    Tr_rho2, grad = jax.value_and_grad(loss_fn)(vstate.parameters)
+    S2 = -jnp.log(jnp.abs(Tr_rho2))
+    grad_S2 = jax.tree_util.tree_map(lambda g: -g / Tr_rho2, grad)
+
+    if debug:
+        w_mean = jnp.mean(w_raw) + 1e-30
+        ess_ratio = float(w_mean ** 2 / (jnp.mean(w_raw ** 2) + 1e-30))
+        ess_abs   = ess_ratio * w_raw.shape[0]
+        lw        = jnp.log(jnp.abs(w_raw) + 1e-30)
+        lw_std    = float(jnp.std(lw))
+        lw_max    = jnp.max(lw)
+        frac_max  = float(jnp.mean(lw > (lw_max - 1.0)))
+
+        print(f"Tr[ρ_A²]      = {float(Tr_rho2):.6e}")
+        print(f"S₂            = {float(S2):.6f}")
+        print(f"ESS/M         = {ess_ratio:.4f}  "
+            f"({ess_abs:.0f}/{w_raw.shape[0]})")
+        print(f"log-w std     = {lw_std:.3f}")
+        print(f"frac cerca max= {frac_max:.4f}")
+
+    return float(S2), grad_S2
+
+def train_reverse_network(vstate, vstate_R, n_steps=500, batch=1024,
+                          lr=1e-3, key=0, verbose=True, freq=50):
+    """
+    Entrena vstate_R (ARNNDense estándar) para modelar p en orden invertido:
+        vstate_R(flip(s))  ≈  vstate(s)
+    """
+    opt = optax.adam(lr)
+    opt_state = opt.init(vstate_R.parameters)
+
+    def loss_fn(params_R, s):
+        log_p  = 2.0 * jnp.real(vstate._apply_fun(
+            {"params": vstate.parameters, **vstate.model_state}, s
+        ))
+        log_pR = 2.0 * jnp.real(vstate_R._apply_fun(
+            {"params": params_R, **vstate_R.model_state},
+            jnp.flip(s, axis=-1),
+        ))
+        return jnp.mean(log_p - log_pR)
+
+    for step in range(n_steps):
+        s = vstate.sample(n_samples=batch).reshape(-1, vstate.hilbert.size)
+        loss_val, grads = jax.value_and_grad(loss_fn)(vstate_R.parameters, s)
+        updates, opt_state = opt.update(grads, opt_state, vstate_R.parameters)
+        vstate_R.parameters = optax.apply_updates(vstate_R.parameters, updates)
+        if verbose and step % freq == 0:
+            print(f"[train N_R] step {step:4d}  D_KL ≈ {float(loss_val):.4f}")
+    return vstate_R
