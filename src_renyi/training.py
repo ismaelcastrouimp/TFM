@@ -6,12 +6,21 @@ import matplotlib.pyplot as plt
 import netket as nk
 import numpy as np
 import optax
+import os
+import json
 from jax.flatten_util import ravel_pytree
 from scipy.optimize import minimize
 
 from .observables import FreeRenyiEnergyObservable
-from .entropy import renyi2_entropy_and_grad_sampled, renyi2_entropy_sampled, renyi2_entropy_exact, renyi2_entropy_and_grad_exact, renyi2_drut_sampling
-
+from .entropy import (
+    renyi2_entropy_and_grad_sampled,
+    renyi2_entropy_sampled,
+    renyi2_entropy_exact,
+    renyi2_entropy_and_grad_exact,
+    renyi2_drut_sampling,
+    renyi2_wang_cs,          
+    train_reverse_network,    
+)
 
 def free_energy_minimize_SR_SGD(
     vstate, T, partition, Hamiltonian, n_steps=1000,
@@ -345,6 +354,246 @@ def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000,
         ax.set_xlabel("Step")
         ax.set_ylabel(r"$F$")
         ax.legend()
+        plt.tight_layout()
+        plt.show()
+
+    return free_energy_history, best_F, E_best, S2_best
+
+def compute_kl(vstate, vstate_R, n_samples=2048):
+    """D_KL(p_θ || p_R) estimada con muestras de vstate."""
+    s = vstate.sample(n_samples=n_samples).reshape(-1, vstate.hilbert.size)
+    lp = 2.0 * jnp.real(vstate._apply_fun(
+        {"params": vstate.parameters, **vstate.model_state}, s))
+    lpR = 2.0 * jnp.real(vstate_R._apply_fun(
+        {"params": vstate_R.parameters, **vstate_R.model_state},
+        jnp.flip(s, axis=-1)))
+    return float(jnp.mean(lp - lpR))
+
+def _auto_dkl_path(vstate, partition, T):
+    """Deriva la ruta de guardado desde vstate y partition.
+
+    Replica la lógica de training_single_T.py:
+       N      = len(partition)
+       N_A    = vstate.hilbert.size - N
+       data_dir = <project_root>/data/N{N}          si N == N_A
+                = <project_root>/data/N{N}_NA_{N_A}  si N != N_A
+    """
+    N   = len(partition)
+    N_A = vstate.hilbert.size - N
+    here = os.path.dirname(os.path.abspath(__file__))          # src_renyi/
+    base_data_dir = os.path.join(here, "..", "data")
+    folder = f"N{N}" if N == N_A else f"N{N}_NA_{N_A}"
+    data_dir = os.path.join(base_data_dir, folder)
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, f"dkl_history_T{T}.json")
+
+def free_energy_minimize_phases(
+    vstate, T, partition, Hamiltonian, phases,
+    verbose=True, freq=50, plot=True,
+    chunk_size=256, timing=False,
+    learning_rate=None, clip_norm=None, sr=None, n_samples_sr=None,
+    monitor_every=20,
+    dkl_n_samples=2048,   
+):
+    """
+    Minimiza F = E - T·S₂ pasando por una secuencia de fases.
+
+    Parámetros
+    ----------
+    phases : list of dict
+        Cada fase es un diccionario con:
+          - "method"       : "swap", "drut" o "wang"   (obligatorio)
+          - "n_steps"      : nº de pasos               (obligatorio)
+          - "optimizer"    : optax.GradientTransformation (opcional; por defecto SGD)
+          - "learning_rate": override del LR global (opcional)
+          - "vstate_R"     : MCState de la red reversa (obligatorio si method="wang")
+          - "warm_start"   : dict {"every": int, "n_steps": int, "lr": float,
+                                    "batch": int (opcional)}
+                             para actualizar vstate_R periódicamente
+          - "drut_kwargs"  : kwargs para renyi2_drut_sampling (si method="drut")
+          - "wang_kwargs"  : kwargs para renyi2_wang_cs (si method="wang")
+                             p.ej. {"n_samples": 8192}
+
+    Devuelve
+    --------
+    (free_energy_history, best_F, E_best, S2_best)
+    """
+    n_samples_full = vstate.n_samples
+    free_energy_history = []
+    best_F = float("inf")
+    best_params = None
+    phase_boundaries = []
+
+    # ── Auto-detección: ¿hay fase Wang? ──
+    has_wang = any(p["method"] == "wang" for p in phases)
+    dkl_history = []
+    global_step = 0
+
+    if has_wang:
+        dkl_save_path = _auto_dkl_path(vstate, partition, T)
+        if verbose:
+            print(f"[dkl] se guardará el historial en {dkl_save_path}")
+
+    def _record_dkl(tag, phase_idx, phase_step, vstate_R):
+        dkl = compute_kl(vstate, vstate_R, n_samples=dkl_n_samples)
+        dkl_history.append({
+            "tag":         tag,
+            "phase":       int(phase_idx),
+            "phase_step":  int(phase_step),
+            "global_step": int(global_step),
+            "dkl":         dkl,
+        })
+        return dkl
+
+    for i_phase, phase in enumerate(phases):
+        method        = phase["method"]
+        n_steps       = phase["n_steps"]
+        vstate_R      = phase.get("vstate_R", None)
+        warm_start    = phase.get("warm_start", None)
+        drut_kwargs   = phase.get("drut_kwargs", None)
+        wang_kwargs   = phase.get("wang_kwargs", None)
+        optimizer     = phase.get("optimizer", None)
+        lr_phase      = phase.get("learning_rate", learning_rate)
+        initial_train = phase.get("initial_train", None)
+
+        if method == "wang" and vstate_R is None:
+            raise ValueError("Phase with method='wang' requires a 'vstate_R' entry.")
+
+        # ── (sin cambios en construcción del observable / optimizer) ──
+        op = FreeRenyiEnergyObservable(
+            vstate.hilbert, Hamiltonian, partition, T,
+            chunk_size=chunk_size,
+            method=method,
+            drut_kwargs=drut_kwargs,
+            wang_kwargs=wang_kwargs,
+            vstate_R=vstate_R,
+        )
+        if optimizer is None:
+            lr = lr_phase if lr_phase is not None else 1e-3
+            optimizer = optax.sgd(lr)
+        grad_transform = optimizer
+        if clip_norm is not None:
+            grad_transform = optax.chain(
+                optax.clip_by_global_norm(clip_norm), optimizer
+            )
+        opt_state = grad_transform.init(vstate.parameters)
+
+        if verbose:
+            print(f"\n[phase {i_phase}] method={method}, n_steps={n_steps}")
+            if method == "wang" and warm_start is not None:
+                print(f"             warm_start: {warm_start}")
+
+        phase_start = len(free_energy_history)
+        phase_boundaries.append(phase_start)
+
+        # ── initial_train ──
+        if initial_train is not None:
+            if verbose:
+                dkl_before = _record_dkl("initial_before", i_phase, -1, vstate_R)
+            train_reverse_network(
+                vstate, vstate_R,
+                n_steps=initial_train["n_steps"],
+                batch=initial_train.get("batch", 4096),
+                lr=initial_train.get("lr", 1e-3),
+                verbose=verbose, freq=500,
+            )
+            if verbose:
+                dkl_after = _record_dkl("initial_after", i_phase, -1, vstate_R)
+                print(f"    D_KL: {dkl_before:.2e} → {dkl_after:.2e}")
+
+        # ── Loop de la fase ──
+        for step in range(n_steps):
+            if timing:
+                t0 = time.time()
+
+            F_stats, F_grad = vstate.expect_and_grad(op)
+
+            if sr is not None:
+                if n_samples_sr is not None:
+                    vstate.n_samples = n_samples_sr
+                F_grad = sr(vstate, F_grad, step)
+                if n_samples_sr is not None:
+                    vstate.n_samples = n_samples_full
+
+            updates, opt_state = grad_transform.update(
+                F_grad, opt_state, vstate.parameters
+            )
+            vstate.parameters = optax.apply_updates(vstate.parameters, updates)
+
+            if timing:
+                jax.tree_util.tree_map(
+                    lambda x: x.block_until_ready(), vstate.parameters
+                )
+
+            F_val = float(F_stats.mean.real)
+            free_energy_history.append(F_val)
+
+            if F_val < best_F:
+                best_F = F_val
+                best_params = vstate.parameters
+
+            # ── Warm-start (fase Wang) ──
+            if (method == "wang" and warm_start is not None
+                    and step > 0 and step % warm_start["every"] == 0):
+                if verbose:
+                    dkl_pre = _record_dkl("warm_start_before", i_phase, step, vstate_R)
+                train_reverse_network(
+                    vstate, vstate_R,
+                    n_steps=warm_start["n_steps"],
+                    batch=warm_start.get("batch", 1024),
+                    lr=warm_start["lr"],
+                    verbose=False,
+                )
+                if verbose:
+                    dkl_post = _record_dkl("warm_start_after", i_phase, step, vstate_R)
+                    print(f"    [warm-start @ step {step}] "
+                          f"D_KL: {dkl_pre:.2e} → {dkl_post:.2e}")
+
+            # ── Monitor periódico (fase Wang) ──
+            if (method == "wang" and monitor_every
+                    and step > 0 and step % monitor_every == 0):
+                dkl_now = _record_dkl("monitor", i_phase, step, vstate_R)
+                if verbose:
+                    print(f"    [monitor @ step {step}] "
+                          f"D_KL(vstate || vstate_R) = {dkl_now:.2e}")
+
+            if step % freq == 0 and verbose:
+                msg = f"  [{method}] Step {step:4d} | F={F_val:.6f}"
+                if timing:
+                    msg += f" | t={time.time()-t0:.3f}s"
+                print(msg)
+
+            global_step += 1
+
+    # ── Guardar historial (solo si hubo fase Wang) ──
+    if has_wang and dkl_history:
+        with open(dkl_save_path, "w") as f:
+            json.dump(dkl_history, f, indent=2)
+        if verbose:
+            print(f"\n[dkl_history] {len(dkl_history)} registros guardados en "
+                  f"{dkl_save_path}")
+
+    # ── Restaurar y reevaluar (sin cambios) ──
+    vstate.parameters = best_params
+    jax.clear_caches()
+    vstate.chunk_size = chunk_size
+    E_best = float(vstate.expect(Hamiltonian).mean.real)
+    vstate.chunk_size = None
+    S2_best = renyi2_entropy_sampled(
+        vstate, partition, n_samples_full, chunk_size=chunk_size
+    )
+    best_F = E_best - T * S2_best
+
+    # ── Plot original de F (SIN tocar) ──
+    if plot:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(free_energy_history, label=r"$F$")
+        for i, b in enumerate(phase_boundaries[1:], start=1):
+            ax.axvline(b, color='k', ls='--', alpha=0.3,
+                       label=f"phase {i}: {phases[i]['method']}")
+        ax.set_xlabel("Step")
+        ax.set_ylabel(r"$F$")
+        ax.legend(fontsize=8)
         plt.tight_layout()
         plt.show()
 

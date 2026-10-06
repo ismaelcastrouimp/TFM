@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import netket as nk
 from netket.experimental.observable import AbstractObservable
 
-from .entropy import renyi2_drut_sampling
+from .entropy import renyi2_drut_sampling, renyi2_wang_cs
 
 
 class FreeRenyiEnergyObservable(AbstractObservable):
@@ -14,14 +14,16 @@ class FreeRenyiEnergyObservable(AbstractObservable):
 
     Con method="swap", calcula energía y S₂ en un kernel fusionado usando
     las muestras del vstate. Con method="drut", calcula ambos gradientes
-    mediante las rutinas estándar de energía y Drut.
+    mediante las rutinas estándar de energía y Drut. Con method="wang", 
+    calcula ambos gradientes mediante conditional sampling.
     """
 
     def __init__(self, hilbert, H, partition, T, chunk_size=128,
-                 method="swap", drut_kwargs=None, drut_seed=0):
+                 method="swap", drut_kwargs=None, drut_seed=0,
+                 wang_kwargs=None, wang_seed=0, vstate_R=None):   
         super().__init__(hilbert)
-        if method not in ("swap", "drut"):
-            raise ValueError(f"method must be 'swap' or 'drut', got {method!r}")
+        if method not in ("swap", "drut", "wang"):
+            raise ValueError(f"method must be 'swap', 'drut' or 'wang', got {method!r}")
         self.H = H
         self.partition = partition
         self.T = T
@@ -30,10 +32,10 @@ class FreeRenyiEnergyObservable(AbstractObservable):
         self.drut_kwargs = dict(drut_kwargs or {})
         self.drut_seed = drut_seed
         self._drut_step = 0
-
-    @property
-    def dtype(self):
-        return float
+        self.wang_kwargs = dict(wang_kwargs or {})           
+        self.wang_seed = wang_seed                             
+        self.vstate_R = vstate_R                                
+        self._wang_step = 0                                      
 
 
 @partial(jax.jit, static_argnames=("logpsi", "chunk_size"))
@@ -112,6 +114,27 @@ def _free_renyi_grad_jit(logpsi, params, model_state,
 
 @nk.vqs.expect_and_grad.dispatch
 def expect_and_grad_free_renyi(vstate, op, chunk_size, **kwargs):
+
+    if op.method == "wang":
+        if op.vstate_R is None:
+            raise RuntimeError("Wang method requires `vstate_R` in the observable.")
+        E_stats, grad_E = vstate.expect_and_grad(op.H)
+        wang_kwargs = {
+            **op.wang_kwargs,
+            "key": op.wang_seed + op._wang_step,
+        }
+        S2, grad_S2 = renyi2_wang_cs(
+            vstate, op.vstate_R, op.partition, **wang_kwargs
+        )
+        op._wang_step += 1
+
+        grad_F = jax.tree_util.tree_map(
+            lambda ge, gs: ge - op.T * gs, grad_E, grad_S2
+        )
+        F = float(E_stats.mean.real) - op.T * float(S2)
+        F_stats = nk.stats.statistics(jnp.array([[F]]))
+        return F_stats, grad_F
+
     if op.method == "drut":
         E_stats, grad_E = vstate.expect_and_grad(op.H)
         drut_kwargs = {

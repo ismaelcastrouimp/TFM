@@ -16,7 +16,16 @@ import netket as nk
 from netket.operator.spin import sigmax, sigmaz
 import optax
 import json
-from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled, renyi2_entropy_and_grad_exact, renyi2_drut_sampling, MODARNN, InterleavedARNNDense, ARSpinViT_Causal
+from src_renyi import (
+    free_energy_minimize,              
+    free_energy_minimize_phases,      
+    renyi2_entropy_and_grad_sampled,
+    renyi2_entropy_and_grad_exact,
+    renyi2_drut_sampling,
+    renyi2_wang_cs,                    
+    train_reverse_network,             
+    MODARNN, InterleavedARNNDense, ARSpinViT_Causal,
+)
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
 N          = 10
@@ -29,20 +38,21 @@ h_x        = -1.5
 h_z        = 0.0
 
 T          = 2.5
-N_STEPS    = 0
-N_STEPS_FINE   = 60
+N_STEPS    = 300
 
 chunk_size = N_SAMPLES//2
 clip_norm  = None
-if N_STEPS > 0:
-    lr = optax.linear_schedule(0.01, 0.01, N_STEPS)
-    optimizer = optax.adam(lr)
-else:
-    lr = optax.linear_schedule(0.01, 0.001, N_STEPS)
-    optimizer = optax.adam(lr)
-lr_fine    = optax.linear_schedule(0.01, 0.001, N_STEPS)
 
-drut_kwargs = dict(n_chains=512//2, n_lambda=20, n_sweeps_per_lam=100, n_props_per_sweep=4*N, K=3)
+# if N_STEPS > 0:
+#     lr = optax.linear_schedule(0.01, 0.01, N_STEPS)
+#     optimizer = optax.adam(lr)
+# else:
+#     lr = optax.linear_schedule(0.01, 0.001, N_STEPS)
+#     optimizer = optax.adam(lr)
+# lr_fine    = optax.linear_schedule(0.01, 0.001, N_STEPS)
+
+# drut_kwargs = dict(n_chains=512//2, n_lambda=20, n_sweeps_per_lam=100, n_props_per_sweep=4*N, K=3)
+
 
 N_REP_COSINE = 10
 N_REP_DRUT = 3
@@ -75,23 +85,57 @@ for i in range(N):
     H_extended += J_XX * sigmax(hi, i) @ sigmax(hi, (i + 1) % N)
 
 
-model = nk.models.ARNNDense(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
+model = nk.models.ARNNDense(hilbert=hi, layers=1, features=16, activation=jax.nn.tanh)
 # model = MODARNN(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
 # model = InterleavedARNNDense(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
 # model = ARSpinViT_Causal(hilbert=hi, embedding_d=8, n_heads=2, n_blocks=2, n_ffn_layers=1)
 sampler = nk.sampler.ARDirectSampler(hi)
 vstate  = nk.vqs.MCState(sampler, model, n_samples=N_SAMPLES)
 
+model_R = nk.models.ARNNDense(hilbert=hi, layers=1, features=16,
+                              activation=jax.nn.tanh)
+sampler_R = nk.sampler.ARDirectSampler(hi)
+vstate_R = nk.vqs.MCState(sampler_R, model_R, n_samples=N_SAMPLES)
+
 partition = list(range(N))
+
+phases = [
+    {
+        "method": "wang", "n_steps": N_STEPS, "optimizer": optax.sgd(optax.linear_schedule(0.01, 0.001, N_STEPS)),
+        "vstate_R": vstate_R,
+        "initial_train": {
+            "n_steps": 3000,
+            "batch": 4096,
+            "lr": 1e-3,
+        },
+        "warm_start": {
+            "every": 10,
+            "n_steps": 5,
+            "lr": 1e-4,
+            "batch": 1024,
+        },
+        "wang_kwargs": {
+            "n_samples": 8192,  
+        },
+    },
+]
+
 # ───────────────────────────────────────────────────────────────────────────────
 
 
 # ── ENTRENAMIENTO  ─────────────────────────────────────────────────────────────
 print(f"TRAINING N={N} at T={T}, N_A={N_A}")
-_,f_best,E_best,S_best = free_energy_minimize(vstate, T, partition, H_extended, N_STEPS, freq=20,
-                                               optimizer=optimizer, clip_norm=clip_norm, timing=True,
-                                               chunk_size=chunk_size, plot=True, 
-                                               fine_steps=N_STEPS_FINE, fine_drut_kwargs=drut_kwargs, fine_lr=lr_fine)
+# _,f_best,E_best,S_best = free_energy_minimize(vstate, T, partition, H_extended, N_STEPS, freq=20,
+#                                                optimizer=optimizer, clip_norm=clip_norm, timing=True,
+#                                                chunk_size=chunk_size, plot=True, 
+#                                                fine_steps=N_STEPS_FINE, fine_drut_kwargs=drut_kwargs, fine_lr=lr_fine)
+
+_, f_best, E_best, S_best = free_energy_minimize_phases(
+    vstate, T, partition, H_extended, phases,
+    chunk_size=chunk_size,
+    verbose=True, freq=10,
+    plot=True, timing=True,
+)
 
 print(f"Best solution: S₂={S_best:.6f}, E={E_best:.6f}, F={f_best:.6f}")
 
