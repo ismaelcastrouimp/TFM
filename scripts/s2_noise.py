@@ -42,7 +42,6 @@ from src_renyi.entropy import (
     train_reverse_network,
     _per_site_log_psi,
 )
-from src_renyi.models import ReversedARNNDense
 from src_renyi.training import free_energy_minimize
 
 # ── directorios ────────────────────────────────────────────────────────────────
