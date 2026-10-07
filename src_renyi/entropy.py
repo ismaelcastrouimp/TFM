@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import netket as nk
+import optax
 from netket.jax import jacobian
 
 
@@ -1423,7 +1424,6 @@ def renyi2_increment_sampling(vstate, subsystem_sites, n_chains,
 
 
 # Wang & Davis (2020) — Conditional sampling para S₂
-import optax
 
 def _per_site_log_psi(vstate, s, reverse=False):
     """

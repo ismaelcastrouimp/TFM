@@ -16,46 +16,48 @@ import netket as nk
 from netket.operator.spin import sigmax, sigmaz
 import optax
 import json
-from src_renyi import (
-    free_energy_minimize,              
-    free_energy_minimize_phases,      
+from src_renyi import (          
+    free_energy_minimize_phases,
     renyi2_entropy_and_grad_sampled,
-    renyi2_entropy_and_grad_exact,
-    renyi2_drut_sampling,
-    renyi2_wang_cs,                    
-    train_reverse_network,             
-    MODARNN, InterleavedARNNDense, ARSpinViT_Causal,
+    renyi2_wang_cs,
 )
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
-N          = 10
-N_A        = 10
-N_SAMPLES  = 2**10
 
-J_ZZ       = -1.0
-J_XX       = 0.0
-h_x        = -1.5
-h_z        = 0.0
+N, N_A = 30, 30
+J_ZZ, J_XX, h_x, h_z = -1.0, 0.0, -1.5, 0.0
+T = 4
 
-T          = 2.5
-N_STEPS    = 300
+N_SAMPLES       = 2**14
+N_STEPS_SWAP    = 400
+N_STEPS_WANG    = 400
+INIT_N_STEPS    = 3000
+INIT_BATCH      = N_SAMPLES
+WARM_EVERY      = 5
+WARM_N_STEPS    = 20
+WARM_BATCH      = N_SAMPLES
 
-chunk_size = N_SAMPLES//2
-clip_norm  = None
 
-# if N_STEPS > 0:
-#     lr = optax.linear_schedule(0.01, 0.01, N_STEPS)
-#     optimizer = optax.adam(lr)
-# else:
-#     lr = optax.linear_schedule(0.01, 0.001, N_STEPS)
-#     optimizer = optax.adam(lr)
-# lr_fine    = optax.linear_schedule(0.01, 0.001, N_STEPS)
+chunk_size = N_SAMPLES // 2
 
-# drut_kwargs = dict(n_chains=512//2, n_lambda=20, n_sweeps_per_lam=100, n_props_per_sweep=4*N, K=3)
-
+phases = [
+    # Fase 1: pre-entrenamiento swap
+    {
+        "method": "swap", 
+        "n_steps": N_STEPS_SWAP, 
+        "optimizer": optax.sgd(optax.linear_schedule(0.05, 0.005, 2000)),
+    },
+    # Fase 2: refinado Wang
+    {
+        "method": "wang", "n_steps": N_STEPS_WANG, "optimizer": optax.adam(1e-3),
+        "vstate_R": None,
+        "initial_train": {"n_steps": INIT_N_STEPS, "batch": INIT_BATCH, "lr": 1e-3},
+        "warm_start": {"every": WARM_EVERY, "n_steps": WARM_N_STEPS, "lr": 5e-4, "batch": WARM_BATCH},
+        "wang_kwargs": {"n_samples": N_SAMPLES},
+    },
+]
 
 N_REP_COSINE = 10
-N_REP_DRUT = 3
 # ───────────────────────────────────────────────────────────────────────────────
 
 # ── funciones auxiliares ───────────────────────────────────────────────────────
@@ -86,49 +88,22 @@ for i in range(N):
 
 
 model = nk.models.ARNNDense(hilbert=hi, layers=1, features=16, activation=jax.nn.tanh)
-# model = MODARNN(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
-# model = InterleavedARNNDense(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
-# model = ARSpinViT_Causal(hilbert=hi, embedding_d=8, n_heads=2, n_blocks=2, n_ffn_layers=1)
 sampler = nk.sampler.ARDirectSampler(hi)
 vstate  = nk.vqs.MCState(sampler, model, n_samples=N_SAMPLES)
 
-model_R = nk.models.ARNNDense(hilbert=hi, layers=1, features=16,
-                              activation=jax.nn.tanh)
+model_R = nk.models.ARNNDense(hilbert=hi, layers=1, features=16, activation=jax.nn.tanh)
 sampler_R = nk.sampler.ARDirectSampler(hi)
 vstate_R = nk.vqs.MCState(sampler_R, model_R, n_samples=N_SAMPLES)
 
 partition = list(range(N))
 
-phases = [
-    {
-        "method": "wang", "n_steps": N_STEPS, "optimizer": optax.sgd(optax.linear_schedule(0.01, 0.001, N_STEPS)),
-        "vstate_R": vstate_R,
-        "initial_train": {
-            "n_steps": 3000,
-            "batch": 4096,
-            "lr": 1e-3,
-        },
-        "warm_start": {
-            "every": 10,
-            "n_steps": 5,
-            "lr": 1e-4,
-            "batch": 1024,
-        },
-        "wang_kwargs": {
-            "n_samples": 8192,  
-        },
-    },
-]
+phases[1]["vstate_R"] = vstate_R
 
 # ───────────────────────────────────────────────────────────────────────────────
 
 
 # ── ENTRENAMIENTO  ─────────────────────────────────────────────────────────────
 print(f"TRAINING N={N} at T={T}, N_A={N_A}")
-# _,f_best,E_best,S_best = free_energy_minimize(vstate, T, partition, H_extended, N_STEPS, freq=20,
-#                                                optimizer=optimizer, clip_norm=clip_norm, timing=True,
-#                                                chunk_size=chunk_size, plot=True, 
-#                                                fine_steps=N_STEPS_FINE, fine_drut_kwargs=drut_kwargs, fine_lr=lr_fine)
 
 _, f_best, E_best, S_best = free_energy_minimize_phases(
     vstate, T, partition, H_extended, phases,
@@ -155,23 +130,22 @@ cos_swap_mean = np.mean(cos_vals_swap)
 cos_swap_std  = np.std(cos_vals_swap)
 print(f"[swap] cos = {cos_swap_mean:.4f} ± {cos_swap_std:.4f}")
 
-# ── consistencia del gradiente: DRUT ─────────────────────────────────────────
-grads_drut = []
-for rep in range(N_REP_DRUT):
-    _, grad_est = renyi2_drut_sampling(
-        vstate, partition,
-        n_chains=512, n_lambda=20, n_sweeps_per_lam=100,
-        n_props_per_sweep=4 * N, K=1, key=rep,
+# ── consistencia del gradiente: WANG ─────────────────────────────────────────
+grads_wang = []
+for rep in range(N_REP_COSINE):
+    _, grad_est = renyi2_wang_cs(
+        vstate, vstate_R, partition, N_SAMPLES,
+        key=rep
     )
-    grads_drut.append(grad_est)
+    grads_wang.append(grad_est)
 
-cos_vals_drut = []
-for i in range(N_REP_DRUT):
-    for j in range(i + 1, N_REP_DRUT):
-        cos_vals_drut.append(cosine_similarity(grads_drut[i], grads_drut[j]))
-cos_drut_mean = np.mean(cos_vals_drut)
-cos_drut_std  = np.std(cos_vals_drut)
-print(f"[drut] cos = {cos_drut_mean:.4f} ± {cos_drut_std:.4f}")
+cos_vals_wang = []
+for i in range(N_REP_COSINE):
+    for j in range(i + 1, N_REP_COSINE):
+        cos_vals_wang.append(cosine_similarity(grads_wang[i], grads_wang[j]))
+cos_wang_mean = np.mean(cos_vals_wang)
+cos_wang_std  = np.std(cos_vals_wang)
+print(f"[wang] cos = {cos_wang_mean:.4f} ± {cos_wang_std:.4f}")
 
 # ── guardar parámetros ─────────────────────────────────────────────────────────
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -210,7 +184,7 @@ else:
 all_data["energy"][idx]      = float(E_best)
 all_data["entropy"][idx]     = float(S_best)
 all_data["free_energy"][idx] = float(f_best)
-all_data["reliability"][idx] = {"cos_mean": float(cos_swap_mean), "cos_std": float(cos_swap_std)}
+all_data["reliability"][idx] = {"cos_mean": float(cos_wang_mean), "cos_std": float(cos_wang_std)}
 
 # Guardar parámetros con índice
 filename = os.path.join(params_dir, f"params_{idx:04d}.msgpack")

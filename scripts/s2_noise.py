@@ -72,7 +72,7 @@ def cosine_similarity(g1, g2):
 N              = 10
 GAMMA          = -1.5
 V              = -1.0
-TEMPS          = [2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+TEMPS          = [2.0]
 n_rep          = 10
 
 BUDGET_FIXED   = 2**20
@@ -111,9 +111,8 @@ H_extended = 0
 for i in range(N):
     H_sys += GAMMA * sigmax(hi_sys, i)
     H_sys += V * sigmaz(hi_sys, i) @ sigmaz(hi_sys, (i + 1) % N)
-for i in range(N_TOTAL):
     H_extended += GAMMA * sigmax(hi, i)
-    H_extended += V * sigmaz(hi, i) @ sigmaz(hi, (i + 1) % N_TOTAL)
+    H_extended += V * sigmaz(hi, i) @ sigmaz(hi, (i + 1) % N)
 
 
 # ── Modelos ────────────────────────────────────────────────────────────────────

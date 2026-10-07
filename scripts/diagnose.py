@@ -1,15 +1,15 @@
 """
 diagnose.py
 ===========
-Diagnóstico previo al entrenamiento para una configuración (N, n_samples).
+Diagnóstico previo al entrenamiento.
 
-Calcula:
-  - chunk_size óptimo (el mayor que no da OOM)
-  - tiempo real por step (excluyendo el primer step de compilación JIT)
-  - clip_norm recomendado a partir de las normas de gradiente
+Calcula, para un único `chunk_size`:
+  - el mayor `chunk_size` que no da OOM
+  - tiempo por step real (swap / wang)
+  - clip_norm recomendado
 
 Uso:
-    Editar la sección "CONFIGURACIÓN" y ejecutar:
+    Editar CONFIGURACIÓN y ejecutar:
         python scripts/diagnose.py
 """
 
@@ -23,145 +23,203 @@ from netket.operator.spin import sigmax, sigmaz
 import optax
 
 from src_renyi.observables import FreeRenyiEnergyObservable
+from src_renyi.entropy import train_reverse_network
 
-# ── CONFIGURACIÓN  ────────────────────────────────────────────────────────────
-N         = 30
-N_A       = 5
-N_SAMPLES = 2**21
+# ── CONFIGURACIÓN ─────────────────────────────────────────────────────────────
+N         = 50
+N_A       = 50
+N_SAMPLES = 2**18
 GAMMA     = -1.5
 V         = -1.0
-T         = 1.0         # temperatura de diagnóstico
-N_STEPS   = 5           # steps totales (1 de JIT warmup + N_STEPS-1 medidos)
-N_GRAD    = 20           # steps para medir normas de gradiente y clip_norm
-LR        = 0.05         # lr para el diagnóstico (no afecta a los resultados)
+T         = 1.0
+N_STEPS   = 5           # steps para medir tiempo (1 JIT warmup + resto)
+N_GRAD    = 20          # steps para medir normas de gradiente
+LR        = 0.05        # lr de diagnóstico
+
+# Rango de búsqueda de chunk_size (potencias de 2)
+CHUNK_MIN = 2**4
+CHUNK_MAX = N_SAMPLES // 2      # swap usa N_SAMPLES//2 configuraciones
+WANG_KWARGS      = dict(n_samples=4096)
+WANG_TRAIN_STEPS = 500
 # ──────────────────────────────────────────────────────────────────────────────
 
-# ── construir hilbert, hamiltoniano y vstate ──────────────────────────────────
+
+# ── utilidades ────────────────────────────────────────────────────────────────
+
+OOM_MARKERS = ("RESOURCE_EXHAUSTED", "Out of memory", "out of memory")
+
+def is_oom(exc: BaseException) -> bool:
+    msg = str(exc)
+    return any(m in msg for m in OOM_MARKERS)
+
+
+def find_max_chunk_size(probe_fn, chunk_min=CHUNK_MIN, chunk_max=CHUNK_MAX,
+                        label=""):
+    """Dobla desde abajo; devuelve el mayor cs que no da OOM (o None)."""
+    cs, best = chunk_min, None
+    while cs <= chunk_max:
+        try:
+            probe_fn(cs)
+            jax.effects_barrier()
+            print(f"  ✓ {label}chunk_size = {cs}")
+            best = cs
+            cs *= 2
+        except Exception as e:
+            if is_oom(e):
+                print(f"  ✗ {label}chunk_size = {cs}  → OOM, usar {best}")
+                break
+            else:
+                print(f"  ✗ {label}chunk_size = {cs}  → error no-OOM: "
+                      f"{type(e).__name__}: {e}")
+                raise
+    return best
+
+
+# ── construir hilbert, hamiltoniano y vstates ─────────────────────────────────
+
 hi_sys = nk.hilbert.Spin(s=1/2, N=N)
-hi = nk.hilbert.Spin(s=1/2, N=N+N_A)
-H_sys=0
-H_extended = 0
+hi = nk.hilbert.Spin(s=1/2, N=N + N_A)
+
+H_sys, H_extended = 0, 0
 for i in range(N):
-    H_sys+= GAMMA * sigmax(hi_sys, i)
+    H_sys += GAMMA * sigmax(hi_sys, i)
     H_sys += V * sigmaz(hi_sys, i) @ sigmaz(hi_sys, (i + 1) % N)
     H_extended += GAMMA * sigmax(hi, i)
     H_extended += V * sigmaz(hi, i) @ sigmaz(hi, (i + 1) % N)
 
+model = nk.models.ARNNDense(hilbert=hi, layers=1, features=16,
+                            activation=jax.nn.gelu)
+vstate = nk.vqs.MCState(nk.sampler.ARDirectSampler(hi), model,
+                        n_samples=N_SAMPLES)
 
-model = nk.models.ARNNDense(hilbert=hi, layers=1, features=16, activation=jax.nn.gelu)
-sampler = nk.sampler.ARDirectSampler(hi)
-vstate  = nk.vqs.MCState(sampler, model, n_samples=N_SAMPLES)
+model_R = nk.models.ARNNDense(hilbert=hi, layers=1, features=16,
+                              activation=jax.nn.gelu)
+vstate_R = nk.vqs.MCState(nk.sampler.ARDirectSampler(hi), model_R,
+                          n_samples=N_SAMPLES)
 
 partition = list(range(N))
 
 print("=" * 60)
-print(f"Diagnóstico  —  N={N}  n_samples={N_SAMPLES}  T={T}")
+print(f"Diagnóstico  —  N={N}  N_A={N_A}  n_samples={N_SAMPLES}  T={T}")
 print("=" * 60)
 
 
-# ── 1. chunk_size ──────────────────────────────────────────────────────────────
-print("\n── 1. Buscando chunk_size ────────────────────────────────")
+# ── 1. chunk_size único ───────────────────────────────────────────────────────
+print("\n── 1. chunk_size óptimo (fuente única: op.chunk_size) ───")
 
-n = N_SAMPLES // 2
-candidate = n 
-chunk_size = None
+def probe(cs):
+    op = FreeRenyiEnergyObservable(
+        hi, H_extended, partition, T, chunk_size=cs, method="swap"
+    )
+    _ = vstate.expect_and_grad(op)
 
-while candidate >= 1:
-    if n % candidate != 0:
-        candidate //= 2
-        continue
-    try:
-        op_test = FreeRenyiEnergyObservable(
-            hi, H_extended, partition, T, chunk_size=candidate
-        )
-        _ = vstate.expect_and_grad(op_test)
-        jax.effects_barrier()
-        print(f"  ✓ chunk_size = {candidate}  (n // {N_SAMPLES // candidate})")
-        chunk_size = candidate
-        break
-    except Exception as e:
-        print(f"  ✗ chunk_size = {candidate}  → OOM")
-        candidate //= 2
-
-if chunk_size is None:
-    raise RuntimeError("No se encontró chunk_size válido. Reduce N o n_samples.")
+chunk_size_opt = find_max_chunk_size(probe, label="")
+if chunk_size_opt is None:
+    raise RuntimeError("Ningún chunk_size funciona. Reduce N o N_SAMPLES.")
 
 
+# ── 2a. Tiempo por step (swap) ────────────────────────────────────────────────
+print("\n── 2a. Tiempo por step (swap) ───────────────────────────")
 
-# ── 2. tiempo por step ────────────────────────────────────────────────────────
-print("\n── 2. Tiempo por step ────────────────────────────────────")
-
-op_time   = FreeRenyiEnergyObservable(hi, H_extended, partition, T, chunk_size=chunk_size)
-optimizer = optax.adam(LR)
-opt_state = optimizer.init(vstate.parameters)
+op_swap = FreeRenyiEnergyObservable(
+    hi, H_extended, partition, T, chunk_size=chunk_size_opt, method="swap"
+)
+opt = optax.adam(LR)
+opt_state = opt.init(vstate.parameters)
 params_bak = copy.deepcopy(vstate.parameters)
 
-step_times = []
-
+times = []
 for step in range(N_STEPS):
     t0 = time.perf_counter()
-    F_stats, F_grad = vstate.expect_and_grad(op_time)
-    updates, opt_state = optimizer.update(F_grad, opt_state, vstate.parameters)
+    F_stats, F_grad = vstate.expect_and_grad(op_swap)
+    updates, opt_state = opt.update(F_grad, opt_state, vstate.parameters)
     vstate.parameters = optax.apply_updates(vstate.parameters, updates)
     jax.effects_barrier()
-    elapsed = time.perf_counter() - t0
-
     if step != 0:
-        step_times.append(elapsed)
-        
+        times.append(time.perf_counter() - t0)
 
-step_times = np.array(step_times)
-t_mean = step_times.mean()
-t_std  = step_times.std()
+t_swap_mean, t_swap_std = float(np.mean(times)), float(np.std(times))
+print(f"  t/step = {t_swap_mean:.3f}s ± {t_swap_std:.3f}s")
+print(f"  500 steps ~ {500 * t_swap_mean / 60:.1f} min")
+vstate.parameters = params_bak
 
-print(f"  Tiempo por step : {t_mean:.3f}s ± {t_std:.3f}s")
-print(f"  Estimación 500 steps : {500 * t_mean / 60:.1f} min")
 
-# restaurar parámetros originales
+# ── 2b. Tiempo por step (wang) ────────────────────────────────────────────────
+print("\n── 2b. Tiempo por step (wang) ───────────────────────────")
+print(f"    Pre-entrenando N_R ({WANG_TRAIN_STEPS} steps) ...")
+train_reverse_network(
+    vstate, vstate_R, n_steps=WANG_TRAIN_STEPS, batch=1024, lr=1e-3,
+    verbose=False,
+)
+
+op_wang = FreeRenyiEnergyObservable(
+    hi, H_extended, partition, T, chunk_size=chunk_size_opt, method="wang",
+    vstate_R=vstate_R, wang_kwargs=WANG_KWARGS,
+)
+opt2 = optax.adam(LR)
+opt_state2 = opt2.init(vstate.parameters)
+vstate.parameters = params_bak
+
+times_w = []
+for step in range(N_STEPS):
+    t0 = time.perf_counter()
+    F_stats, F_grad = vstate.expect_and_grad(op_wang)
+    updates, opt_state2 = opt2.update(F_grad, opt_state2, vstate.parameters)
+    vstate.parameters = optax.apply_updates(vstate.parameters, updates)
+    jax.effects_barrier()
+    if step != 0:
+        times_w.append(time.perf_counter() - t0)
+
+t_wang_mean, t_wang_std = float(np.mean(times_w)), float(np.std(times_w))
+print(f"  t/step = {t_wang_mean:.3f}s ± {t_wang_std:.3f}s")
+print(f"  500 steps ~ {500 * t_wang_mean / 60:.1f} min")
 vstate.parameters = params_bak
 
 
 # ── 3. clip_norm ──────────────────────────────────────────────────────────────
-print("\n── 3. Normas de gradiente y clip_norm ───────────────────")
+print("\n── 3. Normas de gradiente y clip_norm (swap) ────────────")
 
-op_clip   = FreeRenyiEnergyObservable(hi, H_extended, partition, T, chunk_size=chunk_size)
-optimizer2 = optax.adam(LR)
-opt_state2 = optimizer2.init(vstate.parameters)
+op_clip = FreeRenyiEnergyObservable(
+    hi, H_extended, partition, T, chunk_size=chunk_size_opt, method="swap"
+)
+opt3 = optax.adam(LR)
+opt_state3 = opt3.init(vstate.parameters)
 
-grad_norms = []
-
-for step in range(N_GRAD):
+norms = []
+for _ in range(N_GRAD):
     F_stats, F_grad = vstate.expect_and_grad(op_clip)
     flat, _ = jax.flatten_util.ravel_pytree(F_grad)
-    grad_norms.append(float(jnp.linalg.norm(flat)))
-    updates, opt_state2 = optimizer2.update(F_grad, opt_state2, vstate.parameters)
+    norms.append(float(jnp.linalg.norm(flat)))
+    updates, opt_state3 = opt3.update(F_grad, opt_state3, vstate.parameters)
     vstate.parameters = optax.apply_updates(vstate.parameters, updates)
 
-grad_norms = jnp.array(grad_norms)
-med  = float(jnp.median(grad_norms))
-p75  = float(jnp.percentile(grad_norms, 75))
-p90  = float(jnp.percentile(grad_norms, 90))
-p95  = float(jnp.percentile(grad_norms, 95))
-mx   = float(jnp.max(grad_norms))
+norms = jnp.array(norms)
+med = float(jnp.median(norms))
+p90 = float(jnp.percentile(norms, 90))
+p95 = float(jnp.percentile(norms, 95))
+mx  = float(jnp.max(norms))
 spread = mx / (med + 1e-10)
-
-clip_recommended = p90 if spread > 5 else p95
+clip_rec = p90 if spread > 5 else p95
 
 print(f"  median : {med:.4f}")
-print(f"  p75    : {p75:.4f}")
 print(f"  p90    : {p90:.4f}")
 print(f"  p95    : {p95:.4f}")
-print(f"  max    : {mx:.4f}  (ratio max/median = {spread:.1f})")
-print(f"  {'cola larga → usando p90' if spread > 5 else 'distribución compacta → usando p95'}")
+print(f"  max    : {mx:.4f}  (max/median = {spread:.1f})")
+print(f"  → clip_norm = {clip_rec:.4f} "
+      f"({'p90, cola larga' if spread > 5 else 'p95, distribución compacta'})")
+vstate.parameters = params_bak
 
 
-# ── resumen final ──────────────────────────────────────────────────────────────
+# ── resumen final ─────────────────────────────────────────────────────────────
 print("\n" + "=" * 60)
 print("RESUMEN")
 print("=" * 60)
-print(f"  N                : {N}")
+print(f"  N, N_A           : {N}, {N_A}")
 print(f"  n_samples        : {N_SAMPLES}")
-print(f"  chunk_size       : {chunk_size}")
-print(f"  tiempo por step  : {t_mean:.3f}s ± {t_std:.3f}s")
-print(f"  500 steps        : ~{500 * t_mean / 60:.1f} min")
-print(f"  clip_norm        : {clip_recommended:.4f}")
+print(f"  chunk_size       : {chunk_size_opt}  "
+      f"({chunk_size_opt / N_SAMPLES:.4f} × N_SAMPLES, "
+      f"i.e. N_SAMPLES/{N_SAMPLES // chunk_size_opt})")
+print(f"  t/step (swap)    : {t_swap_mean:.3f}s ± {t_swap_std:.3f}s")
+print(f"  t/step (wang)    : {t_wang_mean:.3f}s ± {t_wang_std:.3f}s")
+print(f"  clip_norm        : {clip_rec:.4f}")
+print("=" * 60)

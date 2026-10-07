@@ -23,28 +23,28 @@ from tqdm import tqdm
 from src_renyi import free_energy_minimize, renyi2_entropy_and_grad_sampled, free_energy_minimize_exact, ARNN_Z2, InterleavedARNNDense
 
 # ── CONFIGURACIÓN  ─────────────────────────────────────────────────────────────
-N          = 10
-N_A        = N
-N_SAMPLES  = 2**10
+N          = 11
+N_A        = 11
+N_SAMPLES  = 2**20
 
 J_ZZ       = -1.0
 J_XX       = 0.0
 h_x        = -1.5
 h_z        = 0.0
 
-T_min      = 1
+T_min      = 0
 T_max      = 4
-N_Temps    = 31
+N_Temps    = 41
 linear_T   = True  #If False, creates non linear T distribution
                     #following cutoff temperatures (only for N<10)
 
-N_STEPS    = 0
-N_STEPS_FINE   = 150
+N_STEPS    = 300
+N_STEPS_FINE   = 0
 
-chunk_size = N_SAMPLES//2
+chunk_size = N_SAMPLES//8
 clip_norm  = None
 if N_STEPS > 0:
-    lr = optax.linear_schedule(0.05, 0.01, N_STEPS)
+    lr = optax.linear_schedule(0.01, 0.001, N_STEPS)
     optimizer = optax.adam(lr)
 else:
     lr = optax.linear_schedule(0.01, 0.001, N_STEPS)
@@ -72,7 +72,7 @@ for i in range(N):
     H_extended += J_ZZ * sigmaz(hi, i) @ sigmaz(hi, (i + 1) % N)
     H_extended += J_XX * sigmax(hi, i) @ sigmax(hi, (i + 1) % N)
 
-model = nk.models.ARNNDense(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
+model = nk.models.ARNNDense(hilbert=hi, layers=1, features=16, activation=jax.nn.tanh)
 # model = InterleavedARNNDense(hilbert=hi, layers=2, features=32, activation=jax.nn.tanh)
 sampler = nk.sampler.ARDirectSampler(hi)
 
