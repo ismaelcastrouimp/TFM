@@ -823,7 +823,6 @@ def renyi2_drut_sampling(vstate, subsystem_sites, n_chains=256,
 
     return float(S2), grad_S2
 
-
 def _sweep_single_chain_with_samples_cached(key, s1, s2, A, B,
                                               apply_fun, params, model_state,
                                               lam, n_sweeps, n_props_per_sweep,
@@ -1601,10 +1600,17 @@ def renyi2_wang_cs(vstate, vstate_R, subsystem_sites, n_samples,
     return float(S2), grad_S2
 
 def train_reverse_network(vstate, vstate_R, n_steps=500, batch=1024,
-                          lr=1e-3, key=0, verbose=True, freq=50):
+                          lr=1e-3, key=0, verbose=True, freq=50,
+                          return_history=False):
     """
     Entrena vstate_R (ARNNDense estándar) para modelar p en orden invertido:
         vstate_R(flip(s))  ≈  vstate(s)
+
+    Devuelve
+    --------
+    vstate_R : MCState con parámetros entrenados.
+    dkl_history : list[float] (solo si return_history=True)
+        Valor de D_KL en cada paso del entrenamiento, longitud n_steps.
     """
     opt = optax.adam(lr)
     opt_state = opt.init(vstate_R.parameters)
@@ -1619,11 +1625,16 @@ def train_reverse_network(vstate, vstate_R, n_steps=500, batch=1024,
         ))
         return jnp.mean(log_p - log_pR)
 
+    dkl_history = []
     for step in range(n_steps):
         s = vstate.sample(n_samples=batch).reshape(-1, vstate.hilbert.size)
         loss_val, grads = jax.value_and_grad(loss_fn)(vstate_R.parameters, s)
+        dkl_history.append(float(loss_val))
         updates, opt_state = opt.update(grads, opt_state, vstate_R.parameters)
         vstate_R.parameters = optax.apply_updates(vstate_R.parameters, updates)
         if verbose and step % freq == 0:
             print(f"[train N_R] step {step:4d}  D_KL ≈ {float(loss_val):.4f}")
+
+    if return_history:
+        return vstate_R, dkl_history
     return vstate_R

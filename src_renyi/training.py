@@ -16,106 +16,9 @@ from .entropy import (
     renyi2_entropy_and_grad_sampled,
     renyi2_entropy_sampled,
     renyi2_entropy_exact,
-    renyi2_entropy_and_grad_exact,
-    renyi2_drut_sampling,
-    renyi2_wang_cs,          
+    renyi2_entropy_and_grad_exact,     
     train_reverse_network,    
 )
-
-def free_energy_minimize_SR_SGD(
-    vstate, T, partition, Hamiltonian, n_steps=1000,
-    verbose=True, freq=50, plot=True,
-    learning_rate=None, diag_shift=None,
-    n_samples_sr=4096, timing=False,
-    chunk_size = 256
-):
-    """
-    Minimiza F = E - T·S₂ con SR + SGD.
-
-    Parámetros
-    ----------
-    vstate       : MCState de NetKet con el modelo variacional.
-    T            : Temperatura.
-    partition    : Lista de sitios del subsistema A para S₂.
-    Hamiltonian  : Operador H compatible con NetKet.
-    n_steps      : Número de pasos de optimización.
-    verbose      : Si True, imprime progreso cada `freq` pasos.
-    freq         : Frecuencia de impresión.
-    plot         : Si True, muestra gráfica de F al final.
-    learning_rate: Schedule o escalar de optax. Por defecto warmup_cosine_decay.
-    diag_shift   : Schedule o escalar para SR. Por defecto linear 1e-1 → 1e-4.
-    n_samples_sr : Muestras usadas en el paso de SR (< n_samples completo).
-    timing       : Si True, mide y muestra el tiempo real de cada step en los prints.
-    chunk_size   : tamaño de los chunks para procesar FreeRenyiEnergyObservable.
-
-    Devuelve
-    -------
-    (free_energy_history, best_F, E_best, S2_best)
-    """
-    if learning_rate is None:
-        learning_rate = optax.warmup_cosine_decay_schedule(0.1, 0.1, 100, n_steps, 0.001)
-    if diag_shift is None:
-        diag_shift = optax.linear_schedule(1e-1, 1e-4, n_steps)
-
-    sr = nk.optimizer.SR(diag_shift=diag_shift)
-    optimizer = optax.sgd(learning_rate)
-    opt_state = optimizer.init(vstate.parameters)
-
-    free_renyi_op = FreeRenyiEnergyObservable(vstate.hilbert, Hamiltonian, partition, T, chunk_size=chunk_size)
-    n_samples_full = vstate.n_samples
-
-    free_energy_history = []
-    best_F = float("inf")
-    best_params = None
-
-    for step in range(n_steps):
-        if timing:
-            t0 = time.time()
-
-        F_stats, F_grad = vstate.expect_and_grad(free_renyi_op)
-
-        vstate.n_samples = n_samples_sr
-        delta = sr(vstate, F_grad, step)
-        vstate.n_samples = n_samples_full
-
-        updates, opt_state = optimizer.update(delta, opt_state)
-        vstate.parameters = optax.apply_updates(vstate.parameters, updates)
-
-        if timing:
-            jax.tree_util.tree_map(lambda x: x.block_until_ready(), vstate.parameters)
-
-        F_val = float(F_stats.mean.real)
-        free_energy_history.append(F_val)
-
-        if F_val < best_F:
-            best_F = F_val
-            best_params = vstate.parameters
-
-        if step % freq == 0 and verbose:
-            if timing:
-                print(f"Step {step:4d} | F={F_val:.6f} | t={time.time()-t0:.3f}s")
-            else:
-                print(f"Step {step:4d} | F={F_val:.6f}")
-
-    # Restaurar mejores parámetros y evaluar
-    vstate.parameters = best_params
-    jax.clear_caches()
-
-    vstate.chunk_size = chunk_size
-    E_best = float(vstate.expect(Hamiltonian).mean.real)
-    vstate.chunk_size = None
-    S2_best = renyi2_entropy_sampled(vstate, partition, n_samples_full, chunk_size=chunk_size)
-    best_F = E_best - T * S2_best
-
-    if plot:
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.plot(free_energy_history, color="tab:blue", label=r"$F$")
-        ax.set_xlabel("Step")
-        ax.set_ylabel(r"$F$", color="tab:blue")
-        plt.tight_layout()
-        plt.show()
-
-    return free_energy_history, best_F, E_best, S2_best
 
 def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000,
                          fine_steps=0, fine_drut_kwargs=None, fine_lr=None,
@@ -369,23 +272,21 @@ def compute_kl(vstate, vstate_R, n_samples=2048):
         jnp.flip(s, axis=-1)))
     return float(jnp.mean(lp - lpR))
 
-def _auto_dkl_path(vstate, partition, T):
-    """Deriva la ruta de guardado desde vstate y partition.
+def _auto_training_history_path(vstate, partition, tag):
+    """Ruta del historial completo de entrenamiento.
 
-    Replica la lógica de training_single_T.py:
-       N      = len(partition)
-       N_A    = vstate.hilbert.size - N
-       data_dir = <project_root>/data/N{N}          si N == N_A
-                = <project_root>/data/N{N}_NA_{N_A}  si N != N_A
+    `tag` se usa tal cual en el nombre del archivo (típicamente el índice
+    del run, formateado como `0001`, `0002`, ...). Se guarda un archivo
+    por run dentro de `training_histories/`.
     """
     N   = len(partition)
     N_A = vstate.hilbert.size - N
-    here = os.path.dirname(os.path.abspath(__file__))          # src_renyi/
+    here = os.path.dirname(os.path.abspath(__file__))
     base_data_dir = os.path.join(here, "..", "data")
     folder = f"N{N}" if N == N_A else f"N{N}_NA_{N_A}"
-    data_dir = os.path.join(base_data_dir, folder)
+    data_dir = os.path.join(base_data_dir, folder, "training_histories")
     os.makedirs(data_dir, exist_ok=True)
-    return os.path.join(data_dir, f"dkl_history_T{T}.json")
+    return os.path.join(data_dir, f"training_history_{tag}.json")
 
 def free_energy_minimize_phases(
     vstate, T, partition, Hamiltonian, phases,
@@ -393,30 +294,27 @@ def free_energy_minimize_phases(
     chunk_size=256, timing=False,
     learning_rate=None, clip_norm=None, sr=None, n_samples_sr=None,
     monitor_every=20,
-    dkl_n_samples=2048,   
+    dkl_n_samples=2048,
+    history_index=None,
 ):
     """
     Minimiza F = E - T·S₂ pasando por una secuencia de fases.
 
-    Parámetros
-    ----------
-    phases : list of dict
-        Cada fase es un diccionario con:
-          - "method"       : "swap", "drut" o "wang"   (obligatorio)
-          - "n_steps"      : nº de pasos               (obligatorio)
-          - "optimizer"    : optax.GradientTransformation (opcional; por defecto SGD)
-          - "learning_rate": override del LR global (opcional)
-          - "vstate_R"     : MCState de la red reversa (obligatorio si method="wang")
-          - "warm_start"   : dict {"every": int, "n_steps": int, "lr": float,
-                                    "batch": int (opcional)}
-                             para actualizar vstate_R periódicamente
-          - "drut_kwargs"  : kwargs para renyi2_drut_sampling (si method="drut")
-          - "wang_kwargs"  : kwargs para renyi2_wang_cs (si method="wang")
-                             p.ej. {"n_samples": 8192}
+    Guarda un archivo por temperatura:
+        data/N{N}[_NA_{N_A}]/training_history_T{T}.json
 
-    Devuelve
-    --------
-    (free_energy_history, best_F, E_best, S2_best)
+    con dos bloques:
+        "steps"       : [{global_step, phase, phase_step, method, F}, ...]
+        "dkl_records" : [{tag, phase, phase_step, global_step, inner_step?, dkl}, ...]
+
+    Tags de dkl_records:
+        "initial_before"     : antes de initial_train
+        "initial_train_step" : pasos internos de initial_train (inner_step = 0..n-1)
+        "initial_after"      : después de initial_train
+        "warm_start_before"  : antes de cada warm-start
+        "warm_start_step"    : pasos internos de cada warm-start
+        "warm_start_after"   : después de cada warm-start
+        "monitor"            : monitor periódico
     """
     n_samples_full = vstate.n_samples
     free_energy_history = []
@@ -424,26 +322,36 @@ def free_energy_minimize_phases(
     best_params = None
     phase_boundaries = []
 
-    # ── Auto-detección: ¿hay fase Wang? ──
     has_wang = any(p["method"] == "wang" for p in phases)
-    dkl_history = []
     global_step = 0
 
-    if has_wang:
-        dkl_save_path = _auto_dkl_path(vstate, partition, T)
-        if verbose:
-            print(f"[dkl] se guardará el historial en {dkl_save_path}")
+    # ── contenedor del historial completo ──
+    training_history = {
+        "N":          len(partition),
+        "N_A":        vstate.hilbert.size - len(partition),
+        "T":          float(T),
+        "chunk_size": int(chunk_size),
+        "phases":     [{"method": p["method"], "n_steps": p["n_steps"]}
+                       for p in phases],
+        "steps":       [],
+        "dkl_records": [],
+    }
 
-    def _record_dkl(tag, phase_idx, phase_step, vstate_R):
-        dkl = compute_kl(vstate, vstate_R, n_samples=dkl_n_samples)
-        dkl_history.append({
+    def _record_dkl(tag, phase_idx, phase_step, vstate_R, dkl_value=None,
+                    inner_step=None):
+        if dkl_value is None:
+            dkl_value = compute_kl(vstate, vstate_R, n_samples=dkl_n_samples)
+        rec = {
             "tag":         tag,
             "phase":       int(phase_idx),
             "phase_step":  int(phase_step),
             "global_step": int(global_step),
-            "dkl":         dkl,
-        })
-        return dkl
+            "dkl":         float(dkl_value),
+        }
+        if inner_step is not None:
+            rec["inner_step"] = int(inner_step)
+        training_history["dkl_records"].append(rec)
+        return dkl_value
 
     for i_phase, phase in enumerate(phases):
         method        = phase["method"]
@@ -459,7 +367,6 @@ def free_energy_minimize_phases(
         if method == "wang" and vstate_R is None:
             raise ValueError("Phase with method='wang' requires a 'vstate_R' entry.")
 
-        # ── (sin cambios en construcción del observable / optimizer) ──
         op = FreeRenyiEnergyObservable(
             vstate.hilbert, Hamiltonian, partition, T,
             chunk_size=chunk_size,
@@ -488,20 +395,23 @@ def free_energy_minimize_phases(
 
         # ── initial_train ──
         if initial_train is not None:
-            if verbose:
-                dkl_before = _record_dkl("initial_before", i_phase, -1, vstate_R)
-            train_reverse_network(
+            dkl_before = _record_dkl("initial_before", i_phase, -1, vstate_R)
+            vstate_R, dkl_traj = train_reverse_network(
                 vstate, vstate_R,
                 n_steps=initial_train["n_steps"],
                 batch=initial_train.get("batch", 4096),
                 lr=initial_train.get("lr", 1e-3),
                 verbose=verbose, freq=500,
+                return_history=True,
             )
+            for k, dkl_val in enumerate(dkl_traj):
+                _record_dkl("initial_train_step", i_phase, -1, vstate_R,
+                            dkl_value=dkl_val, inner_step=k)
+            dkl_after = _record_dkl("initial_after", i_phase, -1, vstate_R)
             if verbose:
-                dkl_after = _record_dkl("initial_after", i_phase, -1, vstate_R)
                 print(f"    D_KL: {dkl_before:.2e} → {dkl_after:.2e}")
 
-        # ── Loop de la fase ──
+        # ── loop de la fase ──
         for step in range(n_steps):
             if timing:
                 t0 = time.time()
@@ -528,28 +438,39 @@ def free_energy_minimize_phases(
             F_val = float(F_stats.mean.real)
             free_energy_history.append(F_val)
 
+            training_history["steps"].append({
+                "global_step": int(global_step),
+                "phase":       int(i_phase),
+                "phase_step":  int(step),
+                "method":      method,
+                "F":           float(F_val),
+            })
+
             if F_val < best_F:
                 best_F = F_val
                 best_params = vstate.parameters
 
-            # ── Warm-start (fase Wang) ──
+            # ── warm-start ──
             if (method == "wang" and warm_start is not None
                     and step > 0 and step % warm_start["every"] == 0):
-                if verbose:
-                    dkl_pre = _record_dkl("warm_start_before", i_phase, step, vstate_R)
-                train_reverse_network(
+                dkl_pre = _record_dkl("warm_start_before", i_phase, step, vstate_R)
+                vstate_R, dkl_traj = train_reverse_network(
                     vstate, vstate_R,
                     n_steps=warm_start["n_steps"],
                     batch=warm_start.get("batch", 1024),
                     lr=warm_start["lr"],
                     verbose=False,
+                    return_history=True,
                 )
+                for k, dkl_val in enumerate(dkl_traj):
+                    _record_dkl("warm_start_step", i_phase, step, vstate_R,
+                                dkl_value=dkl_val, inner_step=k)
+                dkl_post = _record_dkl("warm_start_after", i_phase, step, vstate_R)
                 if verbose:
-                    dkl_post = _record_dkl("warm_start_after", i_phase, step, vstate_R)
                     print(f"    [warm-start @ step {step}] "
                           f"D_KL: {dkl_pre:.2e} → {dkl_post:.2e}")
 
-            # ── Monitor periódico (fase Wang) ──
+            # ── monitor periódico ──
             if (method == "wang" and monitor_every
                     and step > 0 and step % monitor_every == 0):
                 dkl_now = _record_dkl("monitor", i_phase, step, vstate_R)
@@ -565,15 +486,21 @@ def free_energy_minimize_phases(
 
             global_step += 1
 
-    # ── Guardar historial (solo si hubo fase Wang) ──
-    if has_wang and dkl_history:
+    # ── guardar historial completo (una vez por entrenamiento) ──
+    if has_wang:
+        if history_index is not None:
+            tag = f"{history_index:04d}"
+        else:
+            tag = str(T)                      # fallback por compatibilidad
+        dkl_save_path = _auto_training_history_path(vstate, partition, tag)
         with open(dkl_save_path, "w") as f:
-            json.dump(dkl_history, f, indent=2)
+            json.dump(training_history, f, indent=2)
         if verbose:
-            print(f"\n[dkl_history] {len(dkl_history)} registros guardados en "
+            print(f"\n[training_history] {len(training_history['steps'])} steps + "
+                  f"{len(training_history['dkl_records'])} dkl records → "
                   f"{dkl_save_path}")
 
-    # ── Restaurar y reevaluar (sin cambios) ──
+    # ── restaurar y reevaluar ──
     vstate.parameters = best_params
     jax.clear_caches()
     vstate.chunk_size = chunk_size
@@ -584,7 +511,6 @@ def free_energy_minimize_phases(
     )
     best_F = E_best - T * S2_best
 
-    # ── Plot original de F (SIN tocar) ──
     if plot:
         fig, ax = plt.subplots(figsize=(8, 4))
         ax.plot(free_energy_history, label=r"$F$")
@@ -831,150 +757,3 @@ def free_energy_minimize_scipy(
         "best_energy":         energy_history[best_idx],
         "best_entropy":        entropy_history[best_idx],
     }
-
-def renyi_entropy_maximize_SR_SGD(
-    vstate, partition, n_steps=1000,
-    verbose=True, freq=50, plot=True,
-    learning_rate=None, diag_shift=None,
-    n_samples_sr=4096, timing=False,
-):
-    """
-    Maximiza S₂ del subsistema A usando SR + SGD.
-
-    Parámetros
-    ----------
-    vstate       : MCState de NetKet con el modelo variacional.
-    partition    : Lista de sitios del subsistema A para S₂.
-    n_steps      : Número de pasos de optimización.
-    verbose      : Si True, imprime progreso cada `freq` pasos.
-    freq         : Frecuencia de impresión.
-    plot         : Si True, muestra gráfica de S₂ al final.
-    learning_rate: Schedule o escalar de optax. Por defecto warmup_cosine_decay.
-    diag_shift   : Schedule o escalar para SR. Por defecto linear 1e-1 → 1e-4.
-    n_samples_sr : Muestras usadas en el paso de SR (< n_samples completo).
-    timing       : Si True, mide y muestra el tiempo real de cada step en los prints.
-
-    Devuelve
-    -------
-    (entropy_history, best_S2, best_params)
-    """
-    if learning_rate is None:
-        learning_rate = optax.warmup_cosine_decay_schedule(0.1, 0.1, 100, n_steps, 0.001)
-    if diag_shift is None:
-        diag_shift = optax.linear_schedule(1e-1, 1e-4, n_steps)
-
-    sr = nk.optimizer.SR(diag_shift=diag_shift)
-    optimizer = optax.sgd(learning_rate)
-    opt_state = optimizer.init(vstate.parameters)
-    n_samples_full = vstate.n_samples
-
-    entropy_history = []
-    best_S2 = float("-inf")
-    best_params = None
-
-    for step in range(n_steps):
-        if timing:
-            t0 = time.time()
-
-        S2, grad_S2 = renyi2_entropy_and_grad_sampled(vstate, partition, n_samples_full)
-
-        S2_max = len(partition) * jnp.log(2.0)
-        mask = float(S2 < S2_max)
-
-        # Gradiente con mask aplicado (se anula si S2 >= S2_max)
-        masked_grad = jax.tree_util.tree_map(lambda g: mask * g, grad_S2)
-
-        vstate.n_samples = n_samples_sr
-        delta = sr(vstate, masked_grad, step)
-        vstate.n_samples = n_samples_full
-
-        # Negamos delta para maximizar
-        neg_delta = jax.tree_util.tree_map(lambda d: -d, delta)
-        updates, opt_state = optimizer.update(neg_delta, opt_state)
-        vstate.parameters = optax.apply_updates(vstate.parameters, updates)
-        vstate.parameters = optax.apply_updates(vstate.parameters, updates)
-
-        if timing:
-            jax.tree_util.tree_map(lambda x: x.block_until_ready(), vstate.parameters)
-
-        S2_val = float(S2)
-        entropy_history.append(S2_val)
-
-        if S2_val > best_S2:
-            best_S2 = S2_val
-            best_params = vstate.parameters
-
-        if step % freq == 0 and verbose:
-            if timing:
-                print(f"Step {step:4d} | S₂={S2_val:.6f} | t={time.time()-t0:.3f}s")
-            else:
-                print(f"Step {step:4d} | S₂={S2_val:.6f}")
-
-    vstate.parameters = best_params
-
-    if plot:
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.plot(entropy_history, color="tab:green", label=r"$S_2$")
-        ax.set_xlabel("Step")
-        ax.set_ylabel(r"$S_2$", color="tab:green")
-        plt.tight_layout()
-        plt.show()
-
-    return entropy_history, best_S2, best_params
-
-def renyi_entropy_maximize_ADAM(
-    vstate, partition, n_steps=1000,
-    verbose=True, freq=50, plot=True,
-    learning_rate=None, timing=False,
-):
-    if learning_rate is None:
-        learning_rate = optax.linear_schedule(1e-3, 1e-5, n_steps)
-
-    optimizer = optax.adam(learning_rate=learning_rate)
-    opt_state = optimizer.init(vstate.parameters)
-    n_samples_full = vstate.n_samples
-
-    entropy_history = []
-    best_S2 = float("-inf")
-    best_params = None
-
-    for step in range(n_steps):
-        if timing:
-            t0 = time.time()
-
-        S2, grad_S2 = renyi2_entropy_and_grad_sampled(
-            vstate, partition, n_samples_full
-        )
-
-        # Negamos el gradiente para maximizar
-        neg_grad = jax.tree_util.tree_map(lambda g: -g, grad_S2)
-        updates, opt_state = optimizer.update(neg_grad, opt_state)
-        vstate.parameters = optax.apply_updates(vstate.parameters, updates)
-
-        if timing:
-            jax.tree_util.tree_map(lambda x: x.block_until_ready(), vstate.parameters)
-
-        S2_val = float(S2)
-        entropy_history.append(S2_val)
-
-        if S2_val > best_S2:
-            best_S2 = S2_val
-            best_params = vstate.parameters
-
-        if step % freq == 0 and verbose:
-            if timing:
-                print(f"Step {step:4d} | S₂={S2_val:.6f} | t={time.time()-t0:.3f}s")
-            else:
-                print(f"Step {step:4d} | S₂={S2_val:.6f}")
-
-    vstate.parameters = best_params
-
-    if plot:
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.plot(entropy_history, color="tab:green", label=r"$S_2$")
-        ax.set_xlabel("Step")
-        ax.set_ylabel(r"$S_2$", color="tab:green")
-        plt.tight_layout()
-        plt.show()
-
-    return entropy_history, best_S2, best_params
