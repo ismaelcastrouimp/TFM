@@ -1479,7 +1479,7 @@ def _sample_ar_sites_batch(key, vstate, s_init_batch, sites, reverse=False):
         keys, s_init_batch
     )
 
-def _wang_sample_quadruples(key, vstate, vstate_R, n_samples, N_S, N_total):
+def _wang_sample_quadruples_noA16(key, vstate, vstate_R, n_samples, N_S, N_total):
     """
     σ_a¹ ~ p(σ_a)              [forward]
     σ_b¹ ~ p(σ_b | σ_a¹)        [forward]
@@ -1513,7 +1513,7 @@ def _wang_sample_quadruples(key, vstate, vstate_R, n_samples, N_S, N_total):
 
     return sa1, sb1, sa2, sb2
 
-def renyi2_wang_cs(vstate, vstate_R, subsystem_sites, n_samples,
+def renyi2_wang_cs_noA16(vstate, vstate_R, subsystem_sites, n_samples,
                    key=0, debug=False):
     """S₂ = -ln Tr[ρ_A²] y su gradiente vía Wang & Davis (2020)."""
     N_total = vstate.hilbert.size
@@ -1575,7 +1575,7 @@ def renyi2_wang_cs(vstate, vstate_R, subsystem_sites, n_samples,
         lp11 = logpsi(c11); lp21 = logpsi(c21)
         lp22 = logpsi(c22); lp12 = logpsi(c12)
         log_Omega = lp11 + jnp.conj(lp21) + lp22 + jnp.conj(lp12)
-        return jnp.mean(jnp.real(jnp.exp(log_Omega)) * jnp.exp(-logP))
+        return jnp.mean(jnp.real(jnp.exp(log_Omega - logP)))
 
     Tr_rho2, grad = jax.value_and_grad(loss_fn)(vstate.parameters)
     S2 = -jnp.log(jnp.abs(Tr_rho2))
@@ -1594,6 +1594,167 @@ def renyi2_wang_cs(vstate, vstate_R, subsystem_sites, n_samples,
         print(f"S₂            = {float(S2):.6f}")
         print(f"ESS/M         = {ess_ratio:.4f}  "
             f"({ess_abs:.0f}/{w_raw.shape[0]})")
+        print(f"log-w std     = {lw_std:.3f}")
+        print(f"frac cerca max= {frac_max:.4f}")
+
+    return float(S2), grad_S2
+
+def _wang_sample_quadruples(key, vstate, vstate_R, n_samples, N_S, N_total):
+    """
+    Sampling con el truco del Apéndice A.2 de Wang & Davis (2020):
+
+        σ_a¹ ~ p(σ_a)                             [forward]
+        σ_b¹ ~ p(σ_b | σ_a¹)                       [forward]
+        σ_a² ~ p_R(σ_a | σ_b¹)                     [reverse]
+        σ_b² ~ ½[p(σ_b | σ_a²) + p(σ_b | σ_a¹)]   [forward, mixture]
+
+    El último paso usa una moneda Bernoulli(0.5) per-muestra para decidir
+    de cuál de las dos condicionales se samplea. Esto hace que el factor
+    p(σ_a¹, σ_b²) —la única pieza de Ω que no se generaba correlacionada—
+    también esté presente en P_CS, reduciendo la varianza.
+    """
+    local_states = jnp.asarray(vstate.hilbert.local_states)
+    blank = jnp.full((n_samples, N_total), local_states[0],
+                     dtype=local_states.dtype)
+
+    A_fwd = jnp.arange(N_S)
+    B_fwd = jnp.arange(N_S, N_total)
+    A_rev = jnp.arange(N_S - 1, -1, -1)
+
+    k1, k2, k3, k4, k5, k6 = jax.random.split(key, 6)
+
+    # σ_a¹ ~ p(σ_a)  — forward
+    sa1_full = _sample_ar_sites_batch(k1, vstate, blank, A_fwd, reverse=False)
+    sa1 = sa1_full[:, :N_S]
+
+    # σ_b¹ ~ p(σ_b | σ_a¹)  — forward
+    s_init = blank.at[:, :N_S].set(sa1)
+    sb1_full = _sample_ar_sites_batch(k2, vstate, s_init, B_fwd, reverse=False)
+    sb1 = sb1_full[:, N_S:]
+
+    # σ_a² ~ p_R(σ_a | σ_b¹)  — reverse
+    s_init = blank.at[:, N_S:].set(sb1)
+    sa2_full = _sample_ar_sites_batch(k3, vstate_R, s_init, A_rev, reverse=True)
+    sa2 = sa2_full[:, :N_S]
+
+    # σ_b² ~ mezcla: sampleamos AMBAS condicionales y elegimos per-muestra
+    s_init_a2 = blank.at[:, :N_S].set(sa2)
+    sb2_from_a2 = _sample_ar_sites_batch(
+        k4, vstate, s_init_a2, B_fwd, reverse=False
+    )[:, N_S:]
+
+    s_init_a1 = blank.at[:, :N_S].set(sa1)
+    sb2_from_a1 = _sample_ar_sites_batch(
+        k5, vstate, s_init_a1, B_fwd, reverse=False
+    )[:, N_S:]
+
+    coin = jax.random.bernoulli(k6, 0.5, shape=(n_samples,))
+    sb2 = jnp.where(coin[:, None], sb2_from_a2, sb2_from_a1)
+
+    return sa1, sb1, sa2, sb2
+
+def renyi2_wang_cs(vstate, vstate_R, subsystem_sites, n_samples,
+                   key=0, debug=False):
+    """
+    S₂ = -ln Tr[ρ_A²] y su gradiente vía Wang & Davis (2020),
+    incluyendo el truco del Apéndice A.2 (mixture en σ_b²).
+
+    Añadidos respecto a la versión base:
+      - Se evalúa p(σ_b²|σ_a¹) además de p(σ_b²|σ_a²).
+      - logP usa el log-mixture: log((p_b2_a2 + p_b2_a1)/2).
+      - Estabilidad numérica: exp(log_Omega - logP) en lugar de
+        exp(log_Omega)·exp(-logP).
+    """
+    N_total = vstate.hilbert.size
+    N_S = len(subsystem_sites)
+
+    assert list(subsystem_sites) == list(range(N_S)), (
+        "Wang CS requiere subsystem_sites = [0, 1, ..., N_S-1]"
+    )
+
+    local_states = jnp.asarray(vstate.hilbert.local_states)
+    A_sites = jnp.arange(N_S)
+    B_sites = jnp.arange(N_S, N_total)
+
+    sa1, sb1, sa2, sb2 = _wang_sample_quadruples(
+        jax.random.PRNGKey(key), vstate, vstate_R, n_samples, N_S, N_total
+    )
+    sa1 = jax.lax.stop_gradient(sa1); sb1 = jax.lax.stop_gradient(sb1)
+    sa2 = jax.lax.stop_gradient(sa2); sb2 = jax.lax.stop_gradient(sb2)
+
+    # ── 4 configuraciones que entran en Ω ──
+    c11 = jnp.concatenate([sa1, sb1], axis=-1)
+    c21 = jnp.concatenate([sa2, sb1], axis=-1)
+    c22 = jnp.concatenate([sa2, sb2], axis=-1)
+    c12 = jnp.concatenate([sa1, sb2], axis=-1)
+
+    # ── condicionales log-ψ ──
+    cond_fwd_11 = _per_site_log_psi(vstate,   c11, reverse=False)
+    cond_rev_21 = _per_site_log_psi(vstate_R, c21, reverse=True)
+    cond_fwd_22 = _per_site_log_psi(vstate,   c22, reverse=False)
+    cond_fwd_12 = _per_site_log_psi(vstate,   c12, reverse=False)  # ← NUEVO
+
+    # ── logP ──
+    log_p_a1  = _log_cond_sum(cond_fwd_11, sa1, A_sites, local_states)
+    log_p_b1  = _log_cond_sum(cond_fwd_11, sb1, B_sites, local_states)
+    log_pR_a2 = _log_cond_sum(cond_rev_21, sa2, A_sites, local_states)
+
+    # σ_b² bajo las dos condicionales
+    log_p_b2_a2 = _log_cond_sum(cond_fwd_22, sb2, B_sites, local_states)
+    log_p_b2_a1 = _log_cond_sum(cond_fwd_12, sb2, B_sites, local_states)  # ← NUEVO
+
+    # log((p_b2_a2 + p_b2_a1)/2)
+    log_p_b2_mix = jnp.logaddexp(log_p_b2_a2, log_p_b2_a1) - jnp.log(2.0)  # ← NUEVO
+
+    logP = jax.lax.stop_gradient(
+        log_p_a1 + log_p_b1 + log_pR_a2 + log_p_b2_mix
+    )
+
+    # ── Diagnóstico: pesos Re(Ω)/P_CS sin diferenciar ──
+    def _log_Omega_only(s):
+        def logpsi(x):
+            return vstate._apply_fun(
+                {"params": vstate.parameters, **vstate.model_state}, x
+            )
+        return jnp.real(logpsi(s))
+
+    log_Omega_det = (
+        _log_Omega_only(c11)
+        + _log_Omega_only(c21)
+        + _log_Omega_only(c22)
+        + _log_Omega_only(c12)
+    )
+    w_raw = jnp.exp(log_Omega_det - logP)
+
+    # ── Pérdida diferenciable (Tr[ρ_A²] como ⟨Ω/P_CS⟩) ──
+    def loss_fn(params):
+        def logpsi(s):
+            return vstate._apply_fun(
+                {"params": params, **vstate.model_state}, s
+            )
+        lp11 = logpsi(c11); lp21 = logpsi(c21)
+        lp22 = logpsi(c22); lp12 = logpsi(c12)
+        log_Omega = lp11 + jnp.conj(lp21) + lp22 + jnp.conj(lp12)
+        # Estabilidad numérica: combinamos exponentes ANTES de exponenciar.
+        return jnp.mean(jnp.real(jnp.exp(log_Omega - logP)))
+
+    Tr_rho2, grad = jax.value_and_grad(loss_fn)(vstate.parameters)
+    S2 = -jnp.log(jnp.abs(Tr_rho2))
+    grad_S2 = jax.tree_util.tree_map(lambda g: -g / Tr_rho2, grad)
+
+    if debug:
+        w_mean = jnp.mean(w_raw) + 1e-30
+        ess_ratio = float(w_mean ** 2 / (jnp.mean(w_raw ** 2) + 1e-30))
+        ess_abs   = ess_ratio * w_raw.shape[0]
+        lw        = jnp.log(jnp.abs(w_raw) + 1e-30)
+        lw_std    = float(jnp.std(lw))
+        lw_max    = jnp.max(lw)
+        frac_max  = float(jnp.mean(lw > (lw_max - 1.0)))
+
+        print(f"Tr[ρ_A²]      = {float(Tr_rho2):.6e}")
+        print(f"S₂            = {float(S2):.6f}")
+        print(f"ESS/M         = {ess_ratio:.4f}  "
+              f"({ess_abs:.0f}/{w_raw.shape[0]})")
         print(f"log-w std     = {lw_std:.3f}")
         print(f"frac cerca max= {frac_max:.4f}")
 
