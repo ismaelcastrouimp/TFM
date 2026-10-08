@@ -14,11 +14,8 @@ from .entropy import (
     train_reverse_network
 )
 from .training import (
-    free_energy_minimize_SR_SGD,
     free_energy_minimize,
     free_energy_minimize_phases,
     free_energy_minimize_exact,
     free_energy_minimize_scipy,
-    renyi_entropy_maximize_SR_SGD,
-    renyi_entropy_maximize_ADAM
 )
