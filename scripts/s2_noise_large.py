@@ -5,7 +5,8 @@ Comparación de swap trick, DRUT y Wang CS para tamaños donde ED no es posible,
 a COSTE IGUALADO (evaluaciones del ansatz).
 
 Estructura:
-  1. Entrena vstates a distintas temperaturas (y red reversa para Wang).
+  1. Entrena vstates a distintas temperaturas con Wang CS (fase única).
+     La red reversa se entrena dentro de la fase Wang (initial_train + warm_start).
   2. Compara a un presupuesto fijo (para ver tendencia con T).
   3. Barre el presupuesto B y mide error vs B.
   4. Analiza: error, ESS, cos, y coste computacional.
@@ -43,9 +44,8 @@ from src_renyi.entropy import (
     renyi2_entropy_and_grad_sampled,
     renyi2_drut_sampling2,
     renyi2_wang_cs,
-    train_reverse_network,
 )
-from src_renyi.training import free_energy_minimize
+from src_renyi.training import free_energy_minimize_phases
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Coste en evaluaciones del ansatz
@@ -91,6 +91,19 @@ DRUT_N_PROPS   = 2 * (N + N_A)
 
 # Coste por cadena de DRUT
 DRUT_COST_PER_CHAIN = DRUT_N_LAMBDA * (4 * DRUT_N_SWEEPS * DRUT_N_PROPS + 4)
+
+# ── Hiperparámetros de entrenamiento (Wang único) ──────────────────────────────
+N_STEPS_WANG  = 400
+LR_WANG       = 1e-3
+
+INIT_N_STEPS  = 3000
+INIT_BATCH    = 4096
+LR_INIT       = 1e-3
+
+WARM_EVERY    = 5
+WARM_N_STEPS  = 20
+WARM_BATCH    = 2**14
+LR_WARM       = 5e-4
 
 # ── Número de sitios totales del sistema purificado ──
 N_TOTAL = N + N_A
@@ -155,10 +168,10 @@ vstate_ref = nk.vqs.MCState(sampler, model, n_samples=2**16)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Entrenamiento (forward + reverse)
+# Entrenamiento (Wang CS como única fase)
 # ══════════════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 70)
-print(f"Entrenando vstates  (N = {N}, N_A = {N_A})")
+print(f"Entrenando vstates  (N = {N}, N_A = {N_A}) con Wang CS")
 print("=" * 70)
 
 trained_vstates   = {}
@@ -166,32 +179,47 @@ trained_vstates_R = {}
 
 for i, T in enumerate(TEMPS):
     vstate = copy.deepcopy(vstate_ref)
-    lr = optax.linear_schedule(0.05, 0.001, 300)
     print(f"\n  T = {T:.2f}")
-    t0 = time.time()
-    free_energy_minimize(
-        vstate, T, partition, H_extended, n_steps=300,
-        optimizer=optax.sgd(lr),
-        plot=False, verbose=False,
-        chunk_size=vstate.n_samples // 2,
-    )
-    print(f"         entrenamiento: {time.time() - t0:.1f} s")
-    trained_vstates[T] = vstate
 
-    # ── Red reversa (Wang CS) ──
+    # ── Red reversa (necesaria para Wang) ──
     model_R = nk.models.ARNNDense(
         hilbert=hi, layers=1, features=16, activation=jax.nn.gelu
     )
     vstate_R = nk.vqs.MCState(
         nk.sampler.ARDirectSampler(hi), model_R, n_samples=2**16
     )
+
+    # ── Fase única: Wang CS ──
+    phases = [
+        {
+            "method": "wang",
+            "n_steps": N_STEPS_WANG,
+            "optimizer": optax.adam(LR_WANG),
+            "vstate_R": vstate_R,
+            "initial_train": {
+                "n_steps": INIT_N_STEPS,
+                "batch":   INIT_BATCH,
+                "lr":      LR_INIT,
+            },
+            "warm_start": {
+                "every":   WARM_EVERY,
+                "n_steps": WARM_N_STEPS,
+                "lr":      LR_WARM,
+                "batch":   WARM_BATCH,
+            },
+            "wang_kwargs": {"n_samples": vstate.n_samples},
+        },
+    ]
+
     t0 = time.time()
-    train_reverse_network(
-        vstate, vstate_R,
-        n_steps=3000, batch=4096, lr=1e-3,
-        verbose=False, freq=500,
+    free_energy_minimize_phases(
+        vstate, T, partition, H_extended, phases,
+        chunk_size=vstate.n_samples // 2,
+        verbose=False, freq=50, plot=False, timing=False,
     )
-    print(f"         red reversa: {time.time() - t0:.1f} s")
+    print(f"         entrenamiento (Wang): {time.time() - t0:.1f} s")
+
+    trained_vstates[T]   = vstate
     trained_vstates_R[T] = vstate_R
 
 
