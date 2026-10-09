@@ -18,6 +18,7 @@ Devuelve, para una única configuración:
       → WARM_EVERY sugerido.
   6b. Recuperación DKL con warm-start → WARM_N_STEPS sugerido.
   7.  Contabilidad completa del coste Wang (init + main + warm-starts).
+  8.  Memoria del proceso (VmHWM) → --mem sugerido para SLURM.
 
 NOTA: el warmup (2c) sitúa vstate en un punto no aleatorio, pero **no**
 garantiza que esté cerca del mínimo de F(T). Los diagnósticos de 6a/6b
@@ -46,12 +47,12 @@ from src_renyi.entropy import (
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════════════════════════
-N         = 20
-N_A       = 20
-N_SAMPLES = 2**18
+N         = 50
+N_A       = 50
+N_SAMPLES = 2**15
 GAMMA     = -1.5
 V         = -1.0
-T         = 4
+T         = 2
 
 # LRs de diagnóstico (deben reflejar los LRs reales de producción)
 LR_SWAP   = 0.05      # swap + SGD
@@ -224,6 +225,72 @@ def print_curve(history, window=100, label="", n_points=10):
         print(f"      step≈{i + window // 2:>5}  DKL≈{h_smooth[i]:.4f}")
 
 
+# ── memoria del proceso y GPU ────────────────────────────────────────────────
+
+def get_process_memory_mb():
+    """
+    Lee /proc/self/status y devuelve un dict con la memoria del proceso.
+
+      VmRSS:  residente AHORA
+      VmHWM:  pico de residente (lo que cuenta contra --mem de SLURM)
+      VmSize: virtual AHORA
+      VmPeak: pico de virtual
+
+    Devuelve el valor en MB (float).
+    """
+    keys = ("VmRSS", "VmHWM", "VmSize", "VmPeak")
+    info = {k: 0.0 for k in keys}
+    with open("/proc/self/status") as f:
+        for line in f:
+            for k in keys:
+                if line.startswith(k + ":"):
+                    # Formato: "VmRSS:   12345 kB"
+                    info[k] = int(line.split()[1]) / 1024.0
+    return info
+
+
+def get_gpu_memory_mb():
+    """
+    Devuelve {device_id: (used_MB, limit_MB)} para cada GPU visible.
+    Si no hay GPU o jax no da stats, devuelve {}.
+    """
+    out = {}
+    for d in jax.local_devices():
+        try:
+            stats = d.memory_stats()
+        except Exception:
+            stats = None
+        if stats and "bytes_in_use" in stats and "bytes_limit" in stats:
+            out[d.id] = (
+                stats["bytes_in_use"] / 1024.0 ** 2,
+                stats["bytes_limit"]   / 1024.0 ** 2,
+            )
+    return out
+
+
+def memory_report(label=""):
+    """Imprime un informe de memoria y devuelve el --mem sugerido en GB."""
+    mem = get_process_memory_mb()
+    gpu = get_gpu_memory_mb()
+
+    print(f"  memoria del proceso ({label}):")
+    print(f"    VmRSS  (ahora)   = {mem['VmRSS']/1024:.2f} GB")
+    print(f"    VmHWM  (pico)    = {mem['VmHWM']/1024:.2f} GB   ← contra --mem")
+    print(f"    VmSize (ahora)   = {mem['VmSize']/1024:.2f} GB   (virtual)")
+    print(f"    VmPeak (pico)    = {mem['VmPeak']/1024:.2f} GB   (virtual)")
+
+    if gpu:
+        for dev_id, (used, limit) in gpu.items():
+            print(f"    GPU {dev_id}: {used/1024:.2f} GB usados / "
+                  f"{limit/1024:.2f} GB límite")
+    else:
+        print(f"    GPU: no disponible o stats no accesibles")
+
+    suggested_mem_gb = max(4, int(np.ceil(mem["VmHWM"] / 1024 * 3)))
+    print(f"    → --mem sugerido (3 × VmHWM): {suggested_mem_gb} GB")
+    return suggested_mem_gb
+
+
 # ── construir hilbert, hamiltoniano y vstates ────────────────────────────────
 
 hi = nk.hilbert.Spin(s=1/2, N=N + N_A)
@@ -317,8 +384,7 @@ jax.effects_barrier()
 
 print(f"  F tras warmup = {F_warmup_last:.4f}")
 
-# Re-capturamos params_bak en el estado warmed-up,
-# para que todas las secciones siguientes partan de aquí.
+# Re-capturamos params_bak en el estado warmed-up
 params_bak = copy.deepcopy(vstate.parameters)
 print(f"  params_bak renovado al estado warmed-up")
 
@@ -545,9 +611,11 @@ print(f"  → C_g ≈ {C_g:.4f}  (std(||∇S₂||) = C_g / √n)")
 mean_grad_norm = float(np.mean(ns_results[max(ns_results)]["grad_norm"]))
 n_samples_wang_opt = int(np.ceil((C_g / (NS_EPS_GRAD * mean_grad_norm)) ** 2))
 n_samples_wang_opt = 2 ** int(np.ceil(np.log2(max(n_samples_wang_opt, 1))))
+n_samples_wang_opt_log2 = int(np.round(np.log2(n_samples_wang_opt)))
 
 print(f"  ||∇S₂|| característica ≈ {mean_grad_norm:.4f}")
-print(f"  → n_samples_wang_opt = {n_samples_wang_opt:,}  "
+print(f"  → n_samples_wang_opt = 2**{n_samples_wang_opt_log2} "
+      f"= {n_samples_wang_opt:,}  "
       f"(para std(||∇S₂||)/||∇S₂|| = {NS_EPS_GRAD:.0%})")
 
 
@@ -694,7 +762,20 @@ print(f"    fracción 'neta' (main / total) = {frac_net:.2%}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 8. RESUMEN
+# 8. Memoria del proceso (VmHWM → --mem sugerido para SLURM)
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── 8. Memoria del proceso ──────────────────────────────────")
+
+# Forzamos algunas operaciones pesadas para que VmHWM capture un pico realista
+_ = vstate.expect(H_extended)
+_ = vstate.expect_and_grad(op_wang_final)
+_ = measure_rev_step_time(vstate, vstate_R, INIT_BATCH_HINT, n_measure=1)
+
+suggested_mem_gb = memory_report(label="tras ops pesadas")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9. RESUMEN
 # ══════════════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 66)
 print("RESUMEN")
@@ -725,8 +806,8 @@ print(f"  Wang – escalado:")
 print(f"    C_g                   : {C_g:.4f}  "
       f"(std(||∇S₂||) = C_g / √n, slope={slope:.3f})")
 print(f"    ||∇S₂|| típico       : {mean_grad_norm:.4f}")
-print(f"    n_samples_wang_opt    : {n_samples_wang_opt:,}  "
-      f"(ε={NS_EPS_GRAD:.0%})")
+print(f"    n_samples_wang_opt    : 2**{n_samples_wang_opt_log2} "
+      f"= {n_samples_wang_opt:,}  (ε={NS_EPS_GRAD:.0%})")
 print()
 print(f"  Warm-start (drift medido con Wang):")
 print(f"    WARM_EVERY sugerido   : {warm_every_rec}")
@@ -738,4 +819,6 @@ print(f"    main                  : {t_main_phase:.1f}s")
 print(f"    warm-starts           : {t_warm_phase:.1f}s")
 print(f"    total                 : {t_total:.1f}s  "
       f"(neto: {frac_net:.1%})")
+print()
+print(f"  --mem sugerido          : {suggested_mem_gb} GB  (3 × VmHWM)")
 print("=" * 66)
