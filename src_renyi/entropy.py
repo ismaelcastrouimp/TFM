@@ -35,7 +35,7 @@ def vstate_to_vector(vstate):
     return psi / norm, all_configs
 
 
-# ── Rényi-2 exacto ────────────────────────────────────────────────────────────
+# ── Rényi-2, n exacto ─────────────────────────────────────────────────────────
 
 def renyi2_entropy_exact(vstate, subsystem_sites):
     """
@@ -119,6 +119,112 @@ def renyi2_entropy_and_grad_exact(vstate, subsystem_sites, hi_extended, isFullSu
     # Usar value_and_grad de JAX para obtener S₂ y su gradiente
     S2, S2_grad = jax.value_and_grad(S2_func)(vstate.parameters)
     return S2, S2_grad
+
+def renyin_entropy_exact(vstate, subsystem_sites, n):
+    """
+    Calcula S_n de forma exacta construyendo la matriz densidad reducida ρ_A.
+
+    S_n = 1/(1-n) · ln Tr[ρ_A^n]
+
+    Escala exponencialmente con N (memoria y tiempo O(4^{N_A})). Solo viable
+    para N total pequeño (≲ 12-14), ya que hay que enumerar toda la base.
+
+    Para n=2 reproduce renyi2_entropy_exact (salvo redondeo).
+
+    Parámetros
+    ----------
+    vstate          : MCState (o FullSumState) de NetKet.
+    subsystem_sites : Índices de los sitios del subsistema A.
+    n               : orden de Rényi (entero o real > 0, n ≠ 1).
+
+    Devuelve
+    --------
+    S_n   : Entropía de Rényi-n (escalar real).
+    rho_A : Matriz densidad reducida de A (dim_A × dim_A).
+    """
+    assert n != 1, "n=1 (von Neumann) no aplica a esta fórmula"
+    N = vstate.hilbert.size
+    subsystem_sites = np.array(subsystem_sites, dtype=int)
+
+    psi, basis = vstate_to_vector(vstate)
+
+    n_A = len(subsystem_sites)
+    n_B = N - n_A
+    dim_A = 2 ** n_A
+    dim_B = 2 ** n_B
+
+    all_sites = np.arange(N)
+    complement_sites = np.setdiff1d(all_sites, subsystem_sites)
+
+    # {-1,+1} → {0,1}, reordenar (A primero, B después)
+    basis_01 = ((basis + 1) // 2).astype(int)
+    reordered_sites = np.concatenate([subsystem_sites, complement_sites])
+    basis_reordered = basis_01[:, reordered_sites]
+
+    powers_A = 2 ** np.arange(n_A)[::-1]
+    powers_B = 2 ** np.arange(n_B)[::-1]
+    idx_A = (basis_reordered[:, :n_A] * powers_A).sum(axis=1)
+    idx_B = (basis_reordered[:, n_A:] * powers_B).sum(axis=1)
+
+    psi_matrix = jnp.zeros((dim_A, dim_B), dtype=complex)
+    psi_matrix = psi_matrix.at[idx_A, idx_B].set(psi)
+
+    # ρ_A = Tr_B(|ψ⟩⟨ψ|)
+    rho_A = psi_matrix @ jnp.conj(psi_matrix.T)
+
+    # Tr[ρ_A^n] = Σ λ_i^n, con λ_i autovalores (reales, ≥ 0)
+    eigvals = jnp.linalg.eigvalsh(rho_A)          # (dim_A,)
+    eigvals = jnp.clip(eigvals.real, 0.0, None)   # por si hay ruido numérico
+
+    # Trivialmente: Σ λ_i = 1, así que normalizamos por seguridad
+    eigvals = eigvals / jnp.sum(eigvals)
+
+    purity_n = jnp.sum(eigvals ** n)
+    S_n = jnp.log(purity_n) / (1.0 - n)
+
+    return S_n, rho_A
+
+def renyin_entropy_and_grad_exact(vstate, subsystem_sites, n,
+                                  hi_extended=None, isFullSum=False):
+    """
+    Gradiente exacto de la entropía de Rényi-n por diferenciación automática
+    sobre la función que la calcula exactamente.
+
+    Análoga a renyi2_entropy_and_grad_exact, pero para orden n arbitrario.
+
+    Parámetros
+    ----------
+    vstate          : MCState de NetKet.
+    subsystem_sites : Índices del subsistema A.
+    n               : Orden de Rényi (n ≥ 2).
+    hi_extended     : (Opcional) Hilbert extendido para FullSumState.
+                      Si isFullSum=True y no se pasa, se usa vstate.hilbert.
+    isFullSum       : Si True, reconstruye vstate_tmp como FullSumState
+                      (necesario si vstate.sampler no está disponible).
+
+    Devuelve
+    --------
+    S_n     : float
+    grad_Sn : pytree con la estructura de vstate.parameters.
+    """
+    assert n >= 2, "n debe ser ≥ 2"
+
+    def S_n_func(params):
+        if isFullSum:
+            hi = hi_extended if hi_extended is not None else vstate.hilbert
+            vstate_tmp = nk.vqs.FullSumState(hi, vstate.model)
+        else:
+            vstate_tmp = nk.vqs.MCState(
+                sampler=vstate.sampler,
+                model=vstate.model,
+                n_samples=vstate.n_samples,
+            )
+        vstate_tmp.parameters = params
+        S_n, _ = renyin_entropy_exact(vstate_tmp, subsystem_sites, n)
+        return S_n
+
+    S_n, grad_Sn = jax.value_and_grad(S_n_func)(vstate.parameters)
+    return S_n, grad_Sn
 
 # ── Rényi-2 muestreado ────────────────────────────────────────────────────────
 
@@ -1673,3 +1779,281 @@ def train_reverse_network(vstate, vstate_R, n_steps=500, batch=1024,
     if return_history:
         return vstate_R, dkl_history
     return vstate_R
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Rényi de orden n >= 2
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# S_n = 1/(1-n) · ln Tr[ρ_A^n]
+#
+# Tr[ρ_A^n] = Σ Ω(σa, σb),  Ω = Π_{k=1}^n ψ(σa^k, σb^k) ψ*(σa^{k+1}, σb^k)
+#                              con σa^{n+1} ≡ σa^1
+#
+# Dos estimadores:
+#   - renyin_entropy_and_grad_sampled : n muestras iid de p por batch,
+#     recombinadas cíclicamente (direct sampling, DS).
+#   - renyin_wang_cs : cadena σa¹→σb¹→σa²→…→σbⁿ con la red inversa para
+#     los pasos σb→σa, y truco A.2 (mezcla) en σbⁿ (conditional sampling).
+#
+# Gradiente: Tr[ρ_A^n] = Σ Ω sobre configuraciones FIJAS ⇒
+#     ∇Tr = Σ ∇Ω = E_P[ (Ω/P) ∇ln Ω ]   (P tratado como constante)
+# Por eso la pérdida es  mean( Re exp( ln Ω − stop_gradient(ln P) ) ).
+# No hay término REINFORCE: el estimador "pathwise" es insesgado porque P
+# es una distribución de muestreo, no un objeto sobre el que diferenciamos.
+# Finalmente, ∇S_n = ∇Tr / ((1 − n) Tr).
+
+def _to_chunks(x, n_chunks, chunk):
+    """(n, M, ...) -> (n_chunks, n, chunk, ...) descartando el resto de M."""
+    n = x.shape[0]
+    x = x[:, : n_chunks * chunk].reshape(n, n_chunks, chunk, *x.shape[2:])
+    return jnp.swapaxes(x, 0, 1)
+
+def _chunk_sizes(n_samples, chunk_size):
+    chunk = max(1, min(chunk_size, n_samples))
+    return n_samples // chunk, chunk
+
+@partial(jax.jit, static_argnames=("apply_fun",))
+def _trace_value_and_grad(apply_fun, params, model_state, c_diag, c_off, log_P):
+    """
+    Tr[ρ_A^n] ≈ mean( Re exp(ln Ω − sg(ln P)) )  y  su gradiente.
+
+    c_diag : (n_chunks, n, chunk, N)   configs (σa^k, σb^k)
+    c_off  : (n_chunks, n, chunk, N)   configs (σa^{k+1}, σb^k)
+    log_P  : (n_chunks, chunk)         ln P_sampling (tratado como constante)
+
+    El gradiente del estimador es  E_P[(Ω/P) ∇ln Ω] = ∇Tr, sin REINFORCE.
+    """
+    def lpsi(p, s):
+        flat = s.reshape(-1, s.shape[-1])
+        out = apply_fun({"params": p, **model_state}, flat)
+        # NetKet a veces devuelve (B, 1); aplanamos a (B,) para el reshape
+        return jnp.squeeze(out).reshape(s.shape[:-1])
+
+    n_chunks, _, chunk, _ = c_diag.shape
+    M = n_chunks * chunk
+
+    def loss_fn(p):
+        @jax.checkpoint
+        def one_chunk(x):
+            cd, co, lP = x
+            log_Omega = jnp.sum(lpsi(p, cd) + jnp.conj(lpsi(p, co)), axis=0)
+            return jnp.sum(jnp.real(jnp.exp(log_Omega - lP)))
+
+        return jnp.sum(jax.lax.map(one_chunk, (c_diag, c_off, log_P))) / M
+
+    return jax.value_and_grad(loss_fn)(params)
+
+def _finalize(T, grad_T, n):
+    S_n = jnp.log(jnp.abs(T)) / (1.0 - n)
+    grad_S = jax.tree_util.tree_map(lambda g: g / ((1.0 - n) * T), grad_T)
+    return S_n, grad_S
+
+def _log_omega_det(vstate, c_diag, c_off):
+    """ln Ω (complejo) por secuencia, sin diferenciar. c_*: (n, M, N)."""
+    n, M, N = c_diag.shape
+    ld = vstate.log_value(c_diag.reshape(-1, N)).reshape(n, M)
+    lo = vstate.log_value(c_off.reshape(-1, N)).reshape(n, M)
+    return jnp.sum(ld + jnp.conj(lo), axis=0)
+
+def _debug_report(name, T, S_n, grad_S, w):
+    w = jnp.real(w)
+    ess = float(jnp.sum(w) ** 2 / (jnp.sum(w ** 2) + 1e-30))
+    gf, _ = jax.flatten_util.ravel_pytree(grad_S)
+    print(f"[{name}] Tr[ρ_A^n] = {float(T):.6e}")
+    print(f"[{name}] S_n       = {float(S_n):.6f}")
+    print(f"[{name}] ESS/M     = {ess / w.shape[0]:.4f}  ({ess:.0f}/{w.shape[0]})")
+    print(f"[{name}] |∇S_n|    = {float(jnp.linalg.norm(gf)):.6f}")
+
+# ── Rényi-n por muestreo directo (DS) ────────────────────────────────────────
+
+def renyin_entropy_and_grad_sampled(vstate, subsystem_sites, n, n_samples,
+                                    key=0, chunk_size=256, debug=False):
+    """
+    S_n y ∇S_n por muestreo directo.
+
+    Cada batch son n muestras iid de p = |ψ|², recombinadas cíclicamente:
+    (σa^{k+1}, σb^k). Estimador f_DS = Ω / Π_k p(σ^k).
+
+    Parámetros
+    ----------
+    n         : orden de Rényi (entero >= 2).
+                n=2 da el mismo estimador (no bit-a-bit) que
+                renyi2_entropy_and_grad_sampled, con menos varianza.
+    n_samples : número de batches M (se muestrean n·M configuraciones).
+
+    Devuelve
+    --------
+    S_n (float), grad_S_n (pytree con la estructura de vstate.parameters).
+    """
+    assert n >= 2, "n debe ser un entero >= 2"
+    N = vstate.hilbert.size
+    mask_A = jnp.zeros(N, dtype=bool).at[
+        jnp.asarray(subsystem_sites, dtype=int)
+    ].set(True)
+
+    total = n * n_samples
+    all_samples = vstate.sample(n_samples=total).reshape(-1, N)
+    # Permutar para romper correlación entre réplicas contiguas
+    all_samples = jax.random.permutation(
+        jax.random.PRNGKey(key), all_samples, axis=0
+    )[:total]
+    s = all_samples.reshape(n, n_samples, N)                  # s[k] = σ^k
+
+    # (σa^{k+1}, σb^k) cíclico
+    s_off = jnp.where(mask_A, jnp.roll(s, -1, axis=0), s)
+
+    # ln P = Σ_k ln p(σ^k) = 2 Σ_k Re ln ψ(σ^k)
+    lp = vstate.log_value(s.reshape(-1, N)).reshape(n, n_samples)
+    log_P = 2.0 * jnp.sum(jnp.real(lp), axis=0)
+
+    n_chunks, chunk = _chunk_sizes(n_samples, chunk_size)
+    T, grad_T = _trace_value_and_grad(
+        vstate._apply_fun, vstate.parameters, vstate.model_state,
+        _to_chunks(s, n_chunks, chunk),
+        _to_chunks(s_off, n_chunks, chunk),
+        log_P[: n_chunks * chunk].reshape(n_chunks, chunk),
+    )
+    S_n, grad_S = _finalize(T, grad_T, n)
+
+    if debug:
+        w = jnp.exp(_log_omega_det(vstate, s, s_off) - log_P)
+        _debug_report("renyi_n DS", T, S_n, grad_S, w)
+
+    return float(S_n), grad_S
+
+# ── Rényi-n por conditional sampling (Wang & Davis 2020) ─────────────────────
+
+def _wang_sample_chain(key, vstate, vstate_R, n_samples, n, N_S, N_total):
+    """
+    Cadena de Wang & Davis generalizada:
+
+        σa¹ ~ p(σa)
+        para k = 1..n-1:
+            σb^k     ~ p(σb | σa^k)              [forward]
+            σa^{k+1} ~ p_R(σa | σb^k)            [reverse]
+        σbⁿ ~ ½ [ p(σb | σaⁿ) + p(σb | σa¹) ]   (truco A.2)
+
+    La moneda Bernoulli(0.5) se tira ANTES de muestrear σbⁿ, así que solo
+    hace falta una pasada AR sobre B (no dos).
+
+    Devuelve sa (n, M, N_S) con sa[k] = σa^{k+1}, sb (n, M, N_B) análogo.
+    """
+    local_states = jnp.asarray(vstate.hilbert.local_states)
+    blank = jnp.full((n_samples, N_total), local_states[0],
+                     dtype=local_states.dtype)
+
+    A_fwd = jnp.arange(N_S)
+    B_fwd = jnp.arange(N_S, N_total)
+    A_rev = jnp.arange(N_S - 1, -1, -1)
+
+    keys = jax.random.split(key, 2 * n + 2)
+    sa, sb = [], []
+
+    # σa¹ ~ p(σa)
+    sa.append(_sample_ar_sites_batch(keys[0], vstate, blank, A_fwd)[:, :N_S])
+
+    for k in range(n):
+        if k < n - 1:
+            cond_A = sa[k]
+        else:
+            coin = jax.random.bernoulli(keys[2 * n + 1], 0.5,
+                                        shape=(n_samples,))
+            cond_A = jnp.where(coin[:, None], sa[0], sa[n - 1])
+
+        s_init = blank.at[:, :N_S].set(cond_A)
+        sb.append(_sample_ar_sites_batch(
+            keys[1 + 2 * k], vstate, s_init, B_fwd
+        )[:, N_S:])
+
+        if k < n - 1:
+            s_init = blank.at[:, N_S:].set(sb[k])
+            sa.append(_sample_ar_sites_batch(
+                keys[2 + 2 * k], vstate_R, s_init, A_rev, reverse=True
+            )[:, :N_S])
+
+    return jnp.stack(sa), jnp.stack(sb)
+
+def renyin_wang_cs(vstate, vstate_R, subsystem_sites, n, n_samples,
+                   key=0, chunk_size=256, debug=False):
+    """
+    S_n y ∇S_n vía conditional sampling (Wang & Davis 2020), orden n >= 2,
+    con mezcla en σbⁿ (Apéndice A.2).
+
+    n=2 reproduce (no bit-a-bit) renyi2_wang_cs.
+
+    Requiere subsystem_sites = [0, ..., N_S-1] (prefijo del orden AR) y
+    vstate_R entrenada con train_reverse_network.
+
+    P_CS = p(σa¹) · Π_{k=1}^{n-1} p(σb^k|σa^k) · Π_{k=1}^{n-1} p_R(σa^{k+1}|σb^k)
+           · ½ [ p(σbⁿ|σaⁿ) + p(σbⁿ|σa¹) ]
+
+    Parámetros
+    ----------
+    n_samples : número de secuencias completas de longitud 2n.
+    """
+    assert n >= 2, "n debe ser un entero >= 2"
+    N_total = vstate.hilbert.size
+    N_S = len(subsystem_sites)
+    assert list(subsystem_sites) == list(range(N_S)), (
+        "Wang CS requiere subsystem_sites = [0, 1, ..., N_S-1]"
+    )
+
+    local_states = jnp.asarray(vstate.hilbert.local_states)
+    A_sites = jnp.arange(N_S)
+    B_sites = jnp.arange(N_S, N_total)
+    M = n_samples
+
+    sa, sb = _wang_sample_chain(jax.random.PRNGKey(key), vstate, vstate_R,
+                                M, n, N_S, N_total)
+    sa = jax.lax.stop_gradient(sa)
+    sb = jax.lax.stop_gradient(sb)
+    sa_next = jnp.roll(sa, -1, axis=0)     # σa^{k+1}, con σa^{n+1} = σa¹
+
+    c_diag = jnp.concatenate([sa, sb], axis=-1)          # (σa^k, σb^k)
+    c_off  = jnp.concatenate([sa_next, sb], axis=-1)      # (σa^{k+1}, σb^k)
+
+    flat = lambda x: x.reshape(n * M, *x.shape[2:])
+
+    # ── ln P_CS ──
+    # Forward en cada c_diag → p(σb^k|σa^k) y p(σa^k|prefix)
+    cond_fwd_diag = _per_site_log_psi(vstate, flat(c_diag), reverse=False)
+    lpA_diag = _log_cond_sum(cond_fwd_diag, flat(sa), A_sites,
+                             local_states).reshape(n, M)
+    lpB_diag = _log_cond_sum(cond_fwd_diag, flat(sb), B_sites,
+                             local_states).reshape(n, M)
+
+    # Reverse para k=1..n-1: p_R(σa^{k+1}|σb^k) evaluado en c_off[:-1]
+    c_off_rev = c_off[:-1].reshape((n - 1) * M, N_total)
+    cond_rev = _per_site_log_psi(vstate_R, c_off_rev, reverse=True)
+    lpR_A = _log_cond_sum(cond_rev,
+                          sa_next[:-1].reshape((n - 1) * M, N_S),
+                          A_sites, local_states).reshape(n - 1, M)
+
+    # Mezcla en σbⁿ: p(σbⁿ|σa¹) se evalúa en c_off[n-1] = (σa¹, σbⁿ)
+    cond_fwd_last = _per_site_log_psi(vstate, c_off[-1], reverse=False)
+    lpB_last_a1 = _log_cond_sum(cond_fwd_last, sb[-1], B_sites, local_states)
+    log_p_b_mix = jnp.logaddexp(lpB_diag[-1], lpB_last_a1) - jnp.log(2.0)
+
+    log_P = jax.lax.stop_gradient(
+        lpA_diag[0]
+        + lpB_diag[:-1].sum(axis=0)
+        + lpR_A.sum(axis=0)
+        + log_p_b_mix
+    )
+
+    # ── Tr[ρ_A^n] y gradiente ──
+    n_chunks, chunk = _chunk_sizes(M, chunk_size)
+    T, grad_T = _trace_value_and_grad(
+        vstate._apply_fun, vstate.parameters, vstate.model_state,
+        _to_chunks(c_diag, n_chunks, chunk),
+        _to_chunks(c_off, n_chunks, chunk),
+        log_P[: n_chunks * chunk].reshape(n_chunks, chunk),
+    )
+    S_n, grad_S = _finalize(T, grad_T, n)
+
+    if debug:
+        w = jnp.exp(_log_omega_det(vstate, c_diag, c_off) - log_P)
+        _debug_report("renyi_n Wang", T, S_n, grad_S, w)
+
+    return float(S_n), grad_S
