@@ -575,7 +575,7 @@ for ns in NS_BUDGET_LIST:
     for rep in range(NS_N_REP):
         t0 = time.perf_counter()
         S2, g = renyi2_wang_cs(
-            vstate, vstate_R, partition, n_samples=ns, key=rep,
+            vstate, vstate_R, partition, n_samples=ns, key=rep, chunk_size=chunk_wang,
         )
         t_list.append(time.perf_counter() - t0)
         s2_list.append(float(S2))

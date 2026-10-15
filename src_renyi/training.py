@@ -515,7 +515,7 @@ def free_energy_minimize_phases(
         if vstate_R is None:
             raise RuntimeError("has_wang=True pero vstate_R es None al final")
         S2_best, _ = renyi2_wang_cs(
-            vstate, vstate_R, partition, n_samples_full
+            vstate, vstate_R, partition, n_samples_full, chunk_size=chunk_size
         )
         print(f"[final S₂] Wang CS = {S2_best:.4f}")
     else:

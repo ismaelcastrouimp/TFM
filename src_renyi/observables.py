@@ -175,7 +175,7 @@ def expect_and_grad_free_renyi(vstate, op, chunk_size, **kwargs):
         E_stats, grad_E = _energy_and_grad_chunked(vstate, op, op.chunk_size)
         wang_kwargs = {**op.wang_kwargs, "key": op.wang_seed + op._wang_step}
         S2, grad_S2 = renyi2_wang_cs(
-            vstate, op.vstate_R, op.partition, **wang_kwargs
+            vstate, op.vstate_R, op.partition, chunk_size=chunk_size, **wang_kwargs
         )
         op._wang_step += 1
 
