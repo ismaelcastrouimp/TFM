@@ -44,16 +44,16 @@ idx = args.idx
 
 
 # ── CONFIGURACIÓN ──────────────────────────────────────────────────────────────
-N, N_A = 10, 10
+N, N_A = 50, 50
 J_ZZ, J_XX, h_x, h_z = -1.0, 0.0, -1.5, 0.0
 
-N_SAMPLES       = 2**14
-N_STEPS_SWAP    = 400
-N_STEPS_WANG    = 400
-INIT_N_STEPS    = 3000
+N_SAMPLES       = 2**17
+N_STEPS_SWAP    = 200
+N_STEPS_WANG    = 3000
+INIT_N_STEPS    = 1000
 INIT_BATCH      = N_SAMPLES
-WARM_EVERY      = 5
-WARM_N_STEPS    = 20
+WARM_EVERY      = 30
+WARM_N_STEPS    = 15
 WARM_BATCH      = N_SAMPLES
 
 chunk_size = N_SAMPLES // 2
@@ -62,13 +62,13 @@ phases = [
     {
         "method": "swap",
         "n_steps": N_STEPS_SWAP,
-        "optimizer": optax.sgd(optax.linear_schedule(0.05, 0.005, 2000)),
+        "optimizer": optax.adam(optax.linear_schedule(0.05, 0.005, N_STEPS_SWAP)),
     },
     {
         "method": "wang", "n_steps": N_STEPS_WANG,
-        "optimizer": optax.adam(1e-3),
+        "optimizer": optax.sign_sgd(optax.linear_schedule(3e-3, 3e-4, N_STEPS_WANG)),
         "vstate_R": None,
-        "initial_train": {"n_steps": INIT_N_STEPS, "batch": INIT_BATCH, "lr": 1e-3},
+        "initial_train": {"n_steps": INIT_N_STEPS, "batch": INIT_BATCH, "lr": 3e-3},
         "warm_start":    {"every": WARM_EVERY, "n_steps": WARM_N_STEPS,
                           "lr": 5e-4, "batch": WARM_BATCH},
         "wang_kwargs":   {"n_samples": N_SAMPLES},
@@ -219,7 +219,7 @@ print(f"[swap] cos = {cos_swap_mean:.4f} ± {cos_swap_std:.4f}")
 grads_wang = []
 for rep in range(N_REP_COSINE):
     _, grad_est = renyi2_wang_cs(
-        vstate, vstate_R, partition, N_SAMPLES, key=rep
+        vstate, vstate_R, partition, N_SAMPLES, key=rep, chunk_size=chunk_size
     )
     grads_wang.append(grad_est)
 

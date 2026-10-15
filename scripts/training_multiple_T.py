@@ -236,7 +236,7 @@ for T_loop_idx, T in enumerate(tqdm(T_array, desc="Temperaturas")):
     grads_wang = []
     for rep in range(N_REP_COSINE):
         _, grad_est = renyi2_wang_cs(
-            vstate, vstate_R, partition, N_SAMPLES, key=rep
+            vstate, vstate_R, partition, N_SAMPLES, key=rep, chunk_size=chunk_size
         )
         grads_wang.append(grad_est)
 
