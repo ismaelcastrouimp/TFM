@@ -1742,37 +1742,68 @@ def renyi2_wang_cs(vstate, vstate_R, subsystem_sites, n_samples,
 
 def train_reverse_network(vstate, vstate_R, n_steps=500, batch=1024,
                           lr=1e-3, key=0, verbose=True, freq=50,
-                          return_history=False):
+                          return_history=False, refresh_every=1):
     """
     Entrena vstate_R (ARNNDense estándar) para modelar p en orden invertido:
         vstate_R(flip(s))  ≈  vstate(s)
+
+    Optimizado con jax.jit: todo el paso (loss + grad + update) se compila
+    una sola vez. El sampling se refresca cada `refresh_every` pasos para
+    amortizar su coste.
+
+    Parámetros
+    ----------
+    refresh_every : int
+        Cada cuántos pasos se re-muestrea un nuevo batch. 1 = comportamiento
+        original (sample cada paso). 10–50 suele dar la misma calidad con
+        mucho menos coste, porque el objetivo (la distribución p) es
+        estacionario durante el entrenamiento de la red reversa.
 
     Devuelve
     --------
     vstate_R : MCState con parámetros entrenados.
     dkl_history : list[float] (solo si return_history=True)
         Valor de D_KL en cada paso del entrenamiento, longitud n_steps.
+        OJO: es el D_KL del batch vigente, que puede repetirse durante
+        `refresh_every` pasos consecutivos.
     """
     opt = optax.adam(lr)
     opt_state = opt.init(vstate_R.parameters)
 
-    def loss_fn(params_R, s):
-        log_p  = 2.0 * jnp.real(vstate._apply_fun(
-            {"params": vstate.parameters, **vstate.model_state}, s
-        ))
-        log_pR = 2.0 * jnp.real(vstate_R._apply_fun(
-            {"params": params_R, **vstate_R.model_state},
+    # Capturamos como estáticos (no cambian durante el entrenamiento de R)
+    p_params = vstate.parameters
+    p_state  = vstate.model_state
+    apply_p  = vstate._apply_fun
+    apply_R  = vstate_R._apply_fun
+
+    def loss_fn(params_R, state_R, s):
+        log_p  = 2.0 * jnp.real(apply_p({"params": p_params, **p_state}, s))
+        log_pR = 2.0 * jnp.real(apply_R(
+            {"params": params_R, **state_R},
             jnp.flip(s, axis=-1),
         ))
         return jnp.mean(log_p - log_pR)
 
+    @jax.jit
+    def train_step(params_R, state_R, opt_state, s):
+        loss_val, grads = jax.value_and_grad(loss_fn, argnums=0)(
+            params_R, state_R, s
+        )
+        updates, opt_state = opt.update(grads, opt_state, params_R)
+        params_R = optax.apply_updates(params_R, updates)
+        return params_R, opt_state, loss_val
+
     dkl_history = []
+    s = None
     for step in range(n_steps):
-        s = vstate.sample(n_samples=batch).reshape(-1, vstate.hilbert.size)
-        loss_val, grads = jax.value_and_grad(loss_fn)(vstate_R.parameters, s)
+        if s is None or step % refresh_every == 0:
+            s = vstate.sample(n_samples=batch).reshape(
+                -1, vstate.hilbert.size
+            )
+        vstate_R.parameters, opt_state, loss_val = train_step(
+            vstate_R.parameters, vstate_R.model_state, opt_state, s
+        )
         dkl_history.append(float(loss_val))
-        updates, opt_state = opt.update(grads, opt_state, vstate_R.parameters)
-        vstate_R.parameters = optax.apply_updates(vstate_R.parameters, updates)
         if verbose and step % freq == 0:
             print(f"[train N_R] step {step:4d}  D_KL ≈ {float(loss_val):.4f}")
 
