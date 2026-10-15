@@ -17,7 +17,8 @@ from .entropy import (
     renyi2_entropy_sampled,
     renyi2_entropy_exact,
     renyi2_entropy_and_grad_exact,     
-    train_reverse_network,    
+    train_reverse_network,
+    renyi2_wang_cs
 )
 
 def free_energy_minimize(vstate, T, partition, Hamiltonian, n_steps=1000,
@@ -502,13 +503,32 @@ def free_energy_minimize_phases(
 
     # ── restaurar y reevaluar ──
     vstate.parameters = best_params
-    jax.clear_caches()
+    jax.clear_jit_caches() if hasattr(jax, "clear_jit_caches") else jax.clear_caches()
     vstate.chunk_size = chunk_size
     E_best = float(vstate.expect(Hamiltonian).mean.real)
     vstate.chunk_size = None
-    S2_best = renyi2_entropy_sampled(
-        vstate, partition, n_samples_full, chunk_size=chunk_size
-    )
+
+    S2_max = len(partition) * float(np.log(2.0))
+
+    if has_wang:
+        # Recuperar la última vstate_R vista
+        if vstate_R is None:
+            raise RuntimeError("has_wang=True pero vstate_R es None al final")
+        S2_best, _ = renyi2_wang_cs(
+            vstate, vstate_R, partition, n_samples_full
+        )
+        print(f"[final S₂] Wang CS = {S2_best:.4f}")
+    else:
+        S2_best = renyi2_entropy_sampled(
+            vstate, partition, n_samples_full, chunk_size=chunk_size
+        )
+        print(f"[final S₂] swap = {S2_best:.4f}")
+
+    if S2_best > S2_max + 0.05:
+        print(f"⚠ S₂ final ({S2_best:.4f}) > cota física ({S2_max:.4f}). "
+              f"Clipeando a la cota.")
+        S2_best = S2_max
+
     best_F = E_best - T * S2_best
 
     if plot:
