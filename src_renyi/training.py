@@ -371,6 +371,7 @@ def free_energy_minimize_phases(
         op = FreeRenyiEnergyObservable(
             vstate.hilbert, Hamiltonian, partition, T,
             chunk_size=chunk_size,
+            chunk_size_energy=phase.get("chunk_size_energy", None),   # ← NUEVO
             method=method,
             drut_kwargs=drut_kwargs,
             wang_kwargs=wang_kwargs,

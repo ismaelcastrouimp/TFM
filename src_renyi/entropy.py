@@ -1634,16 +1634,23 @@ def _wang_sample_quadruples(key, vstate, vstate_R, n_samples, N_S, N_total):
     return sa1, sb1, sa2, sb2
 
 def renyi2_wang_cs(vstate, vstate_R, subsystem_sites, n_samples,
-                   key=0, debug=False, chunk_size=4096):
+                   key=0, debug=False, chunk_size=None):
     """
     S₂ = -ln Tr[ρ_A²] y su gradiente vía Wang & Davis (2020),
-    incluyendo el truco del Apéndice A.2 (mixture en σ_b²).
+    con el truco del Apéndice A.2 (mixture en σ_b²).
 
-    Añadidos respecto a la versión base:
-      - Se evalúa p(σ_b²|σ_a¹) además de p(σ_b²|σ_a²).
-      - logP usa el log-mixture: log((p_b2_a2 + p_b2_a1)/2).
-      - Estabilidad numérica: exp(log_Omega - logP) en lugar de
-        exp(log_Omega)·exp(-logP).
+
+    Notas de implementación
+    -----------------------
+    - El chunk_size se aplica en un único sitio (cap al principio), y todos
+      los sub-cálculos derivan de él: sampling, logP y loss trabajan con
+      el MISMO valor. Esto evita el bug histórico donde el sampling usaba
+      chunk_s = min(chunk_size, n_samples) pero el loss usaba chunk_size
+      y, si chunk_size > n_samples, n_chunks = 0 y jnp.concatenate([]) petaba.
+    - M puede ser < n_samples si n_samples no es múltiplo de chunk_size.
+      Se descartan las últimas (n_samples % chunk_size) muestras.
+    - No hay gradiente a través del sampling (stop_gradient explícito).
+      El gradiente viene de la pérdida pathwise sobre logP (constante).
     """
     N_total = vstate.hilbert.size
     N_S     = len(subsystem_sites)
@@ -1651,29 +1658,36 @@ def renyi2_wang_cs(vstate, vstate_R, subsystem_sites, n_samples,
     assert list(subsystem_sites) == list(range(N_S)), \
         "Wang CS requiere subsystem_sites = [0, 1, ..., N_S-1]"
 
+    # ── Cap único de chunk_size ────────────────────────────────────────
+    if chunk_size is None:
+        chunk_size = int(n_samples)
+    chunk_size = max(1, min(int(chunk_size), int(n_samples)))
+
+    n_chunks = n_samples // chunk_size
+    if n_chunks == 0:
+        raise ValueError(
+            f"n_samples={n_samples} < chunk_size={chunk_size}: "
+            f"no hay chunks completos."
+        )
+    M = n_chunks * chunk_size  # puede ser < n_samples
+
     local_states = jnp.asarray(vstate.hilbert.local_states)
     A_sites = jnp.arange(N_S)
     B_sites = jnp.arange(N_S, N_total)
 
-    # ── 1. Sampling en chunks ──────────────────────────────────────────
-    # Hacemos el muestreo AR por bloques y concatenamos. Esto reduce
-    # el pico de `_wang_sample_quadruples` (que era otra fuente de OOM).
-    chunk_s = min(chunk_size, n_samples)
-    n_chunks_s = n_samples // chunk_s
-    if n_chunks_s == 0:
-        raise ValueError(f"chunk_size={chunk_size} > n_samples={n_samples}")
-
-    keys = jax.random.split(jax.random.PRNGKey(key), n_chunks_s)
-    sa1, sb1, sa2, sb2 = [], [], [], []
+    # ── 1. Sampling en chunks (todos de tamaño chunk_size) ─────────────
+    keys = jax.random.split(jax.random.PRNGKey(key), n_chunks)
+    sa1_l, sb1_l, sa2_l, sb2_l = [], [], [], []
     for k in keys:
         a1, b1, a2, b2 = _wang_sample_quadruples(
-            k, vstate, vstate_R, chunk_s, N_S, N_total
+            k, vstate, vstate_R, chunk_size, N_S, N_total
         )
-        sa1.append(a1); sb1.append(b1); sa2.append(a2); sb2.append(b2)
-    sa1 = jnp.concatenate(sa1, axis=0)
-    sb1 = jnp.concatenate(sb1, axis=0)
-    sa2 = jnp.concatenate(sa2, axis=0)
-    sb2 = jnp.concatenate(sb2, axis=0)
+        sa1_l.append(a1); sb1_l.append(b1)
+        sa2_l.append(a2); sb2_l.append(b2)
+    sa1 = jnp.concatenate(sa1_l, axis=0)   # (M, N_S)
+    sb1 = jnp.concatenate(sb1_l, axis=0)   # (M, N_B)
+    sa2 = jnp.concatenate(sa2_l, axis=0)
+    sb2 = jnp.concatenate(sb2_l, axis=0)
 
     sa1 = jax.lax.stop_gradient(sa1); sb1 = jax.lax.stop_gradient(sb1)
     sa2 = jax.lax.stop_gradient(sa2); sb2 = jax.lax.stop_gradient(sb2)
@@ -1683,8 +1697,8 @@ def renyi2_wang_cs(vstate, vstate_R, subsystem_sites, n_samples,
     c22 = jnp.concatenate([sa2, sb2], axis=-1)
     c12 = jnp.concatenate([sa1, sb2], axis=-1)
 
-    # ── 2. logP (una sola pasada, también chunkeada) ───────────────────
-    def _logP_chunked(c11_, c21_, c22_, c12_, sa1_, sa2_, sb1_, sb2_):
+    # ── 2. logP (una sola pasada, también por chunks de chunk_size) ────
+    def _logP_chunk(c11_, c21_, c22_, c12_, sa1_, sa2_, sb1_, sb2_):
         cond_fwd_11 = _per_site_log_psi(vstate,   c11_, reverse=False)
         cond_rev_21 = _per_site_log_psi(vstate_R, c21_, reverse=True)
         cond_fwd_22 = _per_site_log_psi(vstate,   c22_, reverse=False)
@@ -1698,26 +1712,22 @@ def renyi2_wang_cs(vstate, vstate_R, subsystem_sites, n_samples,
         log_p_b2_mix = jnp.logaddexp(log_p_b2_a2, log_p_b2_a1) - jnp.log(2.0)
         return log_p_a1 + log_p_b1 + log_pR_a2 + log_p_b2_mix
 
-    n_chunks = n_samples // chunk_size
-    chunk = chunk_size
-    M = n_chunks * chunk
-
     def _reshape(x):
-        return x[:M].reshape(n_chunks, chunk, *x.shape[1:])
+        return x.reshape(n_chunks, chunk_size, *x.shape[1:])
 
     c11_c = _reshape(c11); c21_c = _reshape(c21)
     c22_c = _reshape(c22); c12_c = _reshape(c12)
     sa1_c = _reshape(sa1); sb1_c = _reshape(sb1)
     sa2_c = _reshape(sa2); sb2_c = _reshape(sb2)
 
-    logP_full = jnp.concatenate([
-        _logP_chunked(c11_c[i], c21_c[i], c22_c[i], c12_c[i],
-                      sa1_c[i], sa2_c[i], sb1_c[i], sb2_c[i])
+    logP_chunks = jnp.stack([
+        _logP_chunk(c11_c[i], c21_c[i], c22_c[i], c12_c[i],
+                    sa1_c[i], sa2_c[i], sb1_c[i], sb2_c[i])
         for i in range(n_chunks)
-    ])
-    logP = jax.lax.stop_gradient(logP_full)
+    ])                                        # (n_chunks, chunk_size)
+    logP = jax.lax.stop_gradient(logP_chunks)
 
-    # ── 3. Loss con chunking, diferenciable ────────────────────────────
+    # ── 3. Loss con chunks, diferenciable ──────────────────────────────
     def loss_fn(params):
         def lpsi(s):
             return vstate._apply_fun(
@@ -1733,14 +1743,52 @@ def renyi2_wang_cs(vstate, vstate_R, subsystem_sites, n_samples,
 
         total = jnp.sum(jax.lax.map(
             chunk_loss,
-            (c11_c, c21_c, c22_c, c12_c, logP.reshape(n_chunks, chunk)),
+            (c11_c, c21_c, c22_c, c12_c, logP),
         ))
         return total / M
 
     Tr_rho2, grad = jax.value_and_grad(loss_fn)(vstate.parameters)
     S2 = -jnp.log(jnp.abs(Tr_rho2))
+
     Tr_sg = jax.lax.stop_gradient(Tr_rho2)
     grad_S2 = jax.tree_util.tree_map(lambda g: -g / Tr_sg, grad)
+
+    # ── 4. Diagnóstico opcional ────────────────────────────────────────
+    if debug:
+        def lpsi_det(s):
+            return vstate._apply_fun(
+                {"params": vstate.parameters, **vstate.model_state}, s
+            )
+
+        def chunk_stats(args):
+            a, b, c, d, lp = args
+            lp11 = lpsi_det(a); lp21 = lpsi_det(b)
+            lp22 = lpsi_det(c); lp12 = lpsi_det(d)
+            log_Omega = lp11 + jnp.conj(lp21) + lp22 + jnp.conj(lp12)
+            w = jnp.real(jnp.exp(log_Omega - lp))
+            return jnp.sum(w), jnp.sum(w * w), jnp.sum(w * jnp.log(w + 1e-30))
+
+        stats = jax.lax.map(
+            chunk_stats,
+            (c11_c, c21_c, c22_c, c12_c, logP),
+        )                                     # (n_chunks, 3)
+        w_sum   = jnp.sum(stats[:, 0])
+        w2_sum  = jnp.sum(stats[:, 1])
+        wlw_sum = jnp.sum(stats[:, 2])
+
+        ess_ratio = float(w_sum ** 2 / (w2_sum + 1e-30)) / M
+        kl_naive  = float(wlw_sum / (w_sum + 1e-30) - jnp.log(w_sum / M + 1e-30))
+
+        gf, _ = jax.flatten_util.ravel_pytree(grad_S2)
+        print(f"[wang] M              = {M}  (n_samples={n_samples}, "
+              f"chunk_size={chunk_size}, n_chunks={n_chunks})")
+        print(f"[wang] Tr[ρ_A²]       = {float(Tr_rho2):.6e}")
+        print(f"[wang] S₂             = {float(S2):.6f}")
+        print(f"[wang] ESS/M          = {ess_ratio:.4f}  "
+              f"({ess_ratio * M:.0f}/{M})")
+        print(f"[wang] D_KL-ish(Ω||P) = {kl_naive:.4f} nats")
+        print(f"[wang] |∇S₂|          = {float(jnp.linalg.norm(gf)):.6f}")
+
     return float(S2), grad_S2
 
 def train_reverse_network(vstate, vstate_R, n_steps=500, batch=1024,

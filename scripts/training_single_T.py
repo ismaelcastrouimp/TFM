@@ -63,6 +63,7 @@ phases = [
         "method": "swap",
         "n_steps": N_STEPS_SWAP,
         "optimizer": optax.adam(optax.linear_schedule(0.05, 0.005, N_STEPS_SWAP)),
+        "chunk_size_energy": 4096,
     },
     {
         "method": "wang", "n_steps": N_STEPS_WANG,
@@ -70,8 +71,9 @@ phases = [
         "vstate_R": None,
         "initial_train": {"n_steps": INIT_N_STEPS, "batch": INIT_BATCH, "lr": 3e-3},
         "warm_start":    {"every": WARM_EVERY, "n_steps": WARM_N_STEPS,
-                          "lr": 5e-4, "batch": WARM_BATCH},
+                        "lr": 5e-4, "batch": WARM_BATCH},
         "wang_kwargs":   {"n_samples": N_SAMPLES},
+        "chunk_size_energy": 4096,
     },
 ]
 

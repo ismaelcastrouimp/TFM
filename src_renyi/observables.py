@@ -15,15 +15,21 @@ class FreeRenyiEnergyObservable(AbstractObservable):
     Parámetros
     ----------
     chunk_size : int
-        Único punto de control del troceado de batch. Se usa en las tres
-        ramas (swap / drut / wang) tanto para la energía como para S₂.
-        NO se lee `vstate.chunk_size` en ningún sitio: esa variable queda
-        intencionadamente sin usar para evitar el bug `pvary` del path
-        chunked de NetKet.
+        Chunk para la parte de ENTROPÍA (Wang / Drut / swap).
+        NO se usa para la energía.
+    chunk_size_energy : int or None
+        Chunk específico para la energía. Si None, se usa `chunk_size`.
+        Motivo: la energía evaluada en H.get_conn_padded produce un tensor
+        grande (n_samples × nº_conexiones × N_sites). Ese tensor crece
+        mucho más rápido que los de Wang/Drut, así que necesita un chunk
+        más pequeño. Con chunk_size_energy controlas ese pico sin tocar
+        el chunk de la entropía.
+
     method : "swap" | "drut" | "wang"
     """
 
     def __init__(self, hilbert, H, partition, T, chunk_size=128,
+                 chunk_size_energy=None,
                  method="swap", drut_kwargs=None, drut_seed=0,
                  wang_kwargs=None, wang_seed=0, vstate_R=None):
         super().__init__(hilbert)
@@ -32,7 +38,8 @@ class FreeRenyiEnergyObservable(AbstractObservable):
         self.H = H
         self.partition = partition
         self.T = T
-        self.chunk_size = chunk_size
+        self.chunk_size = int(chunk_size)
+        self.chunk_size_energy = int(chunk_size_energy) if chunk_size_energy is not None else self.chunk_size
         self.method = method
         self.drut_kwargs = dict(drut_kwargs or {})
         self.drut_seed = drut_seed
@@ -167,17 +174,29 @@ def _free_renyi_grad_jit(logpsi, params, model_state,
 
 @nk.vqs.expect_and_grad.dispatch
 def expect_and_grad_free_renyi(vstate, op, chunk_size, **kwargs):
+    """
+    `chunk_size` (posicional, viene de NetKet) se IGNORA deliberadamente:
+    la observable manda sobre sus propios chunks vía op.chunk_size y
+    op.chunk_size_energy. Se deja en la firma por compatibilidad con el
+    dispatch de NetKet.
+    """
 
     # ════════════════════════ WANG ════════════════════════
     if op.method == "wang":
         if op.vstate_R is None:
             raise RuntimeError("Wang method requires `vstate_R` in the observable.")
-        E_stats, grad_E = _energy_and_grad_chunked(vstate, op, op.chunk_size)
-        wang_kwargs = {**op.wang_kwargs, "key": op.wang_seed + op._wang_step}
-        wang_kwargs.pop("chunk_size", None)
+
+        # Energía con su propio chunk
+        E_stats, grad_E = _energy_and_grad_chunked(
+            vstate, op, op.chunk_size_energy
+        )
+
+        # Wang con su propio chunk
+        wang_kwargs = {**op.wang_kwargs,
+                       "key": op.wang_seed + op._wang_step,
+                       "chunk_size": op.chunk_size}
         S2, grad_S2 = renyi2_wang_cs(
-            vstate, op.vstate_R, op.partition,
-            chunk_size=op.chunk_size, **wang_kwargs,
+            vstate, op.vstate_R, op.partition, **wang_kwargs
         )
         op._wang_step += 1
 
@@ -190,7 +209,9 @@ def expect_and_grad_free_renyi(vstate, op, chunk_size, **kwargs):
 
     # ════════════════════════ DRUT ════════════════════════
     if op.method == "drut":
-        E_stats, grad_E = _energy_and_grad_chunked(vstate, op, op.chunk_size)
+        E_stats, grad_E = _energy_and_grad_chunked(
+            vstate, op, op.chunk_size_energy
+        )
         drut_kwargs = {**op.drut_kwargs, "key": op.drut_seed + op._drut_step}
         S2, grad_S2 = renyi2_drut_sampling(
             vstate, op.partition, **drut_kwargs
@@ -220,27 +241,30 @@ def expect_and_grad_free_renyi(vstate, op, chunk_size, **kwargs):
         [samples1[:, subsystem_sites], samples2[:, complement_sites]], axis=1
     )
 
-    # chunk_size: única fuente es op.chunk_size
-    cs = min(op.chunk_size, n)
-    n_chunks = n // cs
+    # Energía con chunk_size_energy; S₂ (swap) con chunk_size
+    cs_E = min(op.chunk_size_energy, n)
+    n_chunks_E = n // cs_E
 
     def compute_E_loc_chunk(samples1_chunk):
         sigma_p_chunk, mels_chunk = op.H.get_conn_padded(samples1_chunk)
         return _compute_E_loc_jit(
             vstate._apply_fun, vstate.parameters, vstate.model_state,
-            samples1_chunk, sigma_p_chunk, mels_chunk, chunk_size=cs,
+            samples1_chunk, sigma_p_chunk, mels_chunk, chunk_size=cs_E,
         )
 
     E_loc = jnp.concatenate([
-        compute_E_loc_chunk(samples1[i*cs:(i+1)*cs])
-        for i in range(n_chunks)
+        compute_E_loc_chunk(samples1[i*cs_E:(i+1)*cs_E])
+        for i in range(n_chunks_E)
     ])
     E_loc_sg = jax.lax.stop_gradient(E_loc)
 
+    cs_S = min(op.chunk_size, n)
     E_mean, S2, grad_F = _free_renyi_grad_jit(
         vstate._apply_fun, vstate.parameters, vstate.model_state,
-        samples1, samples2, E_loc_sg,
-        swapped1, swapped2, op.T, cs,
+        samples1[:n_chunks_E*cs_E], samples2[:n_chunks_E*cs_E],
+        E_loc_sg,
+        swapped1[:n_chunks_E*cs_E], swapped2[:n_chunks_E*cs_E],
+        op.T, cs_S,
     )
 
     F = float(E_mean) - op.T * float(S2)

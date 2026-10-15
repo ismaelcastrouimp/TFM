@@ -131,11 +131,10 @@ def find_max_chunk_size(probe_fn, chunk_min=CHUNK_MIN, chunk_max=CHUNK_MAX,
         except Exception as e:
             if is_oom(e):
                 print(f"  ✗ {label}chunk_size = {cs}  → OOM, usar {best}")
-                break
             else:
                 print(f"  ✗ {label}chunk_size = {cs}  → error no-OOM: "
                       f"{type(e).__name__}: {e}")
-                raise
+            break
     return best
 
 
@@ -300,12 +299,12 @@ for i in range(N):
     H_extended += GAMMA * sigmax(hi, i)
     H_extended += V * sigmaz(hi, i) @ sigmaz(hi, (i + 1) % N)
 
-model   = nk.models.ARNNDense(hilbert=hi, layers=1, features=16,
+model   = nk.models.ARNNDense(hilbert=hi, layers=2, features=24,
                               activation=jax.nn.gelu)
 vstate  = nk.vqs.MCState(nk.sampler.ARDirectSampler(hi), model,
                          n_samples=N_SAMPLES)
 
-model_R   = nk.models.ARNNDense(hilbert=hi, layers=1, features=16,
+model_R   = nk.models.ARNNDense(hilbert=hi, layers=2, features=24,
                                 activation=jax.nn.gelu)
 vstate_R  = nk.vqs.MCState(nk.sampler.ARDirectSampler(hi), model_R,
                            n_samples=N_SAMPLES)
@@ -422,22 +421,47 @@ vstate.parameters = params_bak
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1b. chunk_size óptimo (wang)
+# 1b. chunk_size óptimo (wang) — ENERGÍA y ENTROPÍA por separado
 # ══════════════════════════════════════════════════════════════════════════════
-print("\n── 1b. chunk_size óptimo (wang) ─────────────────────────────")
+print("\n── 1b.1. chunk_size óptimo (wang · ENERGÍA) ─────────────────")
 print("    (con vstate_R virgen — solo medimos coste computacional)")
 
-def probe_wang(cs):
+# Wang · S₂ con un chunk fijo y grande (no lo probamos aquí)
+CHUNK_WANG_S_FIXED = min(N_SAMPLES // 2, 8192)
+
+def probe_wang_energy(cs):
     op = FreeRenyiEnergyObservable(
-        hi, H_extended, partition, T, chunk_size=cs, method="wang",
+        hi, H_extended, partition, T,
+        chunk_size=CHUNK_WANG_S_FIXED,
+        chunk_size_energy=cs,                    # ← barremos este
+        method="wang",
         vstate_R=vstate_R, wang_kwargs=WANG_KWARGS_DIAG,
     )
     _ = vstate.expect_and_grad(op)
 
-chunk_wang = find_max_chunk_size(probe_wang, label="[wang] ")
+chunk_wang_energy = find_max_chunk_size(probe_wang_energy, label="[wang·E] ")
+if chunk_wang_energy is None:
+    chunk_wang_energy = 1024
+    print(f"  ⚠ ningún chunk_size válido para la energía de Wang; "
+          f"usando {chunk_wang_energy}")
+
+
+print("\n── 1b.2. chunk_size óptimo (wang · ENTROPÍA) ────────────────")
+
+def probe_wang_S(cs):
+    op = FreeRenyiEnergyObservable(
+        hi, H_extended, partition, T,
+        chunk_size=cs,                           # ← barremos este
+        chunk_size_energy=chunk_wang_energy,     # ← fijamos el de energía
+        method="wang",
+        vstate_R=vstate_R, wang_kwargs=WANG_KWARGS_DIAG,
+    )
+    _ = vstate.expect_and_grad(op)
+
+chunk_wang = find_max_chunk_size(probe_wang_S, label="[wang·S] ")
 if chunk_wang is None:
     chunk_wang = chunk_swap
-    print(f"  ⚠ ningún chunk_size válido para wang; usando {chunk_wang}")
+    print(f"  ⚠ ningún chunk_size válido para Wang; usando {chunk_wang}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -446,7 +470,10 @@ if chunk_wang is None:
 print("\n── 2b. Tiempo por step (wang) ───────────────────────────────")
 
 op_wang = FreeRenyiEnergyObservable(
-    hi, H_extended, partition, T, chunk_size=chunk_wang, method="wang",
+    hi, H_extended, partition, T,
+    chunk_size=chunk_wang,
+    chunk_size_energy=chunk_wang_energy,
+    method="wang",
     vstate_R=vstate_R, wang_kwargs=WANG_KWARGS_DIAG,
 )
 opt2 = optax.adam(LR_WANG)
@@ -512,7 +539,7 @@ best_dkl = float("inf")
 
 for lr in DKL_LRS:
     print(f"\n    lr = {lr:.1e}")
-    model_R_dkl = nk.models.ARNNDense(hilbert=hi, layers=1, features=16,
+    model_R_dkl = nk.models.ARNNDense(hilbert=hi, layers=2, features=24,
                                       activation=jax.nn.gelu)
     vstate_R_dkl = nk.vqs.MCState(nk.sampler.ARDirectSampler(hi), model_R_dkl,
                                   n_samples=N_SAMPLES)
@@ -546,7 +573,7 @@ suggested_init_n_steps = int(dkl_curves[best_lr]["plateau_step"] * 1.2)
 
 print(f"\n  Reentrenando vstate_R final con lr={best_lr:.1e} "
       f"durante {suggested_init_n_steps} steps ...")
-model_R_final = nk.models.ARNNDense(hilbert=hi, layers=1, features=16,
+model_R_final = nk.models.ARNNDense(hilbert=hi, layers=2, features=24,
                                     activation=jax.nn.gelu)
 vstate_R_final = nk.vqs.MCState(nk.sampler.ARDirectSampler(hi), model_R_final,
                                 n_samples=N_SAMPLES)
@@ -627,6 +654,7 @@ print("\n── 6a. Deriva de DKL sin warm-start (Wang) ────────
 op_wang_final = FreeRenyiEnergyObservable(
     hi, H_extended, partition, T,
     chunk_size=chunk_wang,
+    chunk_size_energy=chunk_wang_energy,
     method="wang",
     vstate_R=vstate_R,
     wang_kwargs=WANG_KWARGS_DIAG,
@@ -787,8 +815,10 @@ print(f"  warmup swap             : {WARMUP_SWAP_STEPS} steps "
 print()
 print(f"  chunk_size (swap)       : {chunk_swap}  "
       f"(N_SAMPLES/{N_SAMPLES // chunk_swap})")
-print(f"  chunk_size (wang)       : {chunk_wang}  "
+print(f"  chunk_size (wang·S)     : {chunk_wang}  "
       f"(N_SAMPLES/{N_SAMPLES // chunk_wang})")
+print(f"  chunk_size (wang·E)     : {chunk_wang_energy}  "
+      f"(N_SAMPLES/{N_SAMPLES // chunk_wang_energy})")
 print()
 print(f"  t/step (swap)           : {t_swap_mean:.3f}s")
 print(f"  t/step (wang)           : {t_wang_mean:.3f}s")

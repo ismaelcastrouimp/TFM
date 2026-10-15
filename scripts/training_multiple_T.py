@@ -203,6 +203,7 @@ for T_loop_idx, T in enumerate(tqdm(T_array, desc="Temperaturas")):
             "warm_start":    {"every": WARM_EVERY, "n_steps": WARM_N_STEPS,
                               "lr": 5e-4, "batch": WARM_BATCH},
             "wang_kwargs":   {"n_samples": N_SAMPLES},
+            "chunk_size_energy": 4096,
         },
     ]
 
