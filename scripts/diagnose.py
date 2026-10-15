@@ -20,9 +20,9 @@ Devuelve, para una única configuración:
   7.  Contabilidad completa del coste Wang (init + main + warm-starts).
   8.  Memoria del proceso (VmHWM) → --mem sugerido para SLURM.
 
-NOTA: el warmup (2c) sitúa vstate en un punto no aleatorio, pero **no**
-garantiza que esté cerca del mínimo de F(T). Los diagnósticos de 6a/6b
-y las normas de 3a/3b deben interpretarse como cotas superiores.
+DISEÑO ROBUSTO: todas las secciones a partir de la 5 están envueltas en
+try/except. Si una falla (p. ej. OOM en un budget grande), se reporta y
+el script continúa hasta el resumen final.
 
 Uso:
     Editar CONFIGURACIÓN y ejecutar:
@@ -31,6 +31,7 @@ Uso:
 
 import time
 import copy
+import traceback
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -67,6 +68,11 @@ WARMUP_LR_FINAL   = 0.005
 # chunk_size
 CHUNK_MIN = 2**4
 CHUNK_MAX = N_SAMPLES // 2
+
+# Cap duro para chunk_wang: el probe 1b.2 solo ve 1 chunk, pero en
+# producción con n_samples grandes hay múltiples y JAX materializa
+# tensores intermedios más grandes. 8192 está verificado.
+CHUNK_WANG_HARD_CAP = 8192
 
 # tiempos por step
 N_STEPS   = 5
@@ -224,35 +230,43 @@ def print_curve(history, window=100, label="", n_points=10):
         print(f"      step≈{i + window // 2:>5}  DKL≈{h_smooth[i]:.4f}")
 
 
+def section_guard(name):
+    """Decorador simple para envolver bloques en try/except."""
+    class _Guard:
+        def __enter__(self):
+            print(f"\n>>> inicio: {name}")
+            return self
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if exc_type is None:
+                print(f"<<< fin: {name}")
+                return False
+            if is_oom(exc_val):
+                print(f"!!! {name} abortada por OOM: {exc_val}")
+            else:
+                print(f"!!! {name} abortada por "
+                      f"{exc_type.__name__}: {exc_val}")
+            # Imprimir traza corta para diagnóstico
+            tb = "".join(traceback.format_exception(exc_type, exc_val,
+                                                    exc_tb, limit=3))
+            print("    " + tb.replace("\n", "\n    ").rstrip())
+            return True   # swallow exception
+    return _Guard()
+
+
 # ── memoria del proceso y GPU ────────────────────────────────────────────────
 
 def get_process_memory_mb():
-    """
-    Lee /proc/self/status y devuelve un dict con la memoria del proceso.
-
-      VmRSS:  residente AHORA
-      VmHWM:  pico de residente (lo que cuenta contra --mem de SLURM)
-      VmSize: virtual AHORA
-      VmPeak: pico de virtual
-
-    Devuelve el valor en MB (float).
-    """
     keys = ("VmRSS", "VmHWM", "VmSize", "VmPeak")
     info = {k: 0.0 for k in keys}
     with open("/proc/self/status") as f:
         for line in f:
             for k in keys:
                 if line.startswith(k + ":"):
-                    # Formato: "VmRSS:   12345 kB"
                     info[k] = int(line.split()[1]) / 1024.0
     return info
 
 
 def get_gpu_memory_mb():
-    """
-    Devuelve {device_id: (used_MB, limit_MB)} para cada GPU visible.
-    Si no hay GPU o jax no da stats, devuelve {}.
-    """
     out = {}
     for d in jax.local_devices():
         try:
@@ -268,7 +282,6 @@ def get_gpu_memory_mb():
 
 
 def memory_report(label=""):
-    """Imprime un informe de memoria y devuelve el --mem sugerido en GB."""
     mem = get_process_memory_mb()
     gpu = get_gpu_memory_mb()
 
@@ -316,6 +329,34 @@ print(f"Diagnóstico  —  N={N}  N_A={N_A}  n_samples={N_SAMPLES}  T={T}")
 print("=" * 66)
 
 
+# ── estado global para el resumen (defaults por si algo falla) ───────────────
+results_summary = {
+    "chunk_swap":         None,
+    "chunk_wang":         None,
+    "chunk_wang_energy":  None,
+    "t_swap_mean":        None,
+    "t_wang_mean":        None,
+    "clip_swap":          None,
+    "clip_wang":          None,
+    "best_lr":            None,
+    "best_dkl":           None,
+    "suggested_init_n_steps": None,
+    "C_g":                None,
+    "slope":              None,
+    "mean_grad_norm":     None,
+    "n_samples_wang_opt_log2": None,
+    "n_samples_wang_opt": None,
+    "warm_every_rec":     None,
+    "warm_n_steps_rec":   None,
+    "t_init_phase":       None,
+    "t_main_phase":       None,
+    "t_warm_phase":       None,
+    "t_total":            None,
+    "frac_net":           None,
+    "F_warmup_last":      None,
+}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 1a. chunk_size óptimo (swap)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -329,7 +370,9 @@ def probe_swap(cs):
 
 chunk_swap = find_max_chunk_size(probe_swap, label="[swap] ")
 if chunk_swap is None:
-    raise RuntimeError("Ningún chunk_size funciona para swap.")
+    chunk_swap = 1024
+    print(f"  ⚠ ningún chunk_size válido para swap; usando {chunk_swap}")
+results_summary["chunk_swap"] = chunk_swap
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -354,10 +397,12 @@ for step in range(N_STEPS):
     if step != 0:
         times.append(time.perf_counter() - t0)
 
-t_swap_mean, t_swap_std = float(np.mean(times)), float(np.std(times))
+t_swap_mean = float(np.mean(times)) if times else float("nan")
+t_swap_std  = float(np.std(times))  if times else float("nan")
 print(f"  t/step = {t_swap_mean:.3f}s ± {t_swap_std:.3f}s")
 print(f"  500 steps ~ {500 * t_swap_mean / 60:.1f} min")
 vstate.parameters = params_bak
+results_summary["t_swap_mean"] = t_swap_mean
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -382,6 +427,7 @@ for step in range(WARMUP_SWAP_STEPS):
 jax.effects_barrier()
 
 print(f"  F tras warmup = {F_warmup_last:.4f}")
+results_summary["F_warmup_last"] = F_warmup_last
 
 # Re-capturamos params_bak en el estado warmed-up
 params_bak = copy.deepcopy(vstate.parameters)
@@ -418,6 +464,7 @@ print(f"  max    : {mx_s:.4f}  (max/median = {spread_s:.1f})")
 print(f"  → clip_norm = {clip_swap:.4f} "
       f"({'p90, cola larga' if spread_s > 5 else 'p95, distribución compacta'})")
 vstate.parameters = params_bak
+results_summary["clip_swap"] = clip_swap
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -426,14 +473,13 @@ vstate.parameters = params_bak
 print("\n── 1b.1. chunk_size óptimo (wang · ENERGÍA) ─────────────────")
 print("    (con vstate_R virgen — solo medimos coste computacional)")
 
-# Wang · S₂ con un chunk fijo y grande (no lo probamos aquí)
-CHUNK_WANG_S_FIXED = min(N_SAMPLES // 2, 8192)
+CHUNK_WANG_S_FIXED = min(N_SAMPLES // 2, CHUNK_WANG_HARD_CAP)
 
 def probe_wang_energy(cs):
     op = FreeRenyiEnergyObservable(
         hi, H_extended, partition, T,
         chunk_size=CHUNK_WANG_S_FIXED,
-        chunk_size_energy=cs,                    # ← barremos este
+        chunk_size_energy=cs,
         method="wang",
         vstate_R=vstate_R, wang_kwargs=WANG_KWARGS_DIAG,
     )
@@ -445,14 +491,19 @@ if chunk_wang_energy is None:
     print(f"  ⚠ ningún chunk_size válido para la energía de Wang; "
           f"usando {chunk_wang_energy}")
 
+# Cap de seguridad para energía
+if chunk_wang_energy > CHUNK_WANG_HARD_CAP:
+    print(f"  ⚠ cap energía: {chunk_wang_energy} → {CHUNK_WANG_HARD_CAP}")
+    chunk_wang_energy = CHUNK_WANG_HARD_CAP
+
 
 print("\n── 1b.2. chunk_size óptimo (wang · ENTROPÍA) ────────────────")
 
 def probe_wang_S(cs):
     op = FreeRenyiEnergyObservable(
         hi, H_extended, partition, T,
-        chunk_size=cs,                           # ← barremos este
-        chunk_size_energy=chunk_wang_energy,     # ← fijamos el de energía
+        chunk_size=cs,
+        chunk_size_energy=chunk_wang_energy,
         method="wang",
         vstate_R=vstate_R, wang_kwargs=WANG_KWARGS_DIAG,
     )
@@ -462,6 +513,15 @@ chunk_wang = find_max_chunk_size(probe_wang_S, label="[wang·S] ")
 if chunk_wang is None:
     chunk_wang = chunk_swap
     print(f"  ⚠ ningún chunk_size válido para Wang; usando {chunk_wang}")
+
+# ── Cap de seguridad: 8192 (verificado con múltiples chunks) ─────────────
+if chunk_wang > CHUNK_WANG_HARD_CAP:
+    print(f"  ⚠ cap de seguridad Wang·S: {chunk_wang} → "
+          f"{CHUNK_WANG_HARD_CAP} (evita OOM con múltiples chunks)")
+    chunk_wang = CHUNK_WANG_HARD_CAP
+
+results_summary["chunk_wang"]        = chunk_wang
+results_summary["chunk_wang_energy"] = chunk_wang_energy
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -489,10 +549,12 @@ for step in range(N_STEPS):
     if step != 0:
         times_w.append(time.perf_counter() - t0)
 
-t_wang_mean, t_wang_std = float(np.mean(times_w)), float(np.std(times_w))
+t_wang_mean = float(np.mean(times_w)) if times_w else float("nan")
+t_wang_std  = float(np.std(times_w))  if times_w else float("nan")
 print(f"  t/step = {t_wang_mean:.3f}s ± {t_wang_std:.3f}s")
 print(f"  500 steps ~ {500 * t_wang_mean / 60:.1f} min")
 vstate.parameters = params_bak
+results_summary["t_wang_mean"] = t_wang_mean
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -525,330 +587,383 @@ print(f"  max    : {mx_w:.4f}  (max/median = {spread_w:.1f})")
 print(f"  → clip_norm = {clip_wang:.4f} "
       f"({'p90, cola larga' if spread_w > 5 else 'p95, distribución compacta'})")
 vstate.parameters = params_bak
+results_summary["clip_wang"] = clip_wang
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. Curva DKL(step) de la red reversa para varios lr
 # ══════════════════════════════════════════════════════════════════════════════
-print("\n── 4. Curva DKL(step) de la red reversa ────────────────────")
-print(f"    lrs: {DKL_LRS}   batch: {DKL_BATCH}   n_steps_max: {DKL_N_STEPS_MAX}")
+with section_guard("4. Barrido de lr red reversa"):
+    print(f"    lrs: {DKL_LRS}   batch: {DKL_BATCH}   "
+          f"n_steps_max: {DKL_N_STEPS_MAX}")
 
-dkl_curves = {}
-best_lr = None
-best_dkl = float("inf")
+    dkl_curves = {}
+    best_lr = None
+    best_dkl = float("inf")
 
-for lr in DKL_LRS:
-    print(f"\n    lr = {lr:.1e}")
-    model_R_dkl = nk.models.ARNNDense(hilbert=hi, layers=2, features=24,
-                                      activation=jax.nn.gelu)
-    vstate_R_dkl = nk.vqs.MCState(nk.sampler.ARDirectSampler(hi), model_R_dkl,
-                                  n_samples=N_SAMPLES)
-
-    t0 = time.time()
-    _, dkl_hist = train_reverse_network(
-        vstate, vstate_R_dkl,
-        n_steps=DKL_N_STEPS_MAX, batch=DKL_BATCH, lr=lr,
-        verbose=False, freq=DKL_PRINT_FREQ,
-        return_history=True,
-    )
-    t_train = time.time() - t0
-
-    plateau_step, plateau_dkl = detect_plateau(dkl_hist)
-    dkl_curves[lr] = {
-        "history":      dkl_hist,
-        "plateau_step": int(plateau_step),
-        "plateau_dkl":  float(plateau_dkl),
-        "t_train":      t_train,
-    }
-    print(f"      DKL(0) = {dkl_hist[0]:.4f}   DKL(final) = {dkl_hist[-1]:.4f}")
-    print(f"      plateau @ step {plateau_step}  "
-          f"(DKL ≈ {plateau_dkl:.4f}, t = {t_train:.1f}s)")
-
-    if plateau_dkl < best_dkl:
-        best_dkl = plateau_dkl
-        best_lr  = lr
-
-print(f"\n  → lr óptimo = {best_lr:.1e}  (DKL_plateau = {best_dkl:.4f})")
-suggested_init_n_steps = int(dkl_curves[best_lr]["plateau_step"] * 1.2)
-
-print(f"\n  Reentrenando vstate_R final con lr={best_lr:.1e} "
-      f"durante {suggested_init_n_steps} steps ...")
-model_R_final = nk.models.ARNNDense(hilbert=hi, layers=2, features=24,
-                                    activation=jax.nn.gelu)
-vstate_R_final = nk.vqs.MCState(nk.sampler.ARDirectSampler(hi), model_R_final,
-                                n_samples=N_SAMPLES)
-vstate_R_final = train_reverse_network(
-    vstate, vstate_R_final,
-    n_steps=suggested_init_n_steps, batch=DKL_BATCH, lr=best_lr,
-    verbose=False,
-)
-dkl_final_trained = compute_kl_local(vstate, vstate_R_final,
-                                     n_samples=DRIFT_DKL_SAMPLES)
-print(f"  DKL(vstate || vstate_R_final) = {dkl_final_trained:.4f}")
-
-vstate_R = vstate_R_final
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 5. Escalado de S2 / ∇S2 con n_samples (Wang)
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n── 5. Escalado de S2 / ∇S2 con n_samples (Wang) ────────────")
-print(f"    budgets: {NS_BUDGET_LIST}   n_rep: {NS_N_REP}")
-
-ns_results = {}
-for ns in NS_BUDGET_LIST:
-    s2_list, grad_norm_list, cos_self_list, t_list = [], [], [], []
-    grads = []
-    for rep in range(NS_N_REP):
-        t0 = time.perf_counter()
-        S2, g = renyi2_wang_cs(
-            vstate, vstate_R, partition, n_samples=ns, key=rep, chunk_size=chunk_wang,
+    for lr in DKL_LRS:
+        print(f"\n    lr = {lr:.1e}")
+        model_R_dkl = nk.models.ARNNDense(hilbert=hi, layers=2, features=24,
+                                          activation=jax.nn.gelu)
+        vstate_R_dkl = nk.vqs.MCState(
+            nk.sampler.ARDirectSampler(hi), model_R_dkl,
+            n_samples=N_SAMPLES,
         )
-        t_list.append(time.perf_counter() - t0)
-        s2_list.append(float(S2))
-        grad_norm_list.append(grad_norm(g))
-        grads.append(g)
 
-    for i_ in range(NS_N_REP):
-        for j_ in range(i_ + 1, NS_N_REP):
-            cos_self_list.append(cosine_similarity(grads[i_], grads[j_]))
+        t0 = time.time()
+        _, dkl_hist = train_reverse_network(
+            vstate, vstate_R_dkl,
+            n_steps=DKL_N_STEPS_MAX, batch=DKL_BATCH, lr=lr,
+            verbose=False, freq=DKL_PRINT_FREQ,
+            return_history=True,
+        )
+        t_train = time.time() - t0
 
-    ns_results[ns] = {
-        "S2":        s2_list,
-        "grad_norm": grad_norm_list,
-        "cos_self":  float(np.mean(cos_self_list)),
-        "time":      float(np.mean(t_list)),
-    }
-    print(f"    n={ns:>8,}  ⟨S₂⟩={np.mean(s2_list):.4f}  "
-          f"std(S₂)={np.std(s2_list):.4f}  "
-          f"⟨||∇S₂||⟩={np.mean(grad_norm_list):.4f}  "
-          f"std(||∇S₂||)={np.std(grad_norm_list):.4f}  "
-          f"cos_self={np.mean(cos_self_list):.3f}  "
-          f"t={np.mean(t_list):.3f}s")
+        plateau_step, plateau_dkl = detect_plateau(dkl_hist)
+        dkl_curves[lr] = {
+            "history":      dkl_hist,
+            "plateau_step": int(plateau_step),
+            "plateau_dkl":  float(plateau_dkl),
+            "t_train":      t_train,
+        }
+        print(f"      DKL(0) = {dkl_hist[0]:.4f}   "
+              f"DKL(final) = {dkl_hist[-1]:.4f}")
+        print(f"      plateau @ step {plateau_step}  "
+              f"(DKL ≈ {plateau_dkl:.4f}, t = {t_train:.1f}s)")
 
-ns_arr  = np.array(sorted(ns_results.keys()), dtype=float)
-std_arr = np.array([np.std(ns_results[int(n)]["grad_norm"]) for n in ns_arr])
-log_n   = np.log(ns_arr)
-log_std = np.log(std_arr)
-slope, intercept = np.polyfit(log_n, log_std, 1)
-C_g = float(np.exp(intercept))
-print(f"\n  Ajuste log-log: slope = {slope:.3f}  (teórico -0.5)")
-print(f"  → C_g ≈ {C_g:.4f}  (std(||∇S₂||) = C_g / √n)")
+        if plateau_dkl < best_dkl:
+            best_dkl = plateau_dkl
+            best_lr  = lr
 
-mean_grad_norm = float(np.mean(ns_results[max(ns_results)]["grad_norm"]))
-n_samples_wang_opt = int(np.ceil((C_g / (NS_EPS_GRAD * mean_grad_norm)) ** 2))
-n_samples_wang_opt = 2 ** int(np.ceil(np.log2(max(n_samples_wang_opt, 1))))
-n_samples_wang_opt_log2 = int(np.round(np.log2(n_samples_wang_opt)))
+    print(f"\n  → lr óptimo = {best_lr:.1e}  (DKL_plateau = {best_dkl:.4f})")
+    suggested_init_n_steps = int(dkl_curves[best_lr]["plateau_step"] * 1.2)
 
-print(f"  ||∇S₂|| característica ≈ {mean_grad_norm:.4f}")
-print(f"  → n_samples_wang_opt = 2**{n_samples_wang_opt_log2} "
-      f"= {n_samples_wang_opt:,}  "
-      f"(para std(||∇S₂||)/||∇S₂|| = {NS_EPS_GRAD:.0%})")
+    print(f"\n  Reentrenando vstate_R final con lr={best_lr:.1e} "
+          f"durante {suggested_init_n_steps} steps ...")
+    model_R_final = nk.models.ARNNDense(hilbert=hi, layers=2, features=24,
+                                        activation=jax.nn.gelu)
+    vstate_R_final = nk.vqs.MCState(
+        nk.sampler.ARDirectSampler(hi), model_R_final,
+        n_samples=N_SAMPLES,
+    )
+    vstate_R_final = train_reverse_network(
+        vstate, vstate_R_final,
+        n_steps=suggested_init_n_steps, batch=DKL_BATCH, lr=best_lr,
+        verbose=False,
+    )
+    dkl_final_trained = compute_kl_local(vstate, vstate_R_final,
+                                         n_samples=DRIFT_DKL_SAMPLES)
+    print(f"  DKL(vstate || vstate_R_final) = {dkl_final_trained:.4f}")
+
+    vstate_R = vstate_R_final
+
+    results_summary["best_lr"]   = best_lr
+    results_summary["best_dkl"]  = best_dkl
+    results_summary["suggested_init_n_steps"] = suggested_init_n_steps
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. Escalado de S2 / ∇S2 con n_samples (Wang) — robusto
+# ══════════════════════════════════════════════════════════════════════════════
+with section_guard("5. Escalado de S2/∇S2 con n_samples"):
+    print(f"    budgets: {NS_BUDGET_LIST}   n_rep: {NS_N_REP}")
+    print(f"    chunk_wang base: {chunk_wang}")
+
+    ns_results = {}
+    for ns in NS_BUDGET_LIST:
+        # chunk adaptativo: al menos 4 chunks, cap al hard cap
+        cs_eff = min(chunk_wang, max(256, ns // 4))
+        cs_eff = 2 ** int(np.floor(np.log2(cs_eff)))
+        cs_eff = max(256, cs_eff)
+
+        print(f"\n    budget n={ns:,}  →  chunk_size efectivo = {cs_eff}")
+
+        s2_list, grad_norm_list, cos_self_list, t_list = [], [], [], []
+        grads = []
+
+        try:
+            for rep in range(NS_N_REP):
+                t0 = time.perf_counter()
+                S2, g = renyi2_wang_cs(
+                    vstate, vstate_R, partition,
+                    n_samples=ns, key=rep, chunk_size=cs_eff,
+                )
+                t_list.append(time.perf_counter() - t0)
+                s2_list.append(float(S2))
+                grad_norm_list.append(grad_norm(g))
+                grads.append(g)
+        except Exception as e:
+            print(f"    ✗ {type(e).__name__} con n={ns}, chunk={cs_eff}. "
+                  f"Saltando este budget.")
+            continue
+
+        for i_ in range(len(grads)):
+            for j_ in range(i_ + 1, len(grads)):
+                cos_self_list.append(cosine_similarity(grads[i_], grads[j_]))
+
+        ns_results[ns] = {
+            "S2":        s2_list,
+            "grad_norm": grad_norm_list,
+            "cos_self":  float(np.mean(cos_self_list)) if cos_self_list else float("nan"),
+            "time":      float(np.mean(t_list)),
+            "chunk":     cs_eff,
+        }
+        print(f"    n={ns:>8,}  ⟨S₂⟩={np.mean(s2_list):.4f}  "
+              f"std(S₂)={np.std(s2_list):.4f}  "
+              f"⟨||∇S₂||⟩={np.mean(grad_norm_list):.4f}  "
+              f"std(||∇S₂||)={np.std(grad_norm_list):.4f}  "
+              f"cos_self={np.mean(cos_self_list):.3f}  "
+              f"t={np.mean(t_list):.3f}s")
+
+    if len(ns_results) >= 2:
+        ns_arr  = np.array(sorted(ns_results.keys()), dtype=float)
+        std_arr = np.array([np.std(ns_results[int(n)]["grad_norm"])
+                            for n in ns_arr])
+        log_n   = np.log(ns_arr)
+        log_std = np.log(std_arr)
+        slope, intercept = np.polyfit(log_n, log_std, 1)
+        C_g = float(np.exp(intercept))
+        print(f"\n  Ajuste log-log: slope = {slope:.3f}  (teórico -0.5)")
+        print(f"  → C_g ≈ {C_g:.4f}  (std(||∇S₂||) = C_g / √n)")
+
+        mean_grad_norm = float(np.mean(
+            ns_results[max(ns_results)]["grad_norm"]
+        ))
+        n_samples_wang_opt = int(np.ceil(
+            (C_g / (NS_EPS_GRAD * mean_grad_norm)) ** 2
+        ))
+        n_samples_wang_opt = 2 ** int(np.ceil(
+            np.log2(max(n_samples_wang_opt, 1))
+        ))
+        n_samples_wang_opt_log2 = int(np.round(np.log2(n_samples_wang_opt)))
+
+        print(f"  ||∇S₂|| característica ≈ {mean_grad_norm:.4f}")
+        print(f"  → n_samples_wang_opt = 2**{n_samples_wang_opt_log2} "
+              f"= {n_samples_wang_opt:,}  "
+              f"(para std(||∇S₂||)/||∇S₂|| = {NS_EPS_GRAD:.0%})")
+
+        results_summary["C_g"]        = C_g
+        results_summary["slope"]      = slope
+        results_summary["mean_grad_norm"] = mean_grad_norm
+        results_summary["n_samples_wang_opt_log2"] = n_samples_wang_opt_log2
+        results_summary["n_samples_wang_opt"]      = n_samples_wang_opt
+    else:
+        print(f"\n  ⚠ solo {len(ns_results)} presupuestos válidos; "
+              f"no se puede ajustar el escalado.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 6. Deriva y recuperación de DKL  (con Wang)
 # ══════════════════════════════════════════════════════════════════════════════
-print("\n── 6a. Deriva de DKL sin warm-start (Wang) ─────────────────")
-
-op_wang_final = FreeRenyiEnergyObservable(
-    hi, H_extended, partition, T,
-    chunk_size=chunk_wang,
-    chunk_size_energy=chunk_wang_energy,
-    method="wang",
-    vstate_R=vstate_R,
-    wang_kwargs=WANG_KWARGS_DIAG,
-)
-
-dkl0 = compute_kl_local(vstate, vstate_R, n_samples=DRIFT_DKL_SAMPLES)
-print(f"  DKL inicial = {dkl0:.4f}   umbral deriva = "
-      f"{DRIFT_DKL_THRESH}× DKL₀ = {DRIFT_DKL_THRESH * dkl0:.4f}")
-
-drift_dkl = [dkl0]
-drift_step_thresh = DRIFT_N_STEPS
-
-opt_drift = optax.adam(LR_DRIFT)
-opt_state_drift = opt_drift.init(vstate.parameters)
-for step in range(DRIFT_N_STEPS):
-    _, F_grad = vstate.expect_and_grad(op_wang_final)
-    updates, opt_state_drift = opt_drift.update(
-        F_grad, opt_state_drift, vstate.parameters
+with section_guard("6a. Deriva DKL"):
+    op_wang_final = FreeRenyiEnergyObservable(
+        hi, H_extended, partition, T,
+        chunk_size=chunk_wang,
+        chunk_size_energy=chunk_wang_energy,
+        method="wang",
+        vstate_R=vstate_R,
+        wang_kwargs=WANG_KWARGS_DIAG,
     )
-    vstate.parameters = optax.apply_updates(vstate.parameters, updates)
-    jax.effects_barrier()
 
-    dkl_now = compute_kl_local(vstate, vstate_R, n_samples=DRIFT_DKL_SAMPLES)
-    drift_dkl.append(dkl_now)
+    dkl0 = compute_kl_local(vstate, vstate_R, n_samples=DRIFT_DKL_SAMPLES)
+    print(f"  DKL inicial = {dkl0:.4f}   umbral deriva = "
+          f"{DRIFT_DKL_THRESH}× DKL₀ = {DRIFT_DKL_THRESH * dkl0:.4f}")
 
-    if dkl_now > DRIFT_DKL_THRESH * dkl0 and drift_step_thresh == DRIFT_N_STEPS:
-        drift_step_thresh = step + 1
-        print(f"  → DKL cruzó {DRIFT_DKL_THRESH}× DKL₀ en step {step+1}  "
-              f"(DKL={dkl_now:.4f})")
+    drift_dkl = [dkl0]
+    drift_step_thresh = DRIFT_N_STEPS
 
-print(f"  DKL final tras {DRIFT_N_STEPS} steps: {drift_dkl[-1]:.4f}  "
-      f"({drift_dkl[-1] / (dkl0 + 1e-10):.2f}× DKL₀)")
+    opt_drift = optax.adam(LR_DRIFT)
+    opt_state_drift = opt_drift.init(vstate.parameters)
+    for step in range(DRIFT_N_STEPS):
+        _, F_grad = vstate.expect_and_grad(op_wang_final)
+        updates, opt_state_drift = opt_drift.update(
+            F_grad, opt_state_drift, vstate.parameters
+        )
+        vstate.parameters = optax.apply_updates(vstate.parameters, updates)
+        jax.effects_barrier()
 
-print_curve(drift_dkl, window=10, label="drift DKL(step)", n_points=10)
+        dkl_now = compute_kl_local(vstate, vstate_R,
+                                   n_samples=DRIFT_DKL_SAMPLES)
+        drift_dkl.append(dkl_now)
 
-if drift_step_thresh == DRIFT_N_STEPS:
-    print(f"  ⚠ no se cruzó el umbral en {DRIFT_N_STEPS} steps. "
-          f"Recomendación provisional WARM_EVERY = {DRIFT_N_STEPS}")
-    warm_every_rec = DRIFT_N_STEPS
-else:
-    warm_every_rec = max(1, int(drift_step_thresh * 0.5))
-    print(f"  → WARM_EVERY sugerido = {warm_every_rec}  "
-          f"(mitad del tiempo a deriva)")
+        if (dkl_now > DRIFT_DKL_THRESH * dkl0
+                and drift_step_thresh == DRIFT_N_STEPS):
+            drift_step_thresh = step + 1
+            print(f"  → DKL cruzó {DRIFT_DKL_THRESH}× DKL₀ en step "
+                  f"{step+1}  (DKL={dkl_now:.4f})")
 
-vstate.parameters = params_bak
+    print(f"  DKL final tras {DRIFT_N_STEPS} steps: {drift_dkl[-1]:.4f}  "
+          f"({drift_dkl[-1] / (dkl0 + 1e-10):.2f}× DKL₀)")
+
+    print_curve(drift_dkl, window=10, label="drift DKL(step)", n_points=10)
+
+    if drift_step_thresh == DRIFT_N_STEPS:
+        print(f"  ⚠ no se cruzó el umbral en {DRIFT_N_STEPS} steps. "
+              f"Recomendación provisional WARM_EVERY = {DRIFT_N_STEPS}")
+        warm_every_rec = DRIFT_N_STEPS
+    else:
+        warm_every_rec = max(1, int(drift_step_thresh * 0.5))
+        print(f"  → WARM_EVERY sugerido = {warm_every_rec}  "
+              f"(mitad del tiempo a deriva)")
+
+    vstate.parameters = params_bak
+    results_summary["warm_every_rec"] = warm_every_rec
 
 
-print("\n── 6b. Recuperación de DKL con warm-start ──────────────────")
+with section_guard("6b. Recuperación DKL"):
+    print(f"  Simulando deriva ({warm_every_rec} steps de Wang) ...")
+    opt_drift2 = optax.adam(LR_DRIFT)
+    opt_state_drift2 = opt_drift2.init(vstate.parameters)
+    for _ in range(warm_every_rec):
+        _, F_grad = vstate.expect_and_grad(op_wang_final)
+        updates, opt_state_drift2 = opt_drift2.update(
+            F_grad, opt_state_drift2, vstate.parameters
+        )
+        vstate.parameters = optax.apply_updates(vstate.parameters, updates)
+        jax.effects_barrier()
 
-print(f"  Simulando deriva ({warm_every_rec} steps de Wang) ...")
-opt_drift2 = optax.adam(LR_DRIFT)
-opt_state_drift2 = opt_drift2.init(vstate.parameters)
-for _ in range(warm_every_rec):
-    _, F_grad = vstate.expect_and_grad(op_wang_final)
-    updates, opt_state_drift2 = opt_drift2.update(
-        F_grad, opt_state_drift2, vstate.parameters
+    dkl_drifted = compute_kl_local(vstate, vstate_R,
+                                   n_samples=RECOVER_DKL_SAMPLES)
+    print(f"  DKL tras deriva = {dkl_drifted:.4f}")
+
+    params_R_bak = copy.deepcopy(vstate_R.parameters)
+    vstate_R_recover = copy.deepcopy(vstate_R)
+    vstate_R_recover, dkl_recover_hist = train_reverse_network(
+        vstate, vstate_R_recover,
+        n_steps=RECOVER_N_STEPS_MAX, batch=DRIFT_DKL_SAMPLES, lr=best_lr,
+        verbose=False, return_history=True,
     )
-    vstate.parameters = optax.apply_updates(vstate.parameters, updates)
-    jax.effects_barrier()
 
-dkl_drifted = compute_kl_local(vstate, vstate_R, n_samples=RECOVER_DKL_SAMPLES)
-print(f"  DKL tras deriva = {dkl_drifted:.4f}")
+    if RECOVER_PRINT_CURVE:
+        print_curve(dkl_recover_hist, window=10, label="recover DKL(step)",
+                    n_points=10)
 
-params_R_bak = copy.deepcopy(vstate_R.parameters)
-vstate_R_recover = copy.deepcopy(vstate_R)
-vstate_R_recover, dkl_recover_hist = train_reverse_network(
-    vstate, vstate_R_recover,
-    n_steps=RECOVER_N_STEPS_MAX, batch=DRIFT_DKL_SAMPLES, lr=best_lr,
-    verbose=False, return_history=True,
-)
+    dkl_target = RECOVER_TOL * dkl0
+    recover_step = RECOVER_N_STEPS_MAX
+    for k, dkl_val in enumerate(dkl_recover_hist):
+        if dkl_val <= dkl_target:
+            recover_step = k + 1
+            break
 
-if RECOVER_PRINT_CURVE:
-    print_curve(dkl_recover_hist, window=10, label="recover DKL(step)",
-                n_points=10)
+    print(f"  Objetivo (≤ {RECOVER_TOL}× DKL₀) = {dkl_target:.4f}")
+    if recover_step == RECOVER_N_STEPS_MAX:
+        print(f"  ⚠ no se recuperó en {RECOVER_N_STEPS_MAX} steps. "
+              f"WARM_N_STEPS = {RECOVER_N_STEPS_MAX} (provisional)")
+        warm_n_steps_rec = RECOVER_N_STEPS_MAX
+    else:
+        warm_n_steps_rec = int(recover_step * 1.2)
+        print(f"  → recuperado en step {recover_step}. "
+              f"WARM_N_STEPS sugerido = {warm_n_steps_rec}")
 
-dkl_target = RECOVER_TOL * dkl0
-recover_step = RECOVER_N_STEPS_MAX
-for k, dkl_val in enumerate(dkl_recover_hist):
-    if dkl_val <= dkl_target:
-        recover_step = k + 1
-        break
-
-print(f"  Objetivo (≤ {RECOVER_TOL}× DKL₀) = {dkl_target:.4f}")
-if recover_step == RECOVER_N_STEPS_MAX:
-    print(f"  ⚠ no se recuperó en {RECOVER_N_STEPS_MAX} steps. "
-          f"WARM_N_STEPS = {RECOVER_N_STEPS_MAX} (provisional)")
-    warm_n_steps_rec = RECOVER_N_STEPS_MAX
-else:
-    warm_n_steps_rec = int(recover_step * 1.2)
-    print(f"  → recuperado en step {recover_step}. "
-          f"WARM_N_STEPS sugerido = {warm_n_steps_rec}")
-
-vstate_R.parameters = params_R_bak
-vstate.parameters = params_bak
+    vstate_R.parameters = params_R_bak
+    vstate.parameters = params_bak
+    results_summary["warm_n_steps_rec"] = warm_n_steps_rec
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 7. Contabilidad del coste Wang
 # ══════════════════════════════════════════════════════════════════════════════
-print("\n── 7. Contabilidad del coste Wang ──────────────────────────")
+with section_guard("7. Contabilidad coste Wang"):
+    print(f"  Midiendo t_rev_step con batch={INIT_BATCH_HINT} ...")
+    t_rev_init = measure_rev_step_time(vstate, vstate_R, INIT_BATCH_HINT,
+                                       n_measure=2)
+    print(f"    t_rev_step({INIT_BATCH_HINT}) = {t_rev_init*1000:.1f} ms")
 
-print(f"  Midiendo t_rev_step con batch={INIT_BATCH_HINT} ...")
-t_rev_init = measure_rev_step_time(vstate, vstate_R, INIT_BATCH_HINT,
-                                   n_measure=2)
-print(f"    t_rev_step({INIT_BATCH_HINT}) = {t_rev_init*1000:.1f} ms")
+    print(f"  Midiendo t_rev_step con batch={WARM_BATCH_HINT} ...")
+    t_rev_warm = measure_rev_step_time(vstate, vstate_R, WARM_BATCH_HINT,
+                                       n_measure=2)
+    print(f"    t_rev_step({WARM_BATCH_HINT}) = {t_rev_warm*1000:.1f} ms")
 
-print(f"  Midiendo t_rev_step con batch={WARM_BATCH_HINT} ...")
-t_rev_warm = measure_rev_step_time(vstate, vstate_R, WARM_BATCH_HINT,
-                                   n_measure=2)
-print(f"    t_rev_step({WARM_BATCH_HINT}) = {t_rev_warm*1000:.1f} ms")
+    N_WANG = WANG_N_STEPS_HINT
+    t_init_phase  = (results_summary["suggested_init_n_steps"] or 0) * t_rev_init
+    t_main_phase  = N_WANG * t_wang_mean
+    t_warm_per_it = (results_summary["warm_n_steps_rec"] or 0) * t_rev_warm
+    we = results_summary["warm_every_rec"] or N_WANG
+    n_warm_events = N_WANG // max(1, we)
+    t_warm_phase  = n_warm_events * t_warm_per_it
 
-N_WANG = WANG_N_STEPS_HINT
-t_init_phase  = suggested_init_n_steps * t_rev_init
-t_main_phase  = N_WANG * t_wang_mean
-t_warm_per_it = warm_n_steps_rec * t_rev_warm
-n_warm_events = N_WANG // max(1, warm_every_rec)
-t_warm_phase  = n_warm_events * t_warm_per_it
+    t_total = t_init_phase + t_main_phase + t_warm_phase
+    frac_net = t_main_phase / t_total if t_total > 0 else 0.0
 
-t_total = t_init_phase + t_main_phase + t_warm_phase
-frac_net = t_main_phase / t_total if t_total > 0 else 0.0
+    print(f"\n  Estimación para {N_WANG} pasos Wang:")
+    print(f"    t_init_train  = {t_init_phase:>8.1f}s")
+    print(f"    t_main_wang   = {t_main_phase:>8.1f}s")
+    print(f"    t_warm_starts = {t_warm_phase:>8.1f}s")
+    print(f"    ────────────────────────────────────────")
+    print(f"    t_total       = {t_total:>8.1f}s")
+    print(f"    fracción 'neta' (main / total) = {frac_net:.2%}")
 
-print(f"\n  Estimación para {N_WANG} pasos Wang:")
-print(f"    t_init_train  = {t_init_phase:>8.1f}s  "
-      f"({suggested_init_n_steps} steps × {t_rev_init*1000:.1f}ms)")
-print(f"    t_main_wang   = {t_main_phase:>8.1f}s  "
-      f"({N_WANG} steps × {t_wang_mean*1000:.1f}ms)")
-print(f"    t_warm_starts = {t_warm_phase:>8.1f}s  "
-      f"({n_warm_events} eventos × {warm_n_steps_rec} steps × "
-      f"{t_rev_warm*1000:.1f}ms)")
-print(f"    ────────────────────────────────────────")
-print(f"    t_total       = {t_total:>8.1f}s")
-print(f"    fracción 'neta' (main / total) = {frac_net:.2%}")
+    results_summary["t_init_phase"] = t_init_phase
+    results_summary["t_main_phase"] = t_main_phase
+    results_summary["t_warm_phase"] = t_warm_phase
+    results_summary["t_total"]      = t_total
+    results_summary["frac_net"]     = frac_net
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 8. Memoria del proceso (VmHWM → --mem sugerido para SLURM)
 # ══════════════════════════════════════════════════════════════════════════════
-print("\n── 8. Memoria del proceso ──────────────────────────────────")
-
-# Forzamos algunas operaciones pesadas para que VmHWM capture un pico realista
-_ = vstate.expect(H_extended)
-_ = vstate.expect_and_grad(op_wang_final)
-_ = measure_rev_step_time(vstate, vstate_R, INIT_BATCH_HINT, n_measure=1)
-
-suggested_mem_gb = memory_report(label="tras ops pesadas")
+suggested_mem_gb = None
+with section_guard("8. Memoria del proceso"):
+    _ = vstate.expect(H_extended)
+    _ = vstate.expect_and_grad(op_wang_final)
+    _ = measure_rev_step_time(vstate, vstate_R, INIT_BATCH_HINT, n_measure=1)
+    suggested_mem_gb = memory_report(label="tras ops pesadas")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 9. RESUMEN
 # ══════════════════════════════════════════════════════════════════════════════
+def _fmt(x, fmt=".4f", default="—"):
+    if x is None:
+        return default
+    try:
+        return format(float(x), fmt)
+    except Exception:
+        return str(x)
+
+
 print("\n" + "=" * 66)
 print("RESUMEN")
 print("=" * 66)
 print(f"  N, N_A                  : {N}, {N_A}")
 print(f"  n_samples (vstate)      : {N_SAMPLES}")
 print(f"  warmup swap             : {WARMUP_SWAP_STEPS} steps "
-      f"(F_final = {F_warmup_last:.4f})")
+      f"(F_final = {_fmt(results_summary['F_warmup_last'])})")
 print()
-print(f"  chunk_size (swap)       : {chunk_swap}  "
-      f"(N_SAMPLES/{N_SAMPLES // chunk_swap})")
-print(f"  chunk_size (wang·S)     : {chunk_wang}  "
-      f"(N_SAMPLES/{N_SAMPLES // chunk_wang})")
-print(f"  chunk_size (wang·E)     : {chunk_wang_energy}  "
-      f"(N_SAMPLES/{N_SAMPLES // chunk_wang_energy})")
+print(f"  chunk_size (swap)       : {results_summary['chunk_swap']}")
+print(f"  chunk_size (wang·S)     : {results_summary['chunk_wang']}")
+print(f"  chunk_size (wang·E)     : {results_summary['chunk_wang_energy']}")
 print()
-print(f"  t/step (swap)           : {t_swap_mean:.3f}s")
-print(f"  t/step (wang)           : {t_wang_mean:.3f}s")
+print(f"  t/step (swap)           : {_fmt(results_summary['t_swap_mean'], '.3f')}s")
+print(f"  t/step (wang)           : {_fmt(results_summary['t_wang_mean'], '.3f')}s")
 print()
-print(f"  clip_norm (swap)        : {clip_swap:.4f}")
-print(f"  clip_norm (wang)        : {clip_wang:.4f}")
+print(f"  clip_norm (swap)        : {_fmt(results_summary['clip_swap'])}")
+print(f"  clip_norm (wang)        : {_fmt(results_summary['clip_wang'])}")
 print()
 print(f"  Red reversa:")
-print(f"    lr óptimo             : {best_lr:.1e}")
-print(f"    INIT_N_STEPS          : {suggested_init_n_steps}  "
-      f"(plateau detectado en {dkl_curves[best_lr]['plateau_step']})")
-print(f"    DKL(plateau)          : {best_dkl:.4f}")
+print(f"    lr óptimo             : {results_summary['best_lr']}")
+print(f"    INIT_N_STEPS          : {results_summary['suggested_init_n_steps']}")
+print(f"    DKL(plateau)          : {_fmt(results_summary['best_dkl'])}")
 print()
 print(f"  Wang – escalado:")
-print(f"    C_g                   : {C_g:.4f}  "
-      f"(std(||∇S₂||) = C_g / √n, slope={slope:.3f})")
-print(f"    ||∇S₂|| típico       : {mean_grad_norm:.4f}")
-print(f"    n_samples_wang_opt    : 2**{n_samples_wang_opt_log2} "
-      f"= {n_samples_wang_opt:,}  (ε={NS_EPS_GRAD:.0%})")
+print(f"    C_g                   : {_fmt(results_summary['C_g'])}  "
+      f"(slope={_fmt(results_summary['slope'], '.3f')})")
+print(f"    ||∇S₂|| típico       : {_fmt(results_summary['mean_grad_norm'])}")
+print(f"    n_samples_wang_opt    : "
+      f"2**{results_summary['n_samples_wang_opt_log2']} "
+      f"= {results_summary['n_samples_wang_opt']}")
 print()
 print(f"  Warm-start (drift medido con Wang):")
-print(f"    WARM_EVERY sugerido   : {warm_every_rec}")
-print(f"    WARM_N_STEPS sugerido : {warm_n_steps_rec}")
+print(f"    WARM_EVERY sugerido   : {results_summary['warm_every_rec']}")
+print(f"    WARM_N_STEPS sugerido : {results_summary['warm_n_steps_rec']}")
 print()
-print(f"  Coste Wang ({N_WANG} steps):")
-print(f"    init_train            : {t_init_phase:.1f}s")
-print(f"    main                  : {t_main_phase:.1f}s")
-print(f"    warm-starts           : {t_warm_phase:.1f}s")
-print(f"    total                 : {t_total:.1f}s  "
-      f"(neto: {frac_net:.1%})")
+print(f"  Coste Wang:")
+print(f"    init_train            : {_fmt(results_summary['t_init_phase'], '.1f')}s")
+print(f"    main                  : {_fmt(results_summary['t_main_phase'], '.1f')}s")
+print(f"    warm-starts           : {_fmt(results_summary['t_warm_phase'], '.1f')}s")
+print(f"    total                 : {_fmt(results_summary['t_total'], '.1f')}s  "
+      f"(neto: {_fmt(results_summary['frac_net'], '.1%')})")
 print()
-print(f"  --mem sugerido          : {suggested_mem_gb} GB  (3 × VmHWM)")
+print(f"  --mem sugerido          : {suggested_mem_gb} GB (3 × VmHWM)")
 print("=" * 66)
