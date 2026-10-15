@@ -1739,8 +1739,8 @@ def renyi2_wang_cs(vstate, vstate_R, subsystem_sites, n_samples,
 
     Tr_rho2, grad = jax.value_and_grad(loss_fn)(vstate.parameters)
     S2 = -jnp.log(jnp.abs(Tr_rho2))
-    grad_S2 = jax.tree_util.tree_map(lambda g: -g / Tr_rho2, grad)
-    ...
+    Tr_sg = jax.lax.stop_gradient(Tr_rho2)
+    grad_S2 = jax.tree_util.tree_map(lambda g: -g / Tr_sg, grad)
     return float(S2), grad_S2
 
 def train_reverse_network(vstate, vstate_R, n_steps=500, batch=1024,
