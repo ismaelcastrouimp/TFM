@@ -50,7 +50,7 @@ from src_renyi.entropy import (
 # ══════════════════════════════════════════════════════════════════════════════
 N         = 50
 N_A       = 50
-N_SAMPLES = 2**15
+N_SAMPLES = 2**17
 GAMMA     = -1.5
 V         = -1.0
 T         = 2
@@ -68,11 +68,6 @@ WARMUP_LR_FINAL   = 0.005
 # chunk_size
 CHUNK_MIN = 2**4
 CHUNK_MAX = N_SAMPLES // 2
-
-# Cap duro para chunk_wang: el probe 1b.2 solo ve 1 chunk, pero en
-# producción con n_samples grandes hay múltiples y JAX materializa
-# tensores intermedios más grandes. 8192 está verificado.
-CHUNK_WANG_HARD_CAP = 8192
 
 # tiempos por step
 N_STEPS   = 5
@@ -245,7 +240,6 @@ def section_guard(name):
             else:
                 print(f"!!! {name} abortada por "
                       f"{exc_type.__name__}: {exc_val}")
-            # Imprimir traza corta para diagnóstico
             tb = "".join(traceback.format_exception(exc_type, exc_val,
                                                     exc_tb, limit=3))
             print("    " + tb.replace("\n", "\n    ").rstrip())
@@ -473,7 +467,7 @@ results_summary["clip_swap"] = clip_swap
 print("\n── 1b.1. chunk_size óptimo (wang · ENERGÍA) ─────────────────")
 print("    (con vstate_R virgen — solo medimos coste computacional)")
 
-CHUNK_WANG_S_FIXED = min(N_SAMPLES // 2, CHUNK_WANG_HARD_CAP)
+CHUNK_WANG_S_FIXED = N_SAMPLES // 2
 
 def probe_wang_energy(cs):
     op = FreeRenyiEnergyObservable(
@@ -490,11 +484,6 @@ if chunk_wang_energy is None:
     chunk_wang_energy = 1024
     print(f"  ⚠ ningún chunk_size válido para la energía de Wang; "
           f"usando {chunk_wang_energy}")
-
-# Cap de seguridad para energía
-if chunk_wang_energy > CHUNK_WANG_HARD_CAP:
-    print(f"  ⚠ cap energía: {chunk_wang_energy} → {CHUNK_WANG_HARD_CAP}")
-    chunk_wang_energy = CHUNK_WANG_HARD_CAP
 
 
 print("\n── 1b.2. chunk_size óptimo (wang · ENTROPÍA) ────────────────")
@@ -513,12 +502,6 @@ chunk_wang = find_max_chunk_size(probe_wang_S, label="[wang·S] ")
 if chunk_wang is None:
     chunk_wang = chunk_swap
     print(f"  ⚠ ningún chunk_size válido para Wang; usando {chunk_wang}")
-
-# ── Cap de seguridad: 8192 (verificado con múltiples chunks) ─────────────
-if chunk_wang > CHUNK_WANG_HARD_CAP:
-    print(f"  ⚠ cap de seguridad Wang·S: {chunk_wang} → "
-          f"{CHUNK_WANG_HARD_CAP} (evita OOM con múltiples chunks)")
-    chunk_wang = CHUNK_WANG_HARD_CAP
 
 results_summary["chunk_wang"]        = chunk_wang
 results_summary["chunk_wang_energy"] = chunk_wang_energy
@@ -671,7 +654,7 @@ with section_guard("5. Escalado de S2/∇S2 con n_samples"):
 
     ns_results = {}
     for ns in NS_BUDGET_LIST:
-        # chunk adaptativo: al menos 4 chunks, cap al hard cap
+        # chunk adaptativo: al menos 4 chunks, pero nunca mayor que chunk_wang
         cs_eff = min(chunk_wang, max(256, ns // 4))
         cs_eff = 2 ** int(np.floor(np.log2(cs_eff)))
         cs_eff = max(256, cs_eff)
