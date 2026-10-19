@@ -35,6 +35,23 @@ def vstate_to_vector(vstate):
     return psi / norm, all_configs
 
 
+def _resolve_chunk(n_samples, chunk_size):
+    """
+    Resuelve (n_chunks, chunk_size) de forma que n_chunks * chunk_size <= n_samples.
+
+    Evita los fallos de `reshape` cuando n_samples no es múltiplo de
+    chunk_size, y el caso degenerado chunk_size > n_samples (n_chunks = 0).
+    """
+    chunk_size = max(1, min(int(chunk_size), int(n_samples)))
+    n_chunks = n_samples // chunk_size
+    if n_chunks == 0:
+        raise ValueError(
+            f"n_samples={n_samples} < chunk_size={chunk_size}: "
+            f"no hay chunks completos."
+        )
+    return n_chunks, chunk_size
+
+
 # ── Rényi-2, n exacto ─────────────────────────────────────────────────────────
 
 def renyi2_entropy_exact(vstate, subsystem_sites):
@@ -233,6 +250,11 @@ def renyin_entropy_and_grad_exact(vstate, subsystem_sites, n,
 def _renyi2_forward_jit(apply_fun, params, model_state,
                          samples1, samples2, swapped1, swapped2,
                          chunk_size=128):
+    """
+    S₂ por swap trick. Asume que `samples1.shape[0]` es múltiplo de
+    `chunk_size`. El caller (`renyi2_entropy_sampled`) garantiza esto
+    truncando el batch con `_resolve_chunk`.
+    """
     def log_psi(s):
         return apply_fun({"params": params, **model_state}, s)
 
@@ -274,6 +296,14 @@ def renyi2_entropy_sampled(vstate, subsystem_sites, n_samples, key=0, chunk_size
     swapped1 = jnp.concatenate([samples2[:, subsystem_sites], samples1[:, complement_sites]], axis=1)
     swapped2 = jnp.concatenate([samples1[:, subsystem_sites], samples2[:, complement_sites]], axis=1)
 
+    # ── Truncar a múltiplo de chunk_size (evita fallos de reshape) ────
+    n_chunks, chunk_size = _resolve_chunk(n_samples, chunk_size)
+    n_used = n_chunks * chunk_size
+    samples1  = samples1[:n_used]
+    samples2  = samples2[:n_used]
+    swapped1  = swapped1[:n_used]
+    swapped2  = swapped2[:n_used]
+
     S2 = _renyi2_forward_jit(
         vstate._apply_fun, vstate.parameters, vstate.model_state,
         samples1, samples2, swapped1, swapped2,
@@ -289,6 +319,11 @@ def renyi2_entropy_sampled(vstate, subsystem_sites, n_samples, key=0, chunk_size
 def _renyi2_loss_and_grad(apply_fun, params, model_state,
                           samples1, samples2, swapped1, swapped2,
                           chunk_size=256):
+    """
+    S₂ y su gradiente por swap trick. Asume que `samples1.shape[0]` es
+    múltiplo de `chunk_size`. El caller
+    (`renyi2_entropy_and_grad_sampled`) garantiza esto truncando el batch.
+    """
     def log_psi(p, s):
         return apply_fun({"params": p, **model_state}, s)
 
@@ -377,6 +412,14 @@ def renyi2_entropy_and_grad_sampled(vstate, subsystem_sites, n_samples, key=0, d
     complement_sites = jnp.setdiff1d(all_sites, subsystem_sites)
     swapped1 = jnp.concatenate([samples2[:, subsystem_sites], samples1[:, complement_sites]], axis=1)
     swapped2 = jnp.concatenate([samples1[:, subsystem_sites], samples2[:, complement_sites]], axis=1)
+
+    # ── Truncar a múltiplo de chunk_size (evita fallos de reshape) ────
+    n_chunks, chunk_size = _resolve_chunk(n_samples, chunk_size)
+    n_used = n_chunks * chunk_size
+    samples1  = samples1[:n_used]
+    samples2  = samples2[:n_used]
+    swapped1  = swapped1[:n_used]
+    swapped2  = swapped2[:n_used]
 
     S2, grad_S2 = _renyi2_loss_and_grad(
         vstate._apply_fun, vstate.parameters, vstate.model_state,
@@ -976,14 +1019,8 @@ def _sweep_single_chain_with_samples_cached(key, s1, s2, A, B,
 
     # Extraer muestras: los últimos n_checkpoints checkpoints,
     # espaciados por sample_every sweeps
-    # s1_traj tiene shape (n_sweeps, N)
-    # Índices: los últimos n_checkpoints * sample_every sweeps,
-    # tomando el último de cada bloque de sample_every
     n_checkpoints = n_sweeps // sample_every
-    # Tomamos los índices: n_sweeps-1, n_sweeps-1-sample_every, ...
     idx = n_sweeps - 1 - sample_every * jnp.arange(n_checkpoints)
-    # idx va de n_sweeps-1 hacia atrás, dando los últimos checkpoints
-    # Pero queremos orden temporal ascendente para claridad:
     idx = jnp.sort(idx)
 
     s1_samples = s1_traj[idx]  # (n_checkpoints, N)
@@ -1033,7 +1070,6 @@ def _renyi2_drut_jit2(apply_fun, params, model_state,
                 nc=n_ch, np_=n_cp, tot=n_ch * n_cp,
             )
 
-        # Aplastar (n_chains, n_checkpoints) → (n_chains * n_checkpoints)
         n_ch, n_cp, N_ = s1_smp.shape
         s1_flat = s1_smp.reshape(n_ch * n_cp, N_)
         s2_flat = s2_smp.reshape(n_ch * n_cp, N_)
@@ -1043,12 +1079,10 @@ def _renyi2_drut_jit2(apply_fun, params, model_state,
     (_, _, _), (s1_stack, s2_stack) = jax.lax.scan(
         scan_lam, (s1_init, s2_init, key), lambda_grid
     )
-    # s1_stack: (n_lambda, n_chains * n_checkpoints, N)
 
     lnR_stack = jax.vmap(
         lambda a, b: _lnR_batch(apply_fun, params, model_state, a, b, A, B)
     )(s1_stack, s2_stack)
-    # lnR_stack: (n_lambda, n_chains * n_checkpoints)
 
     f_vals = jnp.mean(lnR_stack, axis=1)  # (n_lambda,)
 
@@ -1090,7 +1124,6 @@ def renyi2_drut_sampling2(vstate, subsystem_sites, n_chains=256,
         spin_min, spin_max, debug, K
     )
 
-    # ← Mismos pesos que en el kernel
     _, gl_weights = _gauss_legendre_01(n_lambda)
 
     grad_loss = jax.grad(lambda p: _drut_loss(
@@ -1157,7 +1190,6 @@ def _renyi2_drut_jit_direct(apply_fun, params, model_state,
         scan_lam, (s1_init, s2_init, key), lambda_grid
     )
 
-    # ── S₂: integración completa Gauss-Legendre (necesita todos los λ) ──
     lnR_stack = jax.vmap(
         lambda a, b: _lnR_batch(apply_fun, params, model_state, a, b, A, B)
     )(s1_stack, s2_stack)
@@ -1166,19 +1198,8 @@ def _renyi2_drut_jit_direct(apply_fun, params, model_state,
     S2_max = A.shape[0] * jnp.log(2.0)
     S2 = jnp.minimum(S2, S2_max)
 
-    # ── Solo las muestras del último λ (≈ q₁) ──
     s1_final = s1_stack[-1]
     s2_final = s2_stack[-1]
-
-    # ── Short MCMC extra a λ=1 exacto (opcional pero elimina sesgo residual) ──
-    # n_extra = n_sweeps_per_lam
-    # keys_extra = jax.random.split(key, s1_final.shape[0])
-    # s1_final, s2_final, _ = sweep_batch_fast(
-    #     keys_extra, s1_final, s2_final, A, B,
-    #     apply_fun, params, model_state,
-    #     1.0,                                # ← lam, POSICIONAL
-    #     n_extra * n_props_per_sweep,        # ← n_props, POSICIONAL
-    # )
 
     return S2, s1_final, s2_final
 
@@ -1195,7 +1216,6 @@ def _drut_direct_loss(apply_fun, params, model_state, s1_final, s2_final, A, B):
     def lpsi(s):
         return jnp.real(apply_fun({"params": params, **model_state}, s))
 
-    # Swaps para el último λ
     sw1 = jnp.concatenate([s2_final[:, A], s1_final[:, B]], axis=1)
     sw2 = jnp.concatenate([s1_final[:, A], s2_final[:, B]], axis=1)
 
@@ -1204,7 +1224,6 @@ def _drut_direct_loss(apply_fun, params, model_state, s1_final, s2_final, A, B):
     lsw1 = jax.vmap(lpsi)(sw1)
     lsw2 = jax.vmap(lpsi)(sw2)
 
-    # E_{q₁}[log ρ]  (salvo constante -2 log Z, irrelevante para ∇)
     return jnp.mean(lp1 + lp2 + lsw1 + lsw2)
 
 def renyi2_drut_sampling_direct(vstate, subsystem_sites, n_chains=256,
@@ -1219,8 +1238,6 @@ def renyi2_drut_sampling_direct(vstate, subsystem_sites, n_chains=256,
 
     Referencia teórica:
         ∇S₂ = -E_{q₁}[∇ log ρ],  q₁ ∝ p·p·R = ρ/Γ
-
-    Idéntica signatura que renyi2_drut_sampling, para sustituirla directamente.
     """
     N_sites = vstate.hilbert.size
     A = jnp.array(subsystem_sites, dtype=int)
@@ -1355,9 +1372,6 @@ def _increment_kernel(apply_fun, params, model_state,
     """
     A_list: lista de arrays [A^0, A^1, ..., A^n], con A^{i+1} = A^i + 1 sitio.
     Devuelve: ratios ⟨R_{A^{i+1}}/R_{A^i}⟩_{q_i}, y los estados finales.
-
-    Nota: el bucle sobre regiones es un `for` Python (no scan), porque
-    las A^i tienen shapes distintas y jax.lax.scan exige formas iguales.
     """
     sweep_batch = _make_sweep_batch_increment(spin_min, spin_max)
 
@@ -1396,8 +1410,8 @@ def _increment_kernel(apply_fun, params, model_state,
         s1_list.append(s1)
         s2_list.append(s2)
 
-    ratios   = jnp.stack(ratios)     # (n_sub,)
-    s1_stack = jnp.stack(s1_list)    # (n_sub, n_chains, N)
+    ratios   = jnp.stack(ratios)
+    s1_stack = jnp.stack(s1_list)
     s2_stack = jnp.stack(s2_list)
 
     return ratios, s1_stack, s2_stack
@@ -1422,7 +1436,6 @@ def _increment_loss(apply_fun, params, model_state, s1_stack, s2_stack, A_list):
         s1, s2 = s1_stack[i], s2_stack[i]
         A_i, A_ip1 = A_list[i], A_list[i + 1]
 
-        # ── Swaps y log-amplitudes ────────────────────────────────────────
         sw1_i   = _swap_A(s1, s2, A_i)
         sw2_i   = _swap_A(s2, s1, A_i)
         sw1_ip1 = _swap_A(s1, s2, A_ip1)
@@ -1438,13 +1451,10 @@ def _increment_loss(apply_fun, params, model_state, s1_stack, s2_stack, A_list):
         log_r = (lsip1 + lsip2) - (lsi1 + lsi2)      # log f_i (per-sample)
         log_q = (lo1 + lo2) + (lsi1 + lsi2)          # log q_i (sin normalizar)
 
-        # ── Término diferenciable: log(mean(f_i)) = log(r_i) ──────────────
         f_i          = jnp.exp(log_r)
-        r_i          = jnp.mean(f_i)                  # diferenciable
+        r_i          = jnp.mean(f_i)
         log_r_mean   = jnp.log(r_i)
 
-        # ── Corrección REINFORCE con baseline ─────────────────────────────
-        # w_i = f_i / r_i. Se usa (w_i - 1) para aprovechar E[∇log q] = 0.
         w_sg     = jax.lax.stop_gradient(f_i / r_i)
         baseline = jax.lax.stop_gradient(jnp.ones_like(w_sg))
         reinforce = jnp.mean((w_sg - baseline) * log_q)
@@ -1459,17 +1469,6 @@ def renyi2_increment_sampling(vstate, subsystem_sites, n_chains,
                               key=0, debug=False):
     """
     Estima S₂(A) con el increment trick de Hastings et al.
-
-    Parámetros
-    ----------
-    vstate              : MCState de NetKet.
-    subsystem_sites     : lista/array con los sitios del subsistema A.
-    n_chains            : número de cadenas Metropolis paralelas.
-    n_sweeps_per_site   : propuestas Metropolis totales por sitio nuevo
-                          (= n_props_per_sweep × n_sweeps_per_site).
-    n_props_per_sweep   : si None, 2*N.
-    key                 : semilla.
-    debug               : imprime diagnóstico por sitio.
 
     Devuelve
     --------
@@ -1491,16 +1490,13 @@ def renyi2_increment_sampling(vstate, subsystem_sites, n_chains,
     spin_min = float(local_states.min())
     spin_max = float(local_states.max())
 
-    # Regiones anidadas: A^i = primeros i sitios del subsistema
     A_list = [A_sites[:i] for i in range(n_sub + 1)]
 
-    # Estado inicial: muestras del vstate (que es q_0 = p⊗p)
     all_init = vstate.sample(n_samples=2 * n_chains).reshape(2 * n_chains, N_sites)
     all_init = jax.random.permutation(jax.random.PRNGKey(key), all_init, axis=0)
     s1_init = all_init[:n_chains]
     s2_init = all_init[n_chains:]
 
-    # ── Núcleo: annealing + ratios ────────────────────────────────────────
     ratios, s1_stack, s2_stack = _increment_kernel(
         vstate._apply_fun, vstate.parameters, vstate.model_state,
         s1_init, s2_init, A_list, n_props,
@@ -1511,7 +1507,6 @@ def renyi2_increment_sampling(vstate, subsystem_sites, n_chains,
     purity = jnp.prod(ratios)
     S2     = -jnp.log(purity)
 
-    # ── Gradiente vía REINFORCE sobre la loss ────────────────────────────
     loss_fn = lambda p: _increment_loss(
         vstate._apply_fun, p, vstate.model_state,
         s1_stack, s2_stack, A_list,
@@ -1528,17 +1523,22 @@ def renyi2_increment_sampling(vstate, subsystem_sites, n_chains,
     return float(S2), grad_S2, ratios, A_list
 
 
-# Wang & Davis (2020) — Conditional sampling para S₂
+# ══════════════════════════════════════════════════════════════════════════════
+# Wang & Davis (2020) — Conditional sampling (con jit interno)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _per_site_log_psi(vstate, s, reverse=False):
     """
-    log ψ(s_i | cond_i) por sitio, en orden ORIGINAL de sitios.
+    [Legacy] log ψ(s_i | cond_i) por sitio, en orden ORIGINAL de sitios.
 
     reverse=False → cond_i = {s_j : j < i}   (forward)
     reverse=True  → cond_i = {s_j : j > i}   (reverse)
 
     El flip es EXPLÍCITO porque NetKet no aplica reorder/inverse_reorder
     dentro de conditionals_log_psi.
+
+    Esta versión se mantiene por compatibilidad. Para código caliente usa
+    `_per_site_log_psi_jit`.
     """
     s_in = jnp.flip(s, axis=-1) if reverse else s
     cond = vstate.model.apply(
@@ -1548,6 +1548,35 @@ def _per_site_log_psi(vstate, s, reverse=False):
     if reverse:
         cond = jnp.flip(cond, axis=-2)
     return cond
+
+
+@partial(jax.jit, static_argnames=("model", "reverse"))
+def _per_site_log_psi_jit(model, params, model_state, s, reverse):
+    """
+    Versión JIT de `_per_site_log_psi`.
+
+    Parámetros
+    ----------
+    model       : flax Module (estático).
+                  Flax implementa __hash__/__eq__ ESTRUCTURALES sobre los
+                  campos del dataclass, así que dos modelos con los mismos
+                  campos (hilbert, layers, features, activation, ...) SÍ
+                  comparten entrada de caché. Requiere que todos los campos
+                  sean hashables (lo son para los ARNN estándar de NetKet).
+    params      : pytree de parámetros (trazado).
+    model_state : pytree (típicamente {}).
+    s           : (B, N) batch de configuraciones (trazado).
+    reverse     : bool (estático) → dos versiones compiladas.
+    """
+    s_in = jnp.flip(s, axis=-1) if reverse else s
+    cond = model.apply(
+        {"params": params, **model_state}, s_in,
+        method="conditionals_log_psi",
+    )
+    if reverse:
+        cond = jnp.flip(cond, axis=-2)
+    return cond
+
 
 def _value_index(s_sel, local_states):
     """Índice en local_states correspondiente a s_sel (robusto al orden)."""
@@ -1563,7 +1592,9 @@ def _log_cond_sum(cond, s_sel, site_indices, local_states):
     ).squeeze(-1)
     return 2.0 * log_psi_sel.sum(axis=-1)
 
+
 def _sample_ar_sites(key, vstate, s_init, sites, reverse=False):
+    """[Legacy] Muestrea los sitios `sites` de una sola configuración."""
     local_states = jnp.asarray(vstate.hilbert.local_states)
     sites_arr = jnp.asarray(sites, dtype=int)
     keys = jax.random.split(key, sites_arr.shape[0])
@@ -1579,11 +1610,52 @@ def _sample_ar_sites(key, vstate, s_init, sites, reverse=False):
     (s_final, _), _ = jax.lax.scan(step, (s_init, None), (keys, sites_arr))
     return s_final
 
+
 def _sample_ar_sites_batch(key, vstate, s_init_batch, sites, reverse=False):
+    """[Legacy] vmap de `_sample_ar_sites` sobre un batch."""
     keys = jax.random.split(key, s_init_batch.shape[0])
     return jax.vmap(lambda k, s: _sample_ar_sites(k, vstate, s, sites, reverse))(
         keys, s_init_batch
     )
+
+
+@partial(jax.jit, static_argnames=("model", "reverse"))
+def _sample_ar_sites_batch_jit(key, model, params, model_state,
+                                s_init_batch, sites, reverse, local_states):
+    """
+    Versión JIT de `_sample_ar_sites_batch`.
+
+    Sustituye `vstate` por (model, params, model_state, local_states) para
+    poder compilar la cadena autoregresiva completa.
+
+    - `model` es estático ⇒ Flax lo hashea ESTRUCTURALMENTE (todos los
+      campos del dataclass deben ser hashables; lo son para ARNN estándar).
+    - `reverse` es estático ⇒ dos versiones compiladas.
+    - `sites` y `local_states` son arrays ⇒ se trazan, pero son pequeños
+      y su forma entra en la cache key (3 shapes típicamente por llamada:
+      A_fwd, B_fwd, A_rev).
+    """
+    keys = jax.random.split(key, s_init_batch.shape[0])
+
+    def single(k, s):
+        keys_sites = jax.random.split(k, sites.shape[0])
+
+        def step(carry, inputs):
+            s, _ = carry
+            k_i, i = inputs
+            cond_i = _per_site_log_psi_jit(
+                model, params, model_state, s[None], reverse
+            )[0, i]
+            choice = jax.random.categorical(k_i, 2.0 * jnp.real(cond_i))
+            return (s.at[i].set(local_states[choice]), None), None
+
+        (s_final, _), _ = jax.lax.scan(
+            step, (s, None), (keys_sites, sites)
+        )
+        return s_final
+
+    return jax.vmap(single)(keys, s_init_batch)
+
 
 def _wang_sample_quadruples(key, vstate, vstate_R, n_samples, N_S, N_total):
     """
@@ -1594,12 +1666,15 @@ def _wang_sample_quadruples(key, vstate, vstate_R, n_samples, N_S, N_total):
         σ_a² ~ p_R(σ_a | σ_b¹)                     [reverse]
         σ_b² ~ ½[p(σ_b | σ_a²) + p(σ_b | σ_a¹)]   [forward, mixture]
 
-    La moneda Bernoulli(0.5) se tira ANTES del muestreo: se elige el
-    condicionante (σ_a² o σ_a¹) per-muestra y se hace una única pasada
-    de AR sobre B. La distribución marginal de σ_b² es idéntica a la de
-    la versión que muestrea ambas y descarta, pero ahorra una pasada
-    completa de red por muestra (2N_S + 2N_B pasos en vez de 2N_S + 3N_B).
+    Usa `_sample_ar_sites_batch_jit` (compilado) internamente.
     """
+    model_v  = vstate.model
+    params_v = vstate.parameters
+    mstate_v = vstate.model_state
+    model_R  = vstate_R.model
+    params_R = vstate_R.parameters
+    mstate_R = vstate_R.model_state
+
     local_states = jnp.asarray(vstate.hilbert.local_states)
     blank = jnp.full((n_samples, N_total), local_states[0],
                      dtype=local_states.dtype)
@@ -1611,27 +1686,36 @@ def _wang_sample_quadruples(key, vstate, vstate_R, n_samples, N_S, N_total):
     k1, k2, k3, k4, k5 = jax.random.split(key, 5)
 
     # σ_a¹ ~ p(σ_a)  — forward
-    sa1_full = _sample_ar_sites_batch(k1, vstate, blank, A_fwd, reverse=False)
+    sa1_full = _sample_ar_sites_batch_jit(
+        k1, model_v, params_v, mstate_v, blank, A_fwd, False, local_states
+    )
     sa1 = sa1_full[:, :N_S]
 
     # σ_b¹ ~ p(σ_b | σ_a¹)  — forward
     s_init = blank.at[:, :N_S].set(sa1)
-    sb1_full = _sample_ar_sites_batch(k2, vstate, s_init, B_fwd, reverse=False)
+    sb1_full = _sample_ar_sites_batch_jit(
+        k2, model_v, params_v, mstate_v, s_init, B_fwd, False, local_states
+    )
     sb1 = sb1_full[:, N_S:]
 
     # σ_a² ~ p_R(σ_a | σ_b¹)  — reverse
     s_init = blank.at[:, N_S:].set(sb1)
-    sa2_full = _sample_ar_sites_batch(k3, vstate_R, s_init, A_rev, reverse=True)
+    sa2_full = _sample_ar_sites_batch_jit(
+        k3, model_R, params_R, mstate_R, s_init, A_rev, True, local_states
+    )
     sa2 = sa2_full[:, :N_S]
 
     # σ_b² ~ mezcla: moneda per-muestra ANTES de muestrear, una sola pasada
     coin = jax.random.bernoulli(k5, 0.5, shape=(n_samples,))
     cond_A = jnp.where(coin[:, None], sa2, sa1)
     s_init = blank.at[:, :N_S].set(cond_A)
-    sb2_full = _sample_ar_sites_batch(k4, vstate, s_init, B_fwd, reverse=False)
+    sb2_full = _sample_ar_sites_batch_jit(
+        k4, model_v, params_v, mstate_v, s_init, B_fwd, False, local_states
+    )
     sb2 = sb2_full[:, N_S:]
 
     return sa1, sb1, sa2, sb2
+
 
 def renyi2_wang_cs(vstate, vstate_R, subsystem_sites, n_samples,
                    key=0, debug=False, chunk_size=None):
@@ -1639,157 +1723,25 @@ def renyi2_wang_cs(vstate, vstate_R, subsystem_sites, n_samples,
     S₂ = -ln Tr[ρ_A²] y su gradiente vía Wang & Davis (2020),
     con el truco del Apéndice A.2 (mixture en σ_b²).
 
+    Implementación
+    --------------
+    Delega en `renyin_wang_cs(..., n=2)`, que:
+      - usa `_wang_sample_chain` con `_sample_ar_sites_batch_jit` (compilado),
+      - evalúa logP con `_per_site_log_psi_jit` (compilado),
+      - calcula Tr y gradiente con `_trace_value_and_grad` (jiteada, cacheada
+        por `apply_fun` estático),
+      - trunca el batch a múltiplo de chunk_size (no falla si no es divisible).
 
-    Notas de implementación
-    -----------------------
-    - El chunk_size se aplica en un único sitio (cap al principio), y todos
-      los sub-cálculos derivan de él: sampling, logP y loss trabajan con
-      el MISMO valor. Esto evita el bug histórico donde el sampling usaba
-      chunk_s = min(chunk_size, n_samples) pero el loss usaba chunk_size
-      y, si chunk_size > n_samples, n_chunks = 0 y jnp.concatenate([]) petaba.
-    - M puede ser < n_samples si n_samples no es múltiplo de chunk_size.
-      Se descartan las últimas (n_samples % chunk_size) muestras.
-    - No hay gradiente a través del sampling (stop_gradient explícito).
-      El gradiente viene de la pérdida pathwise sobre logP (constante).
+    Firma histórica preservada para compatibilidad. El prefijo del debug
+    cambia de "[wang]" a "[renyi_n Wang]", pero los valores son idénticos.
     """
-    N_total = vstate.hilbert.size
-    N_S     = len(subsystem_sites)
+    cs = int(chunk_size) if chunk_size is not None else int(n_samples)
+    return renyin_wang_cs(
+        vstate, vstate_R, subsystem_sites,
+        n=2, n_samples=int(n_samples),
+        key=key, chunk_size=cs, debug=debug,
+    )
 
-    assert list(subsystem_sites) == list(range(N_S)), \
-        "Wang CS requiere subsystem_sites = [0, 1, ..., N_S-1]"
-
-    # ── Cap único de chunk_size ────────────────────────────────────────
-    if chunk_size is None:
-        chunk_size = int(n_samples)
-    chunk_size = max(1, min(int(chunk_size), int(n_samples)))
-
-    n_chunks = n_samples // chunk_size
-    if n_chunks == 0:
-        raise ValueError(
-            f"n_samples={n_samples} < chunk_size={chunk_size}: "
-            f"no hay chunks completos."
-        )
-    M = n_chunks * chunk_size  # puede ser < n_samples
-
-    local_states = jnp.asarray(vstate.hilbert.local_states)
-    A_sites = jnp.arange(N_S)
-    B_sites = jnp.arange(N_S, N_total)
-
-    # ── 1. Sampling en chunks (todos de tamaño chunk_size) ─────────────
-    keys = jax.random.split(jax.random.PRNGKey(key), n_chunks)
-    sa1_l, sb1_l, sa2_l, sb2_l = [], [], [], []
-    for k in keys:
-        a1, b1, a2, b2 = _wang_sample_quadruples(
-            k, vstate, vstate_R, chunk_size, N_S, N_total
-        )
-        sa1_l.append(a1); sb1_l.append(b1)
-        sa2_l.append(a2); sb2_l.append(b2)
-    sa1 = jnp.concatenate(sa1_l, axis=0)   # (M, N_S)
-    sb1 = jnp.concatenate(sb1_l, axis=0)   # (M, N_B)
-    sa2 = jnp.concatenate(sa2_l, axis=0)
-    sb2 = jnp.concatenate(sb2_l, axis=0)
-
-    sa1 = jax.lax.stop_gradient(sa1); sb1 = jax.lax.stop_gradient(sb1)
-    sa2 = jax.lax.stop_gradient(sa2); sb2 = jax.lax.stop_gradient(sb2)
-
-    c11 = jnp.concatenate([sa1, sb1], axis=-1)
-    c21 = jnp.concatenate([sa2, sb1], axis=-1)
-    c22 = jnp.concatenate([sa2, sb2], axis=-1)
-    c12 = jnp.concatenate([sa1, sb2], axis=-1)
-
-    # ── 2. logP (una sola pasada, también por chunks de chunk_size) ────
-    def _logP_chunk(c11_, c21_, c22_, c12_, sa1_, sa2_, sb1_, sb2_):
-        cond_fwd_11 = _per_site_log_psi(vstate,   c11_, reverse=False)
-        cond_rev_21 = _per_site_log_psi(vstate_R, c21_, reverse=True)
-        cond_fwd_22 = _per_site_log_psi(vstate,   c22_, reverse=False)
-        cond_fwd_12 = _per_site_log_psi(vstate,   c12_, reverse=False)
-
-        log_p_a1     = _log_cond_sum(cond_fwd_11, sa1_, A_sites, local_states)
-        log_p_b1     = _log_cond_sum(cond_fwd_11, sb1_, B_sites, local_states)
-        log_pR_a2    = _log_cond_sum(cond_rev_21, sa2_, A_sites, local_states)
-        log_p_b2_a2  = _log_cond_sum(cond_fwd_22, sb2_, B_sites, local_states)
-        log_p_b2_a1  = _log_cond_sum(cond_fwd_12, sb2_, B_sites, local_states)
-        log_p_b2_mix = jnp.logaddexp(log_p_b2_a2, log_p_b2_a1) - jnp.log(2.0)
-        return log_p_a1 + log_p_b1 + log_pR_a2 + log_p_b2_mix
-
-    def _reshape(x):
-        return x.reshape(n_chunks, chunk_size, *x.shape[1:])
-
-    c11_c = _reshape(c11); c21_c = _reshape(c21)
-    c22_c = _reshape(c22); c12_c = _reshape(c12)
-    sa1_c = _reshape(sa1); sb1_c = _reshape(sb1)
-    sa2_c = _reshape(sa2); sb2_c = _reshape(sb2)
-
-    logP_chunks = jnp.stack([
-        _logP_chunk(c11_c[i], c21_c[i], c22_c[i], c12_c[i],
-                    sa1_c[i], sa2_c[i], sb1_c[i], sb2_c[i])
-        for i in range(n_chunks)
-    ])                                        # (n_chunks, chunk_size)
-    logP = jax.lax.stop_gradient(logP_chunks)
-
-    # ── 3. Loss con chunks, diferenciable ──────────────────────────────
-    def loss_fn(params):
-        def lpsi(s):
-            return vstate._apply_fun(
-                {"params": params, **vstate.model_state}, s
-            )
-
-        def chunk_loss(args):
-            a, b, c, d, lp = args
-            lp11 = lpsi(a); lp21 = lpsi(b)
-            lp22 = lpsi(c); lp12 = lpsi(d)
-            log_Omega = lp11 + jnp.conj(lp21) + lp22 + jnp.conj(lp12)
-            return jnp.sum(jnp.real(jnp.exp(log_Omega - lp)))
-
-        total = jnp.sum(jax.lax.map(
-            chunk_loss,
-            (c11_c, c21_c, c22_c, c12_c, logP),
-        ))
-        return total / M
-
-    Tr_rho2, grad = jax.value_and_grad(loss_fn)(vstate.parameters)
-    S2 = -jnp.log(jnp.abs(Tr_rho2))
-
-    Tr_sg = jax.lax.stop_gradient(Tr_rho2)
-    grad_S2 = jax.tree_util.tree_map(lambda g: -g / Tr_sg, grad)
-
-    # ── 4. Diagnóstico opcional ────────────────────────────────────────
-    if debug:
-        def lpsi_det(s):
-            return vstate._apply_fun(
-                {"params": vstate.parameters, **vstate.model_state}, s
-            )
-
-        def chunk_stats(args):
-            a, b, c, d, lp = args
-            lp11 = lpsi_det(a); lp21 = lpsi_det(b)
-            lp22 = lpsi_det(c); lp12 = lpsi_det(d)
-            log_Omega = lp11 + jnp.conj(lp21) + lp22 + jnp.conj(lp12)
-            w = jnp.real(jnp.exp(log_Omega - lp))
-            return jnp.sum(w), jnp.sum(w * w), jnp.sum(w * jnp.log(w + 1e-30))
-
-        stats = jax.lax.map(
-            chunk_stats,
-            (c11_c, c21_c, c22_c, c12_c, logP),
-        )                                     # (n_chunks, 3)
-        w_sum   = jnp.sum(stats[:, 0])
-        w2_sum  = jnp.sum(stats[:, 1])
-        wlw_sum = jnp.sum(stats[:, 2])
-
-        ess_ratio = float(w_sum ** 2 / (w2_sum + 1e-30)) / M
-        kl_naive  = float(wlw_sum / (w_sum + 1e-30) - jnp.log(w_sum / M + 1e-30))
-
-        gf, _ = jax.flatten_util.ravel_pytree(grad_S2)
-        print(f"[wang] M              = {M}  (n_samples={n_samples}, "
-              f"chunk_size={chunk_size}, n_chunks={n_chunks})")
-        print(f"[wang] Tr[ρ_A²]       = {float(Tr_rho2):.6e}")
-        print(f"[wang] S₂             = {float(S2):.6f}")
-        print(f"[wang] ESS/M          = {ess_ratio:.4f}  "
-              f"({ess_ratio * M:.0f}/{M})")
-        print(f"[wang] D_KL-ish(Ω||P) = {kl_naive:.4f} nats")
-        print(f"[wang] |∇S₂|          = {float(jnp.linalg.norm(gf)):.6f}")
-
-    return float(S2), grad_S2
 
 def train_reverse_network(vstate, vstate_R, n_steps=500, batch=1024,
                           lr=1e-3, key=0, verbose=True, freq=50,
@@ -1815,13 +1767,10 @@ def train_reverse_network(vstate, vstate_R, n_steps=500, batch=1024,
     vstate_R : MCState con parámetros entrenados.
     dkl_history : list[float] (solo si return_history=True)
         Valor de D_KL en cada paso del entrenamiento, longitud n_steps.
-        OJO: es el D_KL del batch vigente, que puede repetirse durante
-        `refresh_every` pasos consecutivos.
     """
     opt = optax.adam(lr)
     opt_state = opt.init(vstate_R.parameters)
 
-    # Capturamos como estáticos (no cambian durante el entrenamiento de R)
     p_params = vstate.parameters
     p_state  = vstate.model_state
     apply_p  = vstate._apply_fun
@@ -1909,7 +1858,6 @@ def _trace_value_and_grad(apply_fun, params, model_state, c_diag, c_off, log_P):
     def lpsi(p, s):
         flat = s.reshape(-1, s.shape[-1])
         out = apply_fun({"params": p, **model_state}, flat)
-        # NetKet a veces devuelve (B, 1); aplanamos a (B,) para el reshape
         return jnp.squeeze(out).reshape(s.shape[:-1])
 
     n_chunks, _, chunk, _ = c_diag.shape
@@ -1976,16 +1924,13 @@ def renyin_entropy_and_grad_sampled(vstate, subsystem_sites, n, n_samples,
 
     total = n * n_samples
     all_samples = vstate.sample(n_samples=total).reshape(-1, N)
-    # Permutar para romper correlación entre réplicas contiguas
     all_samples = jax.random.permutation(
         jax.random.PRNGKey(key), all_samples, axis=0
     )[:total]
-    s = all_samples.reshape(n, n_samples, N)                  # s[k] = σ^k
+    s = all_samples.reshape(n, n_samples, N)
 
-    # (σa^{k+1}, σb^k) cíclico
     s_off = jnp.where(mask_A, jnp.roll(s, -1, axis=0), s)
 
-    # ln P = Σ_k ln p(σ^k) = 2 Σ_k Re ln ψ(σ^k)
     lp = vstate.log_value(s.reshape(-1, N)).reshape(n, n_samples)
     log_P = 2.0 * jnp.sum(jnp.real(lp), axis=0)
 
@@ -2016,11 +1961,17 @@ def _wang_sample_chain(key, vstate, vstate_R, n_samples, n, N_S, N_total):
             σa^{k+1} ~ p_R(σa | σb^k)            [reverse]
         σbⁿ ~ ½ [ p(σb | σaⁿ) + p(σb | σa¹) ]   (truco A.2)
 
-    La moneda Bernoulli(0.5) se tira ANTES de muestrear σbⁿ, así que solo
-    hace falta una pasada AR sobre B (no dos).
-
     Devuelve sa (n, M, N_S) con sa[k] = σa^{k+1}, sb (n, M, N_B) análogo.
+
+    Usa `_sample_ar_sites_batch_jit` (compilado) internamente.
     """
+    model_v  = vstate.model
+    params_v = vstate.parameters
+    mstate_v = vstate.model_state
+    model_R  = vstate_R.model
+    params_R = vstate_R.parameters
+    mstate_R = vstate_R.model_state
+
     local_states = jnp.asarray(vstate.hilbert.local_states)
     blank = jnp.full((n_samples, N_total), local_states[0],
                      dtype=local_states.dtype)
@@ -2032,8 +1983,9 @@ def _wang_sample_chain(key, vstate, vstate_R, n_samples, n, N_S, N_total):
     keys = jax.random.split(key, 2 * n + 2)
     sa, sb = [], []
 
-    # σa¹ ~ p(σa)
-    sa.append(_sample_ar_sites_batch(keys[0], vstate, blank, A_fwd)[:, :N_S])
+    sa.append(_sample_ar_sites_batch_jit(
+        keys[0], model_v, params_v, mstate_v, blank, A_fwd, False, local_states
+    )[:, :N_S])
 
     for k in range(n):
         if k < n - 1:
@@ -2044,17 +1996,47 @@ def _wang_sample_chain(key, vstate, vstate_R, n_samples, n, N_S, N_total):
             cond_A = jnp.where(coin[:, None], sa[0], sa[n - 1])
 
         s_init = blank.at[:, :N_S].set(cond_A)
-        sb.append(_sample_ar_sites_batch(
-            keys[1 + 2 * k], vstate, s_init, B_fwd
+        sb.append(_sample_ar_sites_batch_jit(
+            keys[1 + 2 * k], model_v, params_v, mstate_v,
+            s_init, B_fwd, False, local_states
         )[:, N_S:])
 
         if k < n - 1:
             s_init = blank.at[:, N_S:].set(sb[k])
-            sa.append(_sample_ar_sites_batch(
-                keys[2 + 2 * k], vstate_R, s_init, A_rev, reverse=True
+            sa.append(_sample_ar_sites_batch_jit(
+                keys[2 + 2 * k], model_R, params_R, mstate_R,
+                s_init, A_rev, True, local_states
             )[:, :N_S])
 
     return jnp.stack(sa), jnp.stack(sb)
+
+def _wang_sample_chain_chunked(key, vstate, vstate_R, n_samples, n,
+                               N_S, N_total, chunk_size):
+    """
+    Versión troceada de `_wang_sample_chain`.
+
+    Divide el batch de M=n_samples en ceil(M/chunk_size) chunks
+    independientes (claves distintas), ejecuta la cadena en cada uno y
+    concatena a lo largo de la dimensión M.
+
+    El troceo es SOLO en batch — cada cadena k sigue siendo secuencial
+    (σb^k depende de σa^k, σa^{k+1} depende de σb^k, ...).
+
+    Devuelve:
+        sa: (n, M, N_S)
+        sb: (n, M, N_B)
+    """
+    n_chunks, chunk_size = _chunk_sizes(n_samples, chunk_size)
+    keys = jax.random.split(key, n_chunks)
+    sa_list, sb_list = [], []
+    for k in keys:
+        sa_c, sb_c = _wang_sample_chain(k, vstate, vstate_R,
+                                        chunk_size, n, N_S, N_total)
+        sa_list.append(sa_c)
+        sb_list.append(sb_c)
+    return (jnp.concatenate(sa_list, axis=1),
+            jnp.concatenate(sb_list, axis=1))
+
 
 def renyin_wang_cs(vstate, vstate_R, subsystem_sites, n, n_samples,
                    key=0, chunk_size=256, debug=False):
@@ -2062,17 +2044,18 @@ def renyin_wang_cs(vstate, vstate_R, subsystem_sites, n, n_samples,
     S_n y ∇S_n vía conditional sampling (Wang & Davis 2020), orden n >= 2,
     con mezcla en σbⁿ (Apéndice A.2).
 
-    n=2 reproduce (no bit-a-bit) renyi2_wang_cs.
+    n=2 reproduce `renyi2_wang_cs` (que delega aquí).
 
-    Requiere subsystem_sites = [0, ..., N_S-1] (prefijo del orden AR) y
-    vstate_R entrenada con train_reverse_network.
-
-    P_CS = p(σa¹) · Π_{k=1}^{n-1} p(σb^k|σa^k) · Π_{k=1}^{n-1} p_R(σa^{k+1}|σb^k)
-           · ½ [ p(σbⁿ|σaⁿ) + p(σbⁿ|σa¹) ]
-
-    Parámetros
-    ----------
-    n_samples : número de secuencias completas de longitud 2n.
+    TROCEO
+    ------
+    `chunk_size` controla TODOS los sub-cálculos que escalan con M:
+      - el sampling AR (`_wang_sample_chain_chunked`),
+      - la evaluación de logP (`_per_site_log_psi_jit` por chunk),
+      - el Tr[ρ_A^n] y su gradiente (`_trace_value_and_grad`, ya troceado).
+    Si `n_samples` no es múltiplo de `chunk_size`, se descartan las últimas
+    `n_samples % chunk_size` muestras. El troceo es siempre sobre el batch
+    M — las cadenas σa¹→σb¹→σa²→…→σbⁿ son secuenciales en k y no se
+    trocean.
     """
     assert n >= 2, "n debe ser un entero >= 2"
     N_total = vstate.hilbert.size
@@ -2081,61 +2064,98 @@ def renyin_wang_cs(vstate, vstate_R, subsystem_sites, n, n_samples,
         "Wang CS requiere subsystem_sites = [0, 1, ..., N_S-1]"
     )
 
+    # ── Resolver chunks una sola vez (sampling + logP + Tr usan lo mismo)
+    n_chunks, chunk_size = _chunk_sizes(n_samples, chunk_size)
+    M = n_chunks * chunk_size
+
+    # ── Primitivas del modelo, extraídas una sola vez
+    model_v  = vstate.model
+    params_v = vstate.parameters
+    mstate_v = vstate.model_state
+    model_R  = vstate_R.model
+    params_R = vstate_R.parameters
+    mstate_R = vstate_R.model_state
+
     local_states = jnp.asarray(vstate.hilbert.local_states)
     A_sites = jnp.arange(N_S)
     B_sites = jnp.arange(N_S, N_total)
-    M = n_samples
 
-    sa, sb = _wang_sample_chain(jax.random.PRNGKey(key), vstate, vstate_R,
-                                M, n, N_S, N_total)
-    sa = jax.lax.stop_gradient(sa)
-    sb = jax.lax.stop_gradient(sb)
-    sa_next = jnp.roll(sa, -1, axis=0)     # σa^{k+1}, con σa^{n+1} = σa¹
+    # ── 1. Sampling troceado
+    sa, sb = _wang_sample_chain_chunked(
+        jax.random.PRNGKey(key), vstate, vstate_R,
+        M, n, N_S, N_total, chunk_size,
+    )
+    sa = jax.lax.stop_gradient(sa)              # (n, M, N_S)
+    sb = jax.lax.stop_gradient(sb)              # (n, M, N_B)
+    sa_next = jnp.roll(sa, -1, axis=0)          # (σa^{k+1}), con σa^{n+1}=σa¹
 
-    c_diag = jnp.concatenate([sa, sb], axis=-1)          # (σa^k, σb^k)
-    c_off  = jnp.concatenate([sa_next, sb], axis=-1)      # (σa^{k+1}, σb^k)
+    c_diag = jnp.concatenate([sa, sb], axis=-1)     # (n, M, N_total)
+    c_off  = jnp.concatenate([sa_next, sb], axis=-1)
 
-    flat = lambda x: x.reshape(n * M, *x.shape[2:])
+    # ── 2. logP troceado
+    logP_chunks = []
+    for i in range(n_chunks):
+        sl = slice(i * chunk_size, (i + 1) * chunk_size)
+        c_diag_c   = c_diag[:, sl]      # (n, chunk_size, N_total)
+        c_off_c    = c_off[:, sl]
+        sa_c       = sa[:, sl]          # (n, chunk_size, N_S)
+        sb_c       = sb[:, sl]          # (n, chunk_size, N_B)
+        sa_next_c  = sa_next[:, sl]
 
-    # ── ln P_CS ──
-    # Forward en cada c_diag → p(σb^k|σa^k) y p(σa^k|prefix)
-    cond_fwd_diag = _per_site_log_psi(vstate, flat(c_diag), reverse=False)
-    lpA_diag = _log_cond_sum(cond_fwd_diag, flat(sa), A_sites,
-                             local_states).reshape(n, M)
-    lpB_diag = _log_cond_sum(cond_fwd_diag, flat(sb), B_sites,
-                             local_states).reshape(n, M)
+        def flat_c(x, _n=n, _c=chunk_size):
+            return x.reshape(_n * _c, *x.shape[2:])
 
-    # Reverse para k=1..n-1: p_R(σa^{k+1}|σb^k) evaluado en c_off[:-1]
-    c_off_rev = c_off[:-1].reshape((n - 1) * M, N_total)
-    cond_rev = _per_site_log_psi(vstate_R, c_off_rev, reverse=True)
-    lpR_A = _log_cond_sum(cond_rev,
-                          sa_next[:-1].reshape((n - 1) * M, N_S),
-                          A_sites, local_states).reshape(n - 1, M)
+        # Forward en c_diag → p(σb^k|σa^k) y p(σa^k|prefix)
+        cond_fwd_diag = _per_site_log_psi_jit(
+            model_v, params_v, mstate_v, flat_c(c_diag_c), False)
+        lpA_diag_c = _log_cond_sum(
+            cond_fwd_diag, flat_c(sa_c), A_sites, local_states
+        ).reshape(n, chunk_size)
+        lpB_diag_c = _log_cond_sum(
+            cond_fwd_diag, flat_c(sb_c), B_sites, local_states
+        ).reshape(n, chunk_size)
 
-    # Mezcla en σbⁿ: p(σbⁿ|σa¹) se evalúa en c_off[n-1] = (σa¹, σbⁿ)
-    cond_fwd_last = _per_site_log_psi(vstate, c_off[-1], reverse=False)
-    lpB_last_a1 = _log_cond_sum(cond_fwd_last, sb[-1], B_sites, local_states)
-    log_p_b_mix = jnp.logaddexp(lpB_diag[-1], lpB_last_a1) - jnp.log(2.0)
+        # Reverse para k=1..n-1: p_R(σa^{k+1}|σb^k)
+        c_off_rev_c = c_off_c[:-1].reshape(
+            (n - 1) * chunk_size, N_total)
+        cond_rev = _per_site_log_psi_jit(
+            model_R, params_R, mstate_R, c_off_rev_c, True)
+        lpR_A_c = _log_cond_sum(
+            cond_rev,
+            sa_next_c[:-1].reshape((n - 1) * chunk_size, N_S),
+            A_sites, local_states,
+        ).reshape(n - 1, chunk_size)
+
+        # Mezcla en σbⁿ
+        cond_fwd_last = _per_site_log_psi_jit(
+            model_v, params_v, mstate_v, c_off_c[-1], False)
+        lpB_last_a1_c = _log_cond_sum(
+            cond_fwd_last, sb_c[-1], B_sites, local_states)
+        log_p_b_mix_c = jnp.logaddexp(
+            lpB_diag_c[-1], lpB_last_a1_c) - jnp.log(2.0)
+
+        logP_chunks.append(
+            lpA_diag_c[0]
+            + lpB_diag_c[:-1].sum(axis=0)
+            + lpR_A_c.sum(axis=0)
+            + log_p_b_mix_c
+        )
 
     log_P = jax.lax.stop_gradient(
-        lpA_diag[0]
-        + lpB_diag[:-1].sum(axis=0)
-        + lpR_A.sum(axis=0)
-        + log_p_b_mix
+        jnp.stack(logP_chunks, axis=0)          # (n_chunks, chunk_size)
     )
 
-    # ── Tr[ρ_A^n] y gradiente ──
-    n_chunks, chunk = _chunk_sizes(M, chunk_size)
+    # ── 3. Tr[ρ_A^n] y gradiente (ya troceado internamente)
     T, grad_T = _trace_value_and_grad(
         vstate._apply_fun, vstate.parameters, vstate.model_state,
-        _to_chunks(c_diag, n_chunks, chunk),
-        _to_chunks(c_off, n_chunks, chunk),
-        log_P[: n_chunks * chunk].reshape(n_chunks, chunk),
+        _to_chunks(c_diag, n_chunks, chunk_size),
+        _to_chunks(c_off,  n_chunks, chunk_size),
+        log_P,
     )
     S_n, grad_S = _finalize(T, grad_T, n)
 
     if debug:
-        w = jnp.exp(_log_omega_det(vstate, c_diag, c_off) - log_P)
+        w = jnp.exp(_log_omega_det(vstate, c_diag, c_off) - log_P.reshape(-1))
         _debug_report("renyi_n Wang", T, S_n, grad_S, w)
 
     return float(S_n), grad_S
