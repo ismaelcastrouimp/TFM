@@ -2015,12 +2015,12 @@ def _wang_sample_chain_chunked(key, vstate, vstate_R, n_samples, n,
     """
     Versión troceada de `_wang_sample_chain`.
 
-    Divide el batch de M=n_samples en ceil(M/chunk_size) chunks
-    independientes (claves distintas), ejecuta la cadena en cada uno y
-    concatena a lo largo de la dimensión M.
+    Usa `jax.lax.map` (no `for` Python) para que el HLO contenga un
+    while_loop: solo un chunk de activaciones vive en VRAM a la vez,
+    incluso cuando esta función se traza dentro de un jit superior
+    (p.ej. `vstate.expect_and_grad(op)`).
 
-    El troceo es SOLO en batch — cada cadena k sigue siendo secuencial
-    (σb^k depende de σa^k, σa^{k+1} depende de σb^k, ...).
+    El troceo es SOLO en batch — la cadena en k es secuencial.
 
     Devuelve:
         sa: (n, M, N_S)
@@ -2028,14 +2028,21 @@ def _wang_sample_chain_chunked(key, vstate, vstate_R, n_samples, n,
     """
     n_chunks, chunk_size = _chunk_sizes(n_samples, chunk_size)
     keys = jax.random.split(key, n_chunks)
-    sa_list, sb_list = [], []
-    for k in keys:
-        sa_c, sb_c = _wang_sample_chain(k, vstate, vstate_R,
-                                        chunk_size, n, N_S, N_total)
-        sa_list.append(sa_c)
-        sb_list.append(sb_c)
-    return (jnp.concatenate(sa_list, axis=1),
-            jnp.concatenate(sb_list, axis=1))
+
+    def _one(k):
+        return _wang_sample_chain(k, vstate, vstate_R,
+                                  chunk_size, n, N_S, N_total)
+
+    sa_all, sb_all = jax.lax.map(_one, keys)
+    # sa_all: (n_chunks, n, chunk_size, N_S)
+    # sb_all: (n_chunks, n, chunk_size, N_B)
+
+    N_B = N_total - N_S
+    sa = jnp.transpose(sa_all, (1, 0, 2, 3)).reshape(
+        n, n_chunks * chunk_size, N_S)
+    sb = jnp.transpose(sb_all, (1, 0, 2, 3)).reshape(
+        n, n_chunks * chunk_size, N_B)
+    return sa, sb
 
 
 def renyin_wang_cs(vstate, vstate_R, subsystem_sites, n, n_samples,
@@ -2092,58 +2099,55 @@ def renyin_wang_cs(vstate, vstate_R, subsystem_sites, n, n_samples,
     c_diag = jnp.concatenate([sa, sb], axis=-1)     # (n, M, N_total)
     c_off  = jnp.concatenate([sa_next, sb], axis=-1)
 
-    # ── 2. logP troceado
-    logP_chunks = []
-    for i in range(n_chunks):
-        sl = slice(i * chunk_size, (i + 1) * chunk_size)
-        c_diag_c   = c_diag[:, sl]      # (n, chunk_size, N_total)
-        c_off_c    = c_off[:, sl]
-        sa_c       = sa[:, sl]          # (n, chunk_size, N_S)
-        sb_c       = sb[:, sl]          # (n, chunk_size, N_B)
-        sa_next_c  = sa_next[:, sl]
+    # ── 2. logP troceado con lax.map ─────────────────────────────────
+    # Reorganizar a (n_chunks, n, chunk, ...) para que lax.map itere
+    # por chunk. Una sola iteración viva en HLO ⇒ sin desenrollado.
+    _cd_c = _to_chunks(c_diag,  n_chunks, chunk_size)   # (n_chunks, n, chunk, N_total)
+    _co_c = _to_chunks(c_off,   n_chunks, chunk_size)
+    _sa_c = _to_chunks(sa,      n_chunks, chunk_size)   # (n_chunks, n, chunk, N_S)
+    _sb_c = _to_chunks(sb,      n_chunks, chunk_size)   # (n_chunks, n, chunk, N_B)
+    _sn_c = _to_chunks(sa_next, n_chunks, chunk_size)
 
-        def flat_c(x, _n=n, _c=chunk_size):
-            return x.reshape(_n * _c, *x.shape[2:])
+    def _logP_one_chunk(args):
+        cd, co, sa_, sb_, sn_ = args                    # (n, chunk, N_*)
+        flat = lambda x: x.reshape(n * chunk_size, *x.shape[2:])
 
         # Forward en c_diag → p(σb^k|σa^k) y p(σa^k|prefix)
         cond_fwd_diag = _per_site_log_psi_jit(
-            model_v, params_v, mstate_v, flat_c(c_diag_c), False)
+            model_v, params_v, mstate_v, flat(cd), False)
         lpA_diag_c = _log_cond_sum(
-            cond_fwd_diag, flat_c(sa_c), A_sites, local_states
+            cond_fwd_diag, flat(sa_), A_sites, local_states
         ).reshape(n, chunk_size)
         lpB_diag_c = _log_cond_sum(
-            cond_fwd_diag, flat_c(sb_c), B_sites, local_states
+            cond_fwd_diag, flat(sb_), B_sites, local_states
         ).reshape(n, chunk_size)
 
         # Reverse para k=1..n-1: p_R(σa^{k+1}|σb^k)
-        c_off_rev_c = c_off_c[:-1].reshape(
-            (n - 1) * chunk_size, N_total)
+        co_rev = co[:-1].reshape((n - 1) * chunk_size, N_total)
         cond_rev = _per_site_log_psi_jit(
-            model_R, params_R, mstate_R, c_off_rev_c, True)
+            model_R, params_R, mstate_R, co_rev, True)
         lpR_A_c = _log_cond_sum(
             cond_rev,
-            sa_next_c[:-1].reshape((n - 1) * chunk_size, N_S),
+            sn_[:-1].reshape((n - 1) * chunk_size, N_S),
             A_sites, local_states,
         ).reshape(n - 1, chunk_size)
 
         # Mezcla en σbⁿ
-        cond_fwd_last = _per_site_log_psi_jit(
-            model_v, params_v, mstate_v, c_off_c[-1], False)
+        cond_last = _per_site_log_psi_jit(
+            model_v, params_v, mstate_v, co[-1], False)
         lpB_last_a1_c = _log_cond_sum(
-            cond_fwd_last, sb_c[-1], B_sites, local_states)
-        log_p_b_mix_c = jnp.logaddexp(
-            lpB_diag_c[-1], lpB_last_a1_c) - jnp.log(2.0)
+            cond_last, sb_[-1], B_sites, local_states)
+        log_p_b_mix_c = (jnp.logaddexp(lpB_diag_c[-1], lpB_last_a1_c)
+                         - jnp.log(2.0))
 
-        logP_chunks.append(
-            lpA_diag_c[0]
-            + lpB_diag_c[:-1].sum(axis=0)
-            + lpR_A_c.sum(axis=0)
-            + log_p_b_mix_c
-        )
+        return (lpA_diag_c[0]
+                + lpB_diag_c[:-1].sum(axis=0)
+                + lpR_A_c.sum(axis=0)
+                + log_p_b_mix_c)
 
     log_P = jax.lax.stop_gradient(
-        jnp.stack(logP_chunks, axis=0)          # (n_chunks, chunk_size)
-    )
+        jax.lax.map(_logP_one_chunk, (_cd_c, _co_c, _sa_c, _sb_c, _sn_c))
+    )   # (n_chunks, chunk_size)
 
     # ── 3. Tr[ρ_A^n] y gradiente (ya troceado internamente)
     T, grad_T = _trace_value_and_grad(
