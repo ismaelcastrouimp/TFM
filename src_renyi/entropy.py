@@ -135,6 +135,7 @@ def renyi2_entropy_and_grad_exact(vstate, subsystem_sites, hi_extended, isFullSu
     
     # Usar value_and_grad de JAX para obtener S₂ y su gradiente
     S2, S2_grad = jax.value_and_grad(S2_func)(vstate.parameters)
+    S2_grad = jax.tree_util.tree_map(jnp.conj, S2_grad)
     return S2, S2_grad
 
 def renyin_entropy_exact(vstate, subsystem_sites, n):
