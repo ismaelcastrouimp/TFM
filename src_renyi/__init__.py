@@ -19,3 +19,4 @@ from .training import (
     free_energy_minimize_exact,
     free_energy_minimize_scipy,
 )
+from .extrapolation import extrapolate_renyi_to_vN, svn_grad_from_Sn_estimators
