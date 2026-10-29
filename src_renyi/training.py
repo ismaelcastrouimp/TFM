@@ -464,6 +464,7 @@ def free_energy_minimize_phases(
                     verbose=False,
                     return_history=True,
                 )
+                jax.clear_caches()
                 for k, dkl_val in enumerate(dkl_traj):
                     _record_dkl("warm_start_step", i_phase, step, vstate_R,
                                 dkl_value=dkl_val, inner_step=k)
@@ -546,6 +547,27 @@ def free_energy_minimize_phases(
 
     return free_energy_history, best_F, E_best, S2_best
 
+def compute_fidelity(rho, sigma):
+    """Fidelidad entre dos matrices densidad: (Tr sqrt(sqrt(rho) sigma sqrt(rho)))^2"""
+    rho = np.array(rho)
+    sigma = np.array(sigma)
+    
+    # Normalizar por si hay pequeños errores numéricos
+    rho = rho / np.trace(rho)
+    sigma = sigma / np.trace(sigma)
+    
+    # Calcular sqrt(rho)
+    evals, evecs = np.linalg.eigh(rho)
+    evals = np.clip(evals, 0, None)
+    sqrt_rho = evecs @ np.diag(np.sqrt(evals)) @ evecs.conj().T
+    
+    # Calcular M = sqrt(rho) @ sigma @ sqrt(rho)
+    M = sqrt_rho @ sigma @ sqrt_rho
+    evals_M, _ = np.linalg.eigh(M)
+    evals_M = np.clip(evals_M, 0, None)
+    
+    return float(np.real(np.sum(np.sqrt(evals_M))**2))
+
 def free_energy_minimize_exact(
     vstate,         
     T,
@@ -562,6 +584,7 @@ def free_energy_minimize_exact(
     clip_norm=None,
     timing=False,
     sr=None,
+    rho_MRE=None
 ):
     """
     Minimiza F = E - T·S₂ usando gradientes exactos.
@@ -664,6 +687,17 @@ def free_energy_minimize_exact(
 
         if step % freq == 0 and verbose:
             msg = f"Step {step:4d} | F={F_val:.6f} | E={E_val:.6f} | S2={S2_val:.6f}"
+            
+            # ── Cálculo de la Fidelidad ──
+            if rho_MRE is not None:
+                from src_renyi.entropy import renyi2_entropy_exact
+                _, rho_A = renyi2_entropy_exact(vstate, partition)
+                rho = np.array(rho_A)
+                print("frac. elementos Re<0 :", (rho.real < -1e-12).mean())
+                print("max |Im rho|         :", np.abs(rho.imag).max())
+                fid = compute_fidelity(rho_A, rho_MRE)
+                msg += f" | Fid={fid:.5f}"
+                
             if timing:
                 msg += f" | t={time.time()-t0:.3f}s"
             print(msg)
@@ -678,7 +712,13 @@ def free_energy_minimize_exact(
     best_F = E_best - T * S2_best
 
     if verbose:
-        print(f"\nFinal | F={best_F:.6f} | E={E_best:.6f} | S2={S2_best:.6f}")
+        msg = f"\nFinal | F={best_F:.6f} | E={E_best:.6f} | S2={S2_best:.6f}"
+        if rho_MRE is not None:
+            from src_renyi.entropy import renyi2_entropy_exact
+            _, rho_A = renyi2_entropy_exact(vstate, partition)
+            fid = compute_fidelity(rho_A, rho_MRE)
+            msg += f" | Fid={fid:.5f}"
+        print(msg)
 
     if plot:
         fig, axes = plt.subplots(1, 3, figsize=(14, 4))
