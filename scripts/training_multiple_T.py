@@ -23,7 +23,7 @@ import json
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from src_renyi import (
+from src_renyi.physical_ancilla import (
     free_energy_minimize_phases,
     renyi2_entropy_and_grad_sampled,
     renyi2_wang_cs,

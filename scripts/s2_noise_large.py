@@ -40,12 +40,12 @@ matplotlib.rcParams.update({
 })
 import matplotlib.pyplot as plt
 
-from src_renyi.entropy import (
+from src_renyi.physical_ancilla.entropy import (
     renyi2_entropy_and_grad_sampled,
     renyi2_drut_sampling2,
     renyi2_wang_cs,
 )
-from src_renyi.training import free_energy_minimize_phases
+from src_renyi.physical_ancilla.training import free_energy_minimize_phases
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Coste en evaluaciones del ansatz

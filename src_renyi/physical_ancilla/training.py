@@ -690,7 +690,7 @@ def free_energy_minimize_exact(
             
             # ── Cálculo de la Fidelidad ──
             if rho_MRE is not None:
-                from src_renyi.entropy import renyi2_entropy_exact
+                from src_renyi.physical_ancilla.entropy import renyi2_entropy_exact
                 _, rho_A = renyi2_entropy_exact(vstate, partition)
                 rho = np.array(rho_A)
                 print("frac. elementos Re<0 :", (rho.real < -1e-12).mean())
@@ -714,7 +714,7 @@ def free_energy_minimize_exact(
     if verbose:
         msg = f"\nFinal | F={best_F:.6f} | E={E_best:.6f} | S2={S2_best:.6f}"
         if rho_MRE is not None:
-            from src_renyi.entropy import renyi2_entropy_exact
+            from src_renyi.physical_ancilla.entropy import renyi2_entropy_exact
             _, rho_A = renyi2_entropy_exact(vstate, partition)
             fid = compute_fidelity(rho_A, rho_MRE)
             msg += f" | Fid={fid:.5f}"

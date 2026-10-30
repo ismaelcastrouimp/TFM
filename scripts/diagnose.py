@@ -39,8 +39,8 @@ import netket as nk
 from netket.operator.spin import sigmax, sigmaz
 import optax
 
-from src_renyi.observables import FreeRenyiEnergyObservable
-from src_renyi.entropy import (
+from src_renyi.physical_ancilla.observables import FreeRenyiEnergyObservable
+from src_renyi.physical_ancilla.entropy import (
     train_reverse_network,
     renyi2_wang_cs,
 )
@@ -48,9 +48,9 @@ from src_renyi.entropy import (
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════════════════════════
-N         = 50
-N_A       = 50
-N_SAMPLES = 2**17
+N         = 25
+N_A       = 25
+N_SAMPLES = 2**14
 GAMMA     = -1.5
 V         = -1.0
 T         = 2
