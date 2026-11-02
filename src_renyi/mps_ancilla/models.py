@@ -143,33 +143,6 @@ def mps_overlap_matrix(M, chi):
     return mps_overlap_rect(M, M, chi)
 
 
-# def compute_rho(model, params, all_s, chunk=None):
-#     """chunk: filas por trozo en la matriz de solapes (lax.map + checkpoint). Necesario para N>=10
-#     en GPU (la memoria del gradiente crece como K * S^2 * chi^2 sin trozos)."""
-#     logA, M = model.apply({"params": params}, all_s)
-#     A = jnp.exp(logA - jnp.max(jnp.real(logA)))
-#     A = A / jnp.linalg.norm(A)
-#     O = mps_overlap_rect(M, M, model.chi, chunk)
-#     nrm = jnp.sqrt(jnp.real(jnp.diagonal(O)) + 1e-300)
-#     G = O / (nrm[:, None] * nrm[None, :])                                   # solape normalizado
-#     rho = A[:, None] * jnp.conj(A)[None, :] * G
-#     return rho
-
-
-# def make_loss_fns(model, all_s, H_dense, T, chunk=None):
-#     all_s = jnp.asarray(all_s)
-#     H = jnp.asarray(H_dense)
-
-#     def loss(params):
-#         rho = compute_rho(model, params, all_s, chunk)
-#         E = jnp.real(jnp.sum(H.T * rho))                                    # Tr(H rho)
-#         purity = jnp.sum(jnp.abs(rho) ** 2)                                 # Tr rho^2
-#         S2 = -jnp.log(purity)
-#         return E - T * S2, (E, S2)
-
-#     return loss, jax.jit(lambda p: compute_rho(model, p, all_s, chunk))
-
-
 def count_params(params):
     return int(sum(x.size for x in jax.tree_util.tree_leaves(params)))
 

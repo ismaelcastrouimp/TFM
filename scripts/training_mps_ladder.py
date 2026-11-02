@@ -15,6 +15,17 @@ Uso interactivo con YAML (un solo escalon):
     python scripts/training_mps_ladder.py --config slurm/config_mps.yaml \
         --T 1.5 --idx 0 --chis 2 4 8 --stage 0
 
+Estimador de la pureza (S2):
+    --purity iid             parejas de muestras independientes dentro de bloques de pair_block (por defecto)
+    --purity nbr             suma EXACTA en t=s y los N vecinos a un espin (d<=1) + parejas iid con d>=2.
+                             Insesgado; mucho mas estable a S2 alta (casi toda la pureza esta en d<=1).
+    --nbr_from_T X           usa nbr si T >= X e iid si T < X  (implica --purity auto)
+
+Memoria (modelos grandes / M grande):
+    --sample_chunk C         procesa el lote en trozos de <= C muestras (gradiente EXACTO, no aproximado)
+    --mem_gb G               elige el troceado automaticamente para ~G GiB de pico (estimacion)
+    Se aplica a las fases main y polish y a la evaluacion final.  Sin ninguno de los dos: sin trocear.
+
 Parada anticipada (opcional, via config o --tol):
     --tol 0.005  => si |F_chi - F_chi_anterior| < tol, no se sigue subiendo chi.
 
@@ -40,6 +51,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 from src_renyi.mps_ancilla.training import train_mc
+from src_renyi.mps_ancilla.mc_loss import auto_chunks
 from src_renyi.mps_ancilla.ladder import (
     build_model, init_params, pad_chi, save_params, load_params,
     make_evaluator, evaluate, read_results, get_result, update_results_json_locked,
@@ -68,6 +80,16 @@ ap.add_argument("--seed", type=int, default=None)
 ap.add_argument("--eval_M", type=int, default=None)
 ap.add_argument("--eval_batches", type=int, default=None)
 ap.add_argument("--tol", type=float, default=None)
+
+# Estimador de la pureza y memoria
+ap.add_argument("--purity", type=str, choices=["iid", "nbr", "auto"], default=None,
+                help="Estimador de S2.  'auto' = nbr si T >= --nbr_from_T, iid si no.")
+ap.add_argument("--nbr_from_T", type=float, default=None,
+                help="Temperatura a partir de la cual se usa el estimador nbr (implica --purity auto).")
+ap.add_argument("--sample_chunk", type=int, default=None,
+                help="Maximo de muestras por trozo (troceado exacto del lote; reduce la memoria).")
+ap.add_argument("--mem_gb", type=float, default=None,
+                help="Memoria objetivo en GiB para elegir el troceado automaticamente (estimacion).")
 
 # Argumentos obligatorios por job (los pasa el .slurm / launcher).
 ap.add_argument("--T", type=float, nargs="+", required=True,
@@ -123,6 +145,18 @@ args.pair_block = _get(args.pair_block, "training", "pair_block", 8)
 args.ema        = _get(args.ema,        "training", "ema",        0.995)
 args.noise      = _get(args.noise,      "training", "noise",      0.02)
 args.seed       = _get(args.seed,       "training", "seed",       1)
+
+# ── estimador de la pureza ────────────────────────────────────────────────────
+args.nbr_from_T = _get(args.nbr_from_T, "training", "nbr_from_T", None)
+args.purity     = _get(args.purity,     "training", "purity",     None)
+if args.purity is None:
+    args.purity = "auto" if args.nbr_from_T is not None else "iid"
+if args.purity == "auto" and args.nbr_from_T is None:
+    sys.exit("--purity auto necesita --nbr_from_T (o training.nbr_from_T en el YAML)")
+
+# ── memoria ───────────────────────────────────────────────────────────────────
+args.sample_chunk = _get(args.sample_chunk, "training", "sample_chunk", None)
+args.mem_gb       = _get(args.mem_gb,       "training", "mem_gb",       None)
 
 # ── evaluacion final ──────────────────────────────────────────────────────────
 args.eval_M       = _get(args.eval_M,       "evaluation", "eval_M",       1024)
@@ -209,6 +243,13 @@ def ps(vals, k):
     return vals[k] if k < len(vals) else vals[-1]
 
 
+def purity_for(T):
+    """Estimador de la pureza para esta temperatura (el mismo en entrenamiento y evaluacion)."""
+    if args.purity == "auto":
+        return "nbr" if T >= args.nbr_from_T else "iid"
+    return args.purity
+
+
 def stopped_before(idx, k):
     """True si algun escalon anterior marco 'converged'. --force ignora la parada."""
     if args.force:
@@ -251,6 +292,7 @@ def run_stage(T, idx, k):
     if M is None:
         raise ValueError(f"{tag}M no resuelto (training.M en config y --M vacios).")
     assert M % args.pair_block == 0, f"M={M} debe ser multiplo de pair_block={args.pair_block}"
+    assert args.eval_M % args.pair_block == 0, f"eval_M={args.eval_M} debe ser multiplo de pair_block"
 
     steps = ps(args.steps, k)
     warm  = ps(args.warmup, k)
@@ -262,19 +304,22 @@ def run_stage(T, idx, k):
     pM = raw_pM if raw_pM is not None else (2 * M if chi <= 4 else M)
     assert pM % args.pair_block == 0, f"polish_M={pM} debe ser multiplo de pair_block"
 
+    purity = purity_for(T)
     t0 = time.time()
-    print(f"{tag}MC: M={M} steps={steps} lr={lr_k} | polish: {pst} pasos, M={pM}, lr={plr_k}",
-          flush=True)
+    print(f"{tag}MC: M={M} steps={steps} lr={lr_k} | polish: {pst} pasos, M={pM}, lr={plr_k} | "
+          f"purity={purity} sample_chunk={args.sample_chunk} mem_gb={args.mem_gb}", flush=True)
 
     out = train_mc(model, params, N, T, args.h_x, args.J_ZZ,
                    M=M, n_steps=steps, lr=lr_k, warmup=warm,
                    seed=seed, pair_block=args.pair_block, freq=max(1, steps // 20),
                    ema_decay=args.ema, polish_steps=pst, polish_M=pM, polish_lr=plr_k,
-                   tag=tag)
+                   tag=tag, purity=purity, sample_chunk=args.sample_chunk, mem_gb=args.mem_gb)
     p_final = out["params_ema"]                       # se guarda y se evalua la EMA
 
-    # ---- evaluacion MC final con barra de error ----
-    one = make_evaluator(model, N, T, args.h_x, args.J_ZZ, args.eval_M, args.pair_block)
+    # ---- evaluacion MC final con barra de error (mismo estimador y misma politica de memoria) ----
+    nch_eval = auto_chunks(args.eval_M, N, chi, args.pair_block, args.sample_chunk, args.mem_gb, grad=False)
+    one = make_evaluator(model, N, T, args.h_x, args.J_ZZ, args.eval_M, args.pair_block,
+                         purity=purity, n_chunks=nch_eval)
     ev = evaluate(one, p_final, T, args.eval_batches, seed=seed + 999)
 
     # ---- comparacion con el escalon anterior ----
@@ -297,20 +342,24 @@ def run_stage(T, idx, k):
     entry = dict(ev,
                  ms_per_step=1e3 * out["s_per_step"],
                  time_s=time.time() - t0,
-                 M=M, steps=steps,
+                 M=M, steps=steps, purity=purity,
                  h_x=float(args.h_x), J_ZZ=float(args.J_ZZ),
                  dF_prev=dF, converged=converged)
     update_results_json_locked(results_file, idx, T, chi, entry, N=N)
     print(f"{tag}RESULTADO: F={ev['free_energy']:.5f}+-{ev['free_energy_err']:.5f}  "
-          f"E={ev['energy']:.5f}  S2={ev['entropy']:.4f}  | {out['s_per_step']*1e3:.0f} ms/paso, "
+          f"E={ev['energy']:.5f}  S2={ev['entropy']:.4f}±{ev['entropy_err']:.3f}"
+          + (f" (exacto d<=1: {100*ev['near_frac']:.0f}% de P, "
+             f"CV near={ev['near_cv']:.2f} far={ev['far_cv']:.2f})" if ev["near_frac"] is not None else "")
+          + f"  | {out['s_per_step']*1e3:.0f} ms/paso, "
           f"{time.time() - t0:.0f} s  ->  {pfile}", flush=True)
     return "done"
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
 print(f"MPS ladder: N={N}  chis={args.chis}  T={Ts}  idx={idxs}  stage={args.stage}  "
-      f"h_x={args.h_x}  J_ZZ={args.J_ZZ}  config={args.config}  "
-      f"dispositivos={jax.devices()}", flush=True)
+      f"h_x={args.h_x}  J_ZZ={args.J_ZZ}  purity={args.purity}"
+      + (f" (nbr si T>={args.nbr_from_T})" if args.purity == "auto" else "")
+      + f"  config={args.config}  dispositivos={jax.devices()}", flush=True)
 
 for T, idx in zip(Ts, idxs):
     ks = [args.stage] if args.stage is not None else range(len(args.chis))

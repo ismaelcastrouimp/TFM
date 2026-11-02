@@ -1,7 +1,7 @@
 """
 src_renyi/mps_ancilla/ladder.py
 ===============================
-Utilidades para la ESCALERA DE chi del modelo ARViT + MPS ancilla:
+Utilidades para la ESCALERA DE chi del modelo ARViT + MPS ancilla (todo Monte Carlo, sin ED):
 
   * build_model / init_params     -> construyen el modelo a un chi dado (siempre copy_init=True)
   * pad_chi                       -> amplia los parametros de chi a chi2 (ceros + ruido en bloques nuevos);
@@ -27,7 +27,8 @@ except ImportError:                    # pragma: no cover
     fcntl = None
 
 from .models import ARViT_MPSAncilla
-from .training import make_sampler, make_mc_loss
+from .training import make_sampler
+from .mc_loss import make_mc_stats
 
 
 # ── modelo ─────────────────────────────────────────────────────────────────────
@@ -90,36 +91,44 @@ def load_params(path, model, N):
 
 # ── evaluacion MC final ────────────────────────────────────────────────────────
 
-def make_evaluator(model, N, T, hx, J, M, pair_block):
-    """one(params, key) -> (E, S2) de UN lote de M muestras (sin gradiente)."""
+def make_evaluator(model, N, T, hx, J, M, pair_block, purity="iid", n_chunks=1):
+    """one(params, key) -> (E, S2, P_near, P_far) de UN lote de M muestras (sin gradiente).
+    purity: estimador de la pureza ("iid" | "nbr"); n_chunks: trozos de muestras (memoria)."""
+    assert pair_block is None or M % (pair_block * max(n_chunks, 1)) == 0, \
+        f"eval_M={M} debe ser multiplo de pair_block*n_chunks"
     sampler = make_sampler(model, N, M)
-    mc_loss = make_mc_loss(model, N, T, hx, J, None, pair_block)
+    stats = make_mc_stats(model, N, T, hx, J, None, pair_block, purity, n_chunks, diag=True)
 
     @jax.jit
     def one(params, key):
         s = sampler(params, key)
-        _, (E, S2, _F) = mc_loss(params, s)
-        return E, S2
+        return stats(params, s)
     return one
 
 
 def evaluate(one, params, T, n_batches, seed=0):
     """Promedia n_batches lotes independientes.  S2 = -log(media de P) (P es el estimador insesgado;
-    -log P de un lote suelto esta sesgado hacia arriba).  El error de F es std de los lotes / sqrt(n)."""
+    -log P de un lote suelto esta sesgado hacia arriba).  El error de F es std de los lotes / sqrt(n).
+    Diagnostico del estimador nbr (None si purity=iid):
+      near_frac = P_near/P   (parte de P calculada EXACTA: t=s y vecinos a un espin)
+      near_cv, far_cv = std/media por lote de P_near y P_far (cual de las dos domina el ruido)."""
     keys = jax.random.split(jax.random.PRNGKey(seed), n_batches)
-    Es, Ss = [], []
-    for k in keys:
-        E, S2 = one(params, k)
-        Es.append(float(E)); Ss.append(float(S2))
-    Es, Ss = np.array(Es), np.array(Ss)
+    rows = np.array([[float(x) for x in one(params, k)] for k in keys])    # (n, 4)
+    Es, Ss, Pn, Pf = rows.T
     E = Es.mean()
     S2 = -np.log(np.mean(np.exp(-Ss)))
     Fb = Es - T * Ss
     sq = np.sqrt(max(n_batches, 1))
     ddof = 1 if n_batches > 1 else 0
-    return {"energy": float(E), "entropy": float(S2), "free_energy": float(E - T * S2),
-            "energy_err": float(Es.std(ddof=ddof) / sq), "entropy_err": float(Ss.std(ddof=ddof) / sq),
-            "free_energy_err": float(Fb.std(ddof=ddof) / sq)}
+    out = {"energy": float(E), "entropy": float(S2), "free_energy": float(E - T * S2),
+           "energy_err": float(Es.std(ddof=ddof) / sq), "entropy_err": float(Ss.std(ddof=ddof) / sq),
+           "free_energy_err": float(Fb.std(ddof=ddof) / sq),
+           "near_frac": None, "near_cv": None, "far_cv": None}
+    if Pn.mean() > 0:
+        out["near_frac"] = float(Pn.mean() / (Pn.mean() + Pf.mean()))
+        out["near_cv"] = float(Pn.std(ddof=ddof) / Pn.mean())
+        out["far_cv"] = float(Pf.std(ddof=ddof) / max(Pf.mean(), 1e-300))
+    return out
 
 
 # ── JSON de resultados (con lock) ──────────────────────────────────────────────

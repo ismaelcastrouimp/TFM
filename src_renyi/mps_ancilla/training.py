@@ -1,17 +1,18 @@
-"""Entrenamiento de ARViT+MPS: exacto (ED) y Monte Carlo (MC)."""
+"""Entrenamiento de ARViT+MPS: exacto (ED, N<=10) y Monte Carlo (MC).
+La perdida MC (energia local + pureza, estimadores iid/nbr, troceado de muestras) vive en mc_loss.py."""
 import time
+
 import numpy as np
 import jax
 import jax.numpy as jnp
 import optax
 
-from .models import mps_overlap_rect, mps_overlap_aligned, mps_overlap_matrix
-
-sg = jax.lax.stop_gradient
+from .models import mps_overlap_rect
+from .mc_loss import make_mc_loss, make_mc_vg, auto_chunks     # noqa: F401  (make_mc_loss se re-exporta)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# ED (exacto, enumera 2^N; solo N ≤ 10)
+# ED (exacto, enumera 2^N; solo N <= 10)
 # ════════════════════════════════════════════════════════════════════════════
 
 def compute_rho(model, params, all_s, chunk=None):
@@ -78,9 +79,8 @@ def train(loss, params, n_steps, lr, T, *, freq=100, warmup=100, end_frac=1e-2,
     return {"params_best": best_params, "F": E_b - T * S2_b, "E": E_b, "S2": S2_b,
             "time": dt, "s_per_step": dt / n_steps}
 
-# ════════════════════════════════════════════════════════════════════════════
-# MC (escala a N grande)
-# ════════════════════════════════════════════════════════════════════════════
+
+
 
 def make_sampler(model, N, M):
     """Devuelve sample(params, key) -> s (M, N) con valores +-1, muestreo autorregresivo exacto."""
@@ -100,66 +100,10 @@ def make_sampler(model, N, M):
     return sample
 
 
-def make_mc_loss(model, N, T, hx, J, chunk=None, pair_block=None, terms="both"):
-    chi = model.chi
-
-    def mc_loss(params, s):
-        s = sg(s)
-        M = s.shape[0]
-        logA, Mt = model.apply({"params": params}, s)
-        n2 = jnp.real(mps_overlap_aligned(Mt, Mt, chi))                         # ||Phi_s||^2
-        logp = 2.0 * jnp.real(logA)                                             # log p(s)
-
-        # ---- energia local ----
-        flip = 1.0 - 2.0 * jnp.eye(N)
-        sf = (s[:, None, :] * flip[None]).reshape(M * N, N)                     # s con el espin i invertido
-        logAf, Mf = model.apply({"params": params}, sf)
-        Mrep = jnp.repeat(Mt, N, axis=0)
-        Of = mps_overlap_aligned(Mf, Mrep, chi)                                 # <Phi_s | Phi_s'> (orden: s', s)
-        n2f = jnp.real(mps_overlap_aligned(Mf, Mf, chi))
-        Gf = Of / jnp.sqrt(n2f * jnp.repeat(n2, N))
-        ratio = jnp.exp(logAf - jnp.repeat(logA, N))
-        offdiag = jnp.sum((ratio * Gf).reshape(M, N), axis=1)
-        diag = jnp.sum(s * jnp.roll(s, -1, axis=1), axis=1)
-        ReE = jnp.real(hx * offdiag + J * diag)
-        Ebar = jnp.mean(ReE)
-        L_E = jnp.mean(sg(ReE - Ebar) * logp + ReE)
-
-        # ---- pureza ----
-        # pair_block=None: todos los pares i!=j (coste M^2).  pair_block=b: se parte el lote en M/b
-        # bloques y se usan todos los pares DENTRO de cada bloque (coste M*b).  b=2 == M/2 pares disjuntos.
-        if pair_block is None:
-            O = mps_overlap_rect(Mt, Mt, chi, chunk)
-            f = jnp.abs(O) ** 2 / (n2[:, None] * n2[None, :])
-            mask = 1.0 - jnp.eye(M)
-            npairs = M * (M - 1)
-            lp = logp[:, None] + logp[None, :]
-        else:
-            b = pair_block
-            assert M % b == 0, "M debe ser multiplo de pair_block"
-            nb = M // b
-            Mb = Mt.reshape(nb, b, *Mt.shape[1:])
-            O = jax.vmap(lambda m: mps_overlap_rect(m, m, chi))(Mb)               # (nb, b, b)
-            n2b = n2.reshape(nb, b)
-            f = jnp.abs(O) ** 2 / (n2b[:, :, None] * n2b[:, None, :])
-            mask = jnp.broadcast_to(1.0 - jnp.eye(b), (nb, b, b))
-            npairs = nb * b * (b - 1)
-            lpb = logp.reshape(nb, b)
-            lp = lpb[:, :, None] + lpb[:, None, :]
-        Pb = jnp.sum(f * mask) / npairs
-        L_P = T * (Pb + jnp.sum(mask * sg(f - Pb) * lp) / npairs) / sg(Pb)
-
-        S2 = -jnp.log(sg(Pb))
-        total = {"both": L_E + L_P, "E": L_E, "P": L_P}[terms]
-        return total, (Ebar, S2, Ebar - T * S2)
-
-    return mc_loss
-
-
 def train_mc(model, params, N, T, hx, J, *, M=512, n_steps=2000, lr=5e-3, clip=10.0, warmup=100,
              end_frac=1e-2, seed=0, chunk=None, pair_block=None, freq=50, exact_fn=None, ref=None,
              ema_decay=0.995, polish_steps=0, polish_M=None, polish_lr=1e-3, polish_pair_block=None,
-             ckpt_fn=None, ckpt_every=250, tag=""):
+             ckpt_fn=None, ckpt_every=250, tag="", purity="iid", sample_chunk=None, mem_gb=None):
     """
     Entrena con el gradiente MC en dos fases:
       1) n_steps con warmup + coseno, lotes de M muestras.
@@ -174,16 +118,18 @@ def train_mc(model, params, N, T, hx, J, *, M=512, n_steps=2000, lr=5e-3, clip=1
     if ref is not None:
         print(f"{tag}BASELINE exacto (MRE): F={ref[0]:.5f}  E={ref[1]:.5f}  S2={ref[2]:.4f}", flush=True)
 
-    def make_phase(Mv, pb, sched):
+    def make_phase(name, Mv, pb, sched):
         sampler = make_sampler(model, N, Mv)
-        mc_loss = make_mc_loss(model, N, T, hx, J, chunk, pb)
+        nch = auto_chunks(Mv, N, model.chi, pb, sample_chunk, mem_gb, grad=True)
+        vg = make_mc_vg(model, N, T, hx, J, chunk, pb, purity=purity, n_chunks=nch)
+        print(f"{tag}[{name}] M={Mv} purity={purity}" + (f" | sample chunking: {nch} trozos de {Mv // nch}" if nch > 1 else ""), flush=True)
         tx = optax.chain(optax.clip_by_global_norm(clip), optax.adam(sched))
 
         @jax.jit
         def step(params, opt_state, ema, key):
             key, sub = jax.random.split(key)
             s = sampler(params, sub)
-            (_, aux), g = jax.value_and_grad(mc_loss, has_aux=True)(params, s)
+            (_, aux), g = vg(params, s)
             upd, opt_state = tx.update(g, opt_state, params)
             params = optax.apply_updates(params, upd)
             ema = jax.tree_util.tree_map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema, params)
@@ -204,7 +150,7 @@ def train_mc(model, params, N, T, hx, J, *, M=512, n_steps=2000, lr=5e-3, clip=1
     ema = jax.tree_util.tree_map(jnp.zeros_like, params)
     hist, t_total, t0 = [], 0, time.time()
     for name, Mv, pb, n, sched in phases:
-        tx, step = make_phase(Mv, pb, sched)
+        tx, step = make_phase(name, Mv, pb, sched)
         opt_state = tx.init(params)
         for it in range(n):
             params, opt_state, ema, key, (E, S2, F) = step(params, opt_state, ema, key)
