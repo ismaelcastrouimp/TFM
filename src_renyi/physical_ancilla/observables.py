@@ -146,6 +146,10 @@ def _compute_E_loc_jit(logpsi, params, model_state, samples, sigma_p, mels,
 def _energy_and_grad_chunked(vstate, op, chunk_size):
     """
     <H> y su gradiente, usando `chunk_size` explícitamente.
+
+    Compatible con ψ real Y ψ compleja (θ real en ambos casos):
+        ∇<H> = 2·Re⟨(Ĥ_loc − ⟨H⟩)·conj(O)⟩
+    Con ψ real positiva reduce exactamente a la versión anterior.
     """
     H = op.H
     all_s = vstate.samples.reshape(-1, vstate.hilbert.size)
@@ -160,27 +164,29 @@ def _energy_and_grad_chunked(vstate, op, chunk_size):
             s_batch, sigma_p, mels, chunk_size=cs,
         )
 
+    # E_loc puede ser complejo si ψ tiene fase.
     E_loc = jnp.concatenate([
-        _E_loc_chunk(all_s[i*cs:(i+1)*cs]) for i in range(n_chunks)
+        _E_loc_chunk(all_s[i * cs:(i + 1) * cs]) for i in range(n_chunks)
     ])
     E_loc_sg = jax.lax.stop_gradient(E_loc)
+    all_s = all_s[: n_chunks * cs]     # mismas muestras que E_loc
 
-    # ── FIX: la energía reportada es la media de E_loc, NO el valor de la loss
-    E_mean_true = float(jnp.mean(E_loc_sg))
+    # El valor reportado es la media REAL de E_loc.
+    E_mean_true = float(jnp.real(jnp.mean(E_loc_sg)))
 
     def loss_E(params):
         lp_s = jax.vmap(
             lambda s: vstate._apply_fun(
                 {"params": params, **vstate.model_state}, s[None]
             )[0]
-        )(all_s)
-        E_avg = jnp.mean(E_loc_sg)                          # ← renombrado
-        return 2.0 * jnp.mean((E_loc_sg - E_avg) * jnp.real(lp_s))
+        )(all_s)                       # complejo
+        E_avg = jnp.real(jnp.mean(E_loc_sg))            # real
+        # Re[(E_loc − Ē)·conj(O)]  →  real, diferenciable
+        return 2.0 * jnp.mean(jnp.real((E_loc_sg - E_avg) * jnp.conj(lp_s)))
 
     _, grad_E = jax.value_and_grad(loss_E)(vstate.parameters)
     E_stats = nk.stats.statistics(jnp.array([[E_mean_true]]))
     return E_stats, grad_E
-
 
 # ── rama swap (fusionada) ─────────────────────────────────────────────────────
 
@@ -192,10 +198,14 @@ def _free_renyi_grad_jit(logpsi, params, model_state,
         return logpsi({"params": p, **model_state}, s)
 
     def loss_fn(p):
-        E_mean = jnp.mean(E_loc_sg)
-        lp_s1 = jax.vmap(lambda s: log_psi(p, s[None])[0])(samples1)
-        loss_E = 2.0 * jnp.mean((E_loc_sg - E_mean) * jnp.real(lp_s1))
+        # ── Energía (real, correcta para ψ compleja) ────────────────
+        E_mean = jnp.real(jnp.mean(E_loc_sg))                          # ← real
+        lp_s1 = jax.vmap(lambda s: log_psi(p, s[None])[0])(samples1)   # complejo
+        loss_E = 2.0 * jnp.mean(
+            jnp.real((E_loc_sg - E_mean) * jnp.conj(lp_s1))             # ← conj+Re
+        )
 
+        # ── S₂ por swap, chunked ────────────────────────────────────
         n = samples1.shape[0]
         n_chunks = n // chunk_size
 
@@ -221,11 +231,18 @@ def _free_renyi_grad_jit(logpsi, params, model_state,
         )
         lo1, lo2, ls1, ls2 = [x.reshape(n) for x in (lo1, lo2, ls1, ls2)]
 
-        R = jnp.exp(jnp.real(ls1 + ls2 - lo1 - lo2))
-        R_mean = jax.lax.stop_gradient(jnp.mean(R))
-        w = jax.lax.stop_gradient(R / R_mean)
+        # R = ψ(y1)ψ(y2)/(ψ(x1)ψ(x2)) es COMPLEJO si ψ tiene fase.
+        #   Tr ρ² = E[R] = E[Re R]
+        #   ∂Tr ρ² = 2·Re E[R·(O_y1 + O_y2)]          (involución x↔y)
+        #   ⇒ ∇S₂ = −2·Re E[R·(O_y1+O_y2)] / E[Re R]  + 2·E[Re(O_x1+O_x2)]
+        # (el último término tiene media nula para ψ normalizada: baseline).
+        # Con ψ real, Im R = 0 y se recupera exactamente la versión anterior.
+        R = jax.lax.stop_gradient(jnp.exp(ls1 + ls2 - lo1 - lo2))
+        R_mean = jnp.mean(jnp.real(R))
+        w = R / R_mean                                   # complejo, sin grad
+
         loss_S2 = (
-            -2.0 * jnp.mean(w * jnp.real(ls1 + ls2))
+            -2.0 * jnp.mean(jnp.real(w * (ls1 + ls2)))
             + 2.0 * jnp.mean(jnp.real(lo1 + lo2))
         )
         S2 = jax.lax.stop_gradient(-jnp.log(jnp.abs(R_mean)))

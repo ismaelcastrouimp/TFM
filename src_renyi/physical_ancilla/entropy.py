@@ -52,6 +52,82 @@ def _resolve_chunk(n_samples, chunk_size):
     return n_chunks, chunk_size
 
 
+def _logpsi_is_complex(vstate):
+    """True si log ψ del modelo es complejo (θ real, ψ con fase).
+
+    Se decide con `jax.eval_shape` (no evalúa la red).
+    """
+    N = vstate.hilbert.size
+    ls = jnp.asarray(vstate.hilbert.local_states)
+    out = jax.eval_shape(
+        lambda p: vstate._apply_fun({"params": p, **vstate.model_state},
+                                    jnp.full((1, N), ls[0], dtype=ls.dtype)),
+        vstate.parameters,
+    )
+    return jnp.issubdtype(out.dtype, jnp.complexfloating)
+
+
+def _drut_phase_correction(apply_fun, params, model_state, s1, s2, A, B,
+                           lam_last):
+    """
+    Corrección de fase para los estimadores tipo Drut con ψ compleja.
+
+    El MH de Drut usa solo |ψ| (Re log ψ), así que la integral
+    termodinámica estima log E_p[|R|] y su gradiente. Para ψ compleja:
+
+        Tr ρ² = E_p[R] = E_p[|R|] · c,     c = E_{q1}[e^{iφ}],  φ = Im log R
+        q1 ∝ p(x1) p(x2) |R|
+
+    Las muestras disponibles son del último nodo λ_K < 1; se repesan a q1
+    con v ∝ |R|^{1-λ_K}. El gradiente:
+
+        ∂ log c = ∂ log E_p[R] − ∂ log E_p[|R|]
+                = E_{q1}[ Re( (e^{iφ}/c − 1)·(O*_x1 + O*_x2 + O_y1 + O_y2) ) ]
+
+    (si φ ≡ 0 ⇒ c = 1 y la corrección es idénticamente 0).
+
+    Devuelve (log_c, grad_log_c).
+    """
+    def lpsi(p, s):
+        return apply_fun({"params": p, **model_state}, s)
+
+    sw1 = jnp.concatenate([s2[:, A], s1[:, B]], axis=1)
+    sw2 = jnp.concatenate([s1[:, A], s2[:, B]], axis=1)
+
+    lo1, lo2 = lpsi(params, s1), lpsi(params, s2)
+    ls1, ls2 = lpsi(params, sw1), lpsi(params, sw2)
+    log_R = ls1 + ls2 - lo1 - lo2
+
+    v = jax.nn.softmax((1.0 - lam_last) * jnp.real(log_R))
+    e = jnp.exp(1j * jnp.imag(log_R))
+    c = jnp.sum(v * jnp.real(e))
+    c_safe = jnp.maximum(c, 1e-12)
+    coef = jax.lax.stop_gradient(v * (e / c_safe - 1.0))
+
+    def loss(p):
+        o1, o2 = lpsi(p, s1), lpsi(p, s2)
+        y1, y2 = lpsi(p, sw1), lpsi(p, sw2)
+        return jnp.sum(jnp.real(coef * (jnp.conj(o1) + jnp.conj(o2) + y1 + y2)))
+
+    grad_log_c = jax.grad(loss)(params)
+    if float(c) <= 1e-12:
+        print(f"⚠ [drut] factor de fase c = {float(c):.3e} ≤ 0: S₂ no fiable "
+              f"(problema de signo/fase; aumentar n_chains).")
+    return jnp.log(c_safe), grad_log_c
+
+
+def _apply_drut_phase_correction(vstate, S2, grad_S2, s1, s2, A, B, lam_last):
+    """S₂ ← S₂ − log c,  ∇S₂ ← ∇S₂ − ∇log c  (solo ψ compleja)."""
+    log_c, grad_log_c = _drut_phase_correction(
+        vstate._apply_fun, vstate.parameters, vstate.model_state,
+        s1, s2, A, B, lam_last,
+    )
+    S2_max = A.shape[0] * jnp.log(2.0)
+    S2 = jnp.minimum(S2 - log_c, S2_max)
+    grad_S2 = jax.tree_util.tree_map(lambda g, gc: g - gc, grad_S2, grad_log_c)
+    return S2, grad_S2
+
+
 # ── Rényi-2, n exacto ─────────────────────────────────────────────────────────
 
 def renyi2_entropy_exact(vstate, subsystem_sites):
@@ -273,14 +349,16 @@ def _renyi2_forward_jit(apply_fun, params, model_state,
             lo2 = log_psi(s2[None])[0]
             ls1 = log_psi(sw1[None])[0]
             ls2 = log_psi(sw2[None])[0]
-            return jnp.real(ls1 + ls2 - lo1 - lo2)
+            # log R complejo si ψ tiene fase (real si ψ es real)
+            return ls1 + ls2 - lo1 - lo2
         return jax.vmap(renyi_single)(bs1, bs2, bsw1, bsw2)
 
     log_R = jax.lax.map(
         lambda x: renyi_chunk(*x), (s1_c, s2_c, sw1_c, sw2_c)
     ).reshape(n)
 
-    return -jnp.log(jnp.abs(jnp.mean(jnp.exp(log_R))))
+    # Tr ρ² = E[R] = E[Re R]  (R complejo para ψ con fase)
+    return -jnp.log(jnp.abs(jnp.mean(jnp.real(jnp.exp(log_R)))))
 
 def renyi2_entropy_sampled(vstate, subsystem_sites, n_samples, key=0, chunk_size=128, debug=False):
     subsystem_sites = jnp.array(subsystem_sites, dtype=int)
@@ -343,7 +421,7 @@ def _renyi2_loss_and_grad(apply_fun, params, model_state,
             lo2 = log_psi(params, s2[None])[0]
             ls1 = log_psi(params, sw1[None])[0]
             ls2 = log_psi(params, sw2[None])[0]
-            return jnp.real(ls1 + ls2 - lo1 - lo2)
+            return ls1 + ls2 - lo1 - lo2           # complejo si ψ tiene fase
         return jax.vmap(single)(bs1, bs2, bsw1, bsw2)
 
     log_R = jax.lax.map(
@@ -351,7 +429,8 @@ def _renyi2_loss_and_grad(apply_fun, params, model_state,
     ).reshape(n)
     log_R = jax.lax.stop_gradient(log_R)
 
-    R_mean = jax.lax.stop_gradient(jnp.mean(jnp.exp(log_R)))
+    # Tr ρ² = E[Re R].  ∇S₂ = −2 Re E[R (O_y1+O_y2)]/E[Re R] + 2 E[Re(O_x1+O_x2)]
+    R_mean = jax.lax.stop_gradient(jnp.mean(jnp.real(jnp.exp(log_R))))
     S2 = -jnp.log(jnp.abs(R_mean))
 
     # ── backward: gradiente chunkeado ─────────────────────────────────────────
@@ -365,9 +444,9 @@ def _renyi2_loss_and_grad(apply_fun, params, model_state,
                 lo2 = log_psi(p, s2[None])[0]
                 ls1 = log_psi(p, sw1[None])[0]
                 ls2 = log_psi(p, sw2[None])[0]
-                w_i = jax.lax.stop_gradient(jnp.exp(log_Ri) / R_mean)
+                w_i = jax.lax.stop_gradient(jnp.exp(log_Ri) / R_mean)  # complejo
                 return (
-                    -2.0 * w_i * jnp.real(ls1 + ls2)
+                    -2.0 * jnp.real(w_i * (ls1 + ls2))
                     + 2.0 * jnp.real(lo1 + lo2)
                 )
             return jax.vmap(single)(bs1, bs2, bsw1, bsw2, blog_R)
@@ -479,6 +558,12 @@ def renyi2_entropy_and_grad_sampled2(vstate, subsystem_sites, n_samples, key=0, 
     log_o2 = vstate.log_value(samples2)
     log_s1 = vstate.log_value(swapped1)
     log_s2 = vstate.log_value(swapped2)
+
+    if jnp.iscomplexobj(log_o1):
+        return _renyi2_sampled2_complex(
+            vstate, samples1, samples2, swapped1, swapped2,
+            log_o1, log_o2, log_s1, log_s2, debug,
+        )
     
     # ============================================================
     # 4) RATIO SWAP Y ENTROPÍA S₂
@@ -532,6 +617,40 @@ def renyi2_entropy_and_grad_sampled2(vstate, subsystem_sites, n_samples, key=0, 
         print(f"|∇S₂| = {jnp.linalg.norm(grad_S2_flat):.6f}")
     
     return S2, grad_S2
+
+def _renyi2_sampled2_complex(vstate, samples1, samples2, swapped1, swapped2,
+                             log_o1, log_o2, log_s1, log_s2, debug):
+    """
+    Rama compleja de `renyi2_entropy_and_grad_sampled2` (θ real, ψ compleja).
+
+        R = ψ(y1)ψ(y2)/(ψ(x1)ψ(x2))  (complejo),   Tr ρ² = E[Re R]
+        ∇S₂ = −[2 Re E[R (O_y1+O_y2)] − 2 E[Re R] E[Re(O_x1+O_x2)]] / E[Re R]
+
+    Con ψ real se reduce a la fórmula de la rama real (term1 + term2).
+    """
+    def jac_c(s):
+        J = jacobian(vstate._apply_fun, vstate.parameters, s,
+                     model_state=vstate.model_state, mode="complex", dense=True)
+        return J[:, 0] + 1j * J[:, 1]          # (n_samples, n_params) complejo
+
+    O_o1, O_o2 = jac_c(samples1), jac_c(samples2)
+    O_s1, O_s2 = jac_c(swapped1), jac_c(swapped2)
+
+    R = jnp.exp(log_s1 + log_s2 - log_o1 - log_o2)
+    R_mean = jnp.mean(jnp.real(R))
+    S2 = -jnp.log(jnp.abs(R_mean))
+
+    term_y = 2.0 * jnp.real(jnp.mean(R[:, None] * (O_s1 + O_s2), axis=0))
+    term_x = 2.0 * R_mean * jnp.mean(jnp.real(O_o1 + O_o2), axis=0)
+    grad_S2_flat = -(term_y - term_x) / R_mean
+
+    flat_p, unravel = jax.flatten_util.ravel_pytree(vstate.parameters)
+    grad_S2 = unravel(grad_S2_flat.astype(flat_p.dtype))
+    if debug:
+        print(f"⟨Re R⟩ = {float(R_mean):.6f}   ⟨Im R⟩ = {float(jnp.mean(R.imag)):.2e}")
+        print(f"S₂     = {float(S2):.6f}")
+    return S2, grad_S2
+
 
 #Lamda integral method, S₂ = -∫₀¹ dλ ⟨ln R⟩_λ, with ⟨·⟩_λ = ⟨· R^λ⟩ / ⟨R^λ⟩
 #Reweighting: ⟨ln R⟩_λ = ⟨w ln R⟩, w = R^λ / ⟨R^λ⟩
@@ -599,6 +718,11 @@ def _renyi2_lambda_integral_jit(apply_fun, params, model_state,
 
 def renyi2_entropy_and_grad_lambda_integral(vstate, subsystem_sites, n_samples,
                                             n_lambda=10, key=0, debug=False):
+    if _logpsi_is_complex(vstate):
+        raise NotImplementedError(
+            "renyi2_entropy_and_grad_lambda_integral: R^λ no está bien definido "
+            "para ψ compleja (R complejo). Usa swap / Wang / Drut."
+        )
     subsystem_sites = jnp.array(subsystem_sites, dtype=int)
     all_sites = jnp.arange(vstate.hilbert.size)
     complement_sites = jnp.setdiff1d(all_sites, subsystem_sites)
@@ -966,6 +1090,13 @@ def renyi2_drut_sampling(vstate, subsystem_sites, n_chains=256,
     ))(vstate.parameters)
     grad_S2 = jax.tree_util.tree_map(lambda g: -g, grad_loss)
 
+    # ψ compleja: TI da log E_p|R|; corregir con la fase (ver helper)
+    if _logpsi_is_complex(vstate):
+        S2, grad_S2 = _apply_drut_phase_correction(
+            vstate, S2, grad_S2, s1_stack[-1], s2_stack[-1], A, B,
+            lambda_grid[-1],
+        )
+
     if debug:
         gf, _ = jax.flatten_util.ravel_pytree(grad_S2)
         print(f"S₂    = {float(jnp.asarray(S2)):.6f}")
@@ -1133,6 +1264,12 @@ def renyi2_drut_sampling2(vstate, subsystem_sites, n_chains=256,
     ))(vstate.parameters)
     grad_S2 = jax.tree_util.tree_map(lambda g: -g, grad_loss)
 
+    if _logpsi_is_complex(vstate):
+        S2, grad_S2 = _apply_drut_phase_correction(
+            vstate, S2, grad_S2, s1_stack[-1], s2_stack[-1], A, B,
+            lambda_grid[-1],
+        )
+
     if debug:
         gf, _ = jax.flatten_util.ravel_pytree(grad_S2)
         print(f"S₂    = {float(jnp.asarray(S2)):.6f}")
@@ -1272,6 +1409,12 @@ def renyi2_drut_sampling_direct(vstate, subsystem_sites, n_chains=256,
         s1_final, s2_final, A, B,
     ))(vstate.parameters)
     grad_S2 = jax.tree_util.tree_map(lambda g: -g, grad_loss)
+
+    if _logpsi_is_complex(vstate):
+        lam_last = _gauss_legendre_01(n_lambda)[0][-1]
+        S2, grad_S2 = _apply_drut_phase_correction(
+            vstate, S2, grad_S2, s1_final, s2_final, A, B, lam_last,
+        )
 
     if debug:
         gf, _ = jax.flatten_util.ravel_pytree(grad_S2)
@@ -1478,6 +1621,11 @@ def renyi2_increment_sampling(vstate, subsystem_sites, n_chains,
     ratios   : array (n_sub,), los ⟨r_i⟩_{q_i}.
     A_list   : lista de arrays [A^0, ..., A^n].
     """
+    if _logpsi_is_complex(vstate):
+        raise NotImplementedError(
+            "renyi2_increment_sampling: solo implementado para ψ real "
+            "(los ratios R_{A^{i+1}}/R_{A^i} complejos no telescopian con q_i ∝ |R_{A^i}|)."
+        )
     N_sites = vstate.hilbert.size
     A_sites = jnp.array(subsystem_sites, dtype=int)
     n_sub   = len(subsystem_sites)
@@ -1585,9 +1733,12 @@ def _value_index(s_sel, local_states):
     return jnp.argmin(diff, axis=-1).astype(jnp.int32)
 
 def _log_cond_sum(cond, s_sel, site_indices, local_states):
-    """Σ_i log p(s_i | cond) sobre los sitios dados (machine_pow=2)."""
+    """Σ_i log p(s_i | cond) sobre los sitios dados (machine_pow=2).
+
+    p = |ψ|² ⇒ solo cuenta Re log ψ (la fase no entra en la probabilidad).
+    """
     idx = _value_index(s_sel, local_states)
-    cond_sel = cond[:, site_indices, :]
+    cond_sel = jnp.real(cond[:, site_indices, :])
     log_psi_sel = jnp.take_along_axis(
         cond_sel, idx[..., None], axis=-1
     ).squeeze(-1)
@@ -1604,7 +1755,7 @@ def _sample_ar_sites(key, vstate, s_init, sites, reverse=False):
         s, _ = carry
         k, i = inputs
         cond_i = _per_site_log_psi(vstate, s[None], reverse=reverse)[0, i]
-        log_p_i = 2.0 * cond_i                           # machine_pow = 2
+        log_p_i = 2.0 * jnp.real(cond_i)                 # machine_pow = 2
         choice = jax.random.categorical(k, log_p_i)
         return (s.at[i].set(local_states[choice]), None), None
 

@@ -297,6 +297,7 @@ def free_energy_minimize_phases(
     monitor_every=20,
     dkl_n_samples=2048,
     history_index=None,
+    deadline=None,
 ):
     """
     Minimiza F = E - T·S₂ pasando por una secuencia de fases.
@@ -355,6 +356,8 @@ def free_energy_minimize_phases(
         return dkl_value
 
     for i_phase, phase in enumerate(phases):
+        if deadline is not None and time.time() > deadline and best_params is not None:
+            break
         method        = phase["method"]
         n_steps       = phase["n_steps"]
         vstate_R      = phase.get("vstate_R", None)
@@ -415,6 +418,12 @@ def free_energy_minimize_phases(
 
         # ── loop de la fase ──
         for step in range(n_steps):
+            # deadline (time.time() absoluto, opcional): se corta el entrenamiento y se sigue con la
+            # reevaluacion final con los mejores parametros vistos.
+            if deadline is not None and time.time() > deadline:
+                if verbose:
+                    print(f"[deadline] alcanzado en fase {i_phase}, paso {step}: se corta el entrenamiento")
+                break
             if timing:
                 t0 = time.time()
 
@@ -504,7 +513,8 @@ def free_energy_minimize_phases(
                   f"{dkl_save_path}")
 
     # ── restaurar y reevaluar ──
-    vstate.parameters = best_params
+    if best_params is not None:          # None solo si deadline corta antes del primer paso
+        vstate.parameters = best_params
     jax.clear_jit_caches() if hasattr(jax, "clear_jit_caches") else jax.clear_caches()
     vstate.chunk_size = chunk_size
     E_best = float(vstate.expect(Hamiltonian).mean.real)

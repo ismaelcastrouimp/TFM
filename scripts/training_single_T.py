@@ -36,6 +36,7 @@ from src_renyi.physical_ancilla import (
     free_energy_minimize_phases,
     renyi2_entropy_and_grad_sampled,
     renyi2_wang_cs,
+    ARSpinViT_Causal_Interleaved
 )
 
 
@@ -54,12 +55,12 @@ idx = args.idx
 
 
 # ── CONFIGURACIÓN ──────────────────────────────────────────────────────────────
-N, N_A = 25, 25
+N, N_A = 8, 8
 J_ZZ, J_XX, h_x, h_z = -1.0, 0.0, -1.5, 0.0
 
 N_SAMPLES       = 2**12
 N_STEPS_SWAP    = 200
-N_STEPS_WANG    = 3000
+N_STEPS_WANG    = 300
 INIT_N_STEPS    = 1000
 INIT_BATCH      = N_SAMPLES
 WARM_EVERY      = 30
@@ -69,24 +70,24 @@ WARM_BATCH      = N_SAMPLES
 chunk_size = N_SAMPLES // 2
 
 phases = [
-    {
-        "method": "swap",
-        "n_steps": N_STEPS_SWAP,
-        "optimizer": optax.sgd(optax.linear_schedule(0.05, 0.005, N_STEPS_SWAP)),
-        "chunk_size_energy": 4096,
-    },
+    # {
+    #     "method": "swap",
+    #     "n_steps": N_STEPS_SWAP,
+    #     "optimizer": optax.sgd(optax.linear_schedule(0.05, 0.005, N_STEPS_SWAP)),
+    #     "chunk_size_energy": 4096,
+    # },
     {
         "method": "wang", "n_steps": N_STEPS_WANG,
-        "optimizer": optax.sgd(optax.linear_schedule(0.02, 0.002, N_STEPS_WANG)),
+        "optimizer": optax.adam(optax.linear_schedule(0.001, 0.0005, N_STEPS_WANG)),
         "vstate_R": None,
         "initial_train": {"n_steps": INIT_N_STEPS, "batch": INIT_BATCH, "lr": 3e-3},
         "warm_start":    {"every": WARM_EVERY, "n_steps": WARM_N_STEPS,
                         "lr": 5e-4, "batch": WARM_BATCH},
         "wang_kwargs":   {"n_samples": N_SAMPLES},
         "chunk_size_energy": 4096,
+        "vstate_R": None
     },
 ]
-sr_optimizer = nk.optimizer.SR(diag_shift=optax.linear_schedule(0.1, 0.005, N_STEPS_WANG))
 N_REP_COSINE = 10
 # ───────────────────────────────────────────────────────────────────────────────
 
@@ -183,18 +184,16 @@ for i in range(N):
     H_extended += J_ZZ * sigmaz(hi, i) @ sigmaz(hi, (i + 1) % N)
     H_extended += J_XX * sigmax(hi, i) @ sigmax(hi, (i + 1) % N)
 
-model   = nk.models.ARNNDense(hilbert=hi, layers=1, features=16,
-                              activation=jax.nn.gelu)
+model   = nk.models.ARNNDense(hilbert=hi, layers=1, features=16)
 sampler = nk.sampler.ARDirectSampler(hi)
 vstate  = nk.vqs.MCState(sampler, model, n_samples=N_SAMPLES)
 
-model_R   = nk.models.ARNNDense(hilbert=hi, layers=1, features=16,
-                                activation=jax.nn.gelu)
+model_R   = nk.models.ARNNDense(hilbert=hi, layers=1, features=16)
 sampler_R = nk.sampler.ARDirectSampler(hi)
 vstate_R  = nk.vqs.MCState(sampler_R, model_R, n_samples=N_SAMPLES)
 
 partition = list(range(N))
-# phases[1]["vstate_R"] = vstate_R
+phases[0]["vstate_R"] = vstate_R
 # ───────────────────────────────────────────────────────────────────────────────
 
 
@@ -204,10 +203,9 @@ print(f"TRAINING N={N} at T={T}, N_A={N_A}, idx={idx}")
 _, f_best, E_best, S_best = free_energy_minimize_phases(
     vstate, T, partition, H_extended, phases,
     chunk_size=chunk_size,
-    sr= sr_optimizer,
     n_samples_sr=2**12,
-    clip_norm=1.0,
-    verbose=True, freq=10,
+    clip_norm=None,
+    verbose=True, freq=1,
     plot=False, timing=True,
     history_index=idx,
 )
