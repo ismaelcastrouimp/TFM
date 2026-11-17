@@ -1941,6 +1941,8 @@ def train_reverse_network(vstate, vstate_R, n_steps=500, batch=1024,
         loss_val, grads = jax.value_and_grad(loss_fn, argnums=0)(
             params_R, state_R, s
         )
+        # Parámetros complejos: JAX devuelve el conjugado de la dirección de descenso (no-op si son reales).
+        grads = jax.tree_util.tree_map(jnp.conj, grads)
         updates, opt_state = opt.update(grads, opt_state, params_R)
         params_R = optax.apply_updates(params_R, updates)
         return params_R, opt_state, loss_val
