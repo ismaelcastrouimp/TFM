@@ -2315,3 +2315,230 @@ def renyin_wang_cs(vstate, vstate_R, subsystem_sites, n, n_samples,
         _debug_report("renyi_n Wang", T, S_n, grad_S, w)
 
     return float(S_n), grad_S
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AR inclinado: S₂ y ∇S₂ por muestreo de importancia del
+# compañero, para CUALQUIER red autoregresiva de NetKet (ARNNDense, ARSpinViT_Causal,
+# versiones intercaladas, ARNN_Z2, MODARNN...).  Solo usa `conditionals_log_psi`,
+# `reorder` (orden autoregresivo, como ARDirectSampler) y `__call__`.
+#
+#   Tr ρ_A² = Σ_{x1,x2} |ψ(x1)|² |ψ(x2)|² R(x1,x2),   R = ψ(y1)ψ(y2) / (ψ(x1)ψ(x2)),
+#   y1 = (x2_A, x1_B), y2 = (x1_A, x2_B)   (swap de los sitios A).
+#   x1 ~ |ψ|²  y, en vez de x2 ~ |ψ|² (swap iid), x2 ~ q(·|x1): el AR "inclinado" hacia x1,
+#   q_κ(x2|x1) = Π_i p(x2_i|x2_<i) κ^{[x2_i ≠ x1_i]} / c_i,   c_i = p(x1_i|x2_<i) + κ (1 - p(x1_i|x2_<i)),
+#   con mezcla defensiva estratificada de κ's (el compañero k usa κ_{k mod J}; densidad Σ_j a_j q_j,
+#   a_j = n_j/K).  κ = 1 es exactamente el swap iid, así que incluirlo acota el peso por el del swap.
+#   Peso (complejo): w = |ψ(x2)|² R / q_mix.   Ẑ(x1) = (1/K) Σ_k Re w,   P̂ = media de Ẑ,  S₂ = -ln P̂.
+#   Gradiente (θ real):  ∇P = Re Σ G ∇[ln ψ(y1) + ln ψ(y2) + ln ψ*(x1) + ln ψ*(x2)],  G = ψ*(x1)ψ*(x2)ψ(y1)ψ(y2)
+#   ⇒ ∇P̂ = media Re[w (O_y1 + O_y2 + O*_x1 + O*_x2)] - b_m ∇ln|ψ(x1)|²  (línea base b_m = media de Ẑ SIN la muestra m
+#      ("leave-one-out"): independiente de x1_m, así que ∇P̂ es insesgado; con b = P̂ del lote habría sesgo O(1/M));
+#   q va con stop-gradient.   ∇S₂ = -∇P̂ / P̂.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _ar_order(model, params, model_state, N):
+    """Orden autoregresivo de los sitios (el mismo que usa nk.sampler.ARDirectSampler)."""
+    return model.apply({"params": params, **model_state}, jnp.arange(N), method=model.reorder)
+
+
+def check_ar_order(model, params, model_state, local_states, N, order=None, seed=0, n_cfg=4):
+    """Comprueba que la red es causal en el orden que declara `reorder`: al cambiar el sitio j solo pueden cambiar
+    los condicionales de sitios POSTERIORES a j en ese orden.  Si no, ARDirectSampler (y el AR inclinado) muestrean
+    mal.  Prueba n_cfg configuraciones aleatorias (una pasada de n_cfg (N+1) filas).  Devuelve la lista de
+    violaciones (j, i); vacía = OK (o red sin dependencia aún, p.ej. capa final a 0)."""
+    order = np.asarray(_ar_order(model, params, model_state, N) if order is None else order)
+    pos = np.empty(N, int); pos[order] = np.arange(N)
+    ls = np.asarray(local_states)
+    xs = ls[np.random.default_rng(seed).integers(0, len(ls), (n_cfg, N))]
+    X = np.repeat(xs[:, None], N + 1, 1)                                            # (n_cfg, N+1, N)
+    for j in range(N):
+        X[:, j + 1, j] = ls[(np.argmin(np.abs(ls[None] - xs[:, j, None]), -1) + 1) % len(ls)]
+    c = np.asarray(model.apply({"params": params, **model_state}, jnp.asarray(X.reshape(-1, N)),
+                               method="conditionals_log_psi")).reshape(n_cfg, N + 1, N, -1)
+    ch = (np.abs(c[:, 1:] - c[:, :1]).max(-1) > 1e-10).any(0)                       # (j, i): cond. i cambia al tocar j
+    return [(j, i) for j in range(N) for i in range(N) if ch[j, i] and pos[i] <= pos[j]]
+
+
+@partial(jax.jit, static_argnames=("model", "nc"))
+def _tilted_sample(model, params, model_state, key, x_ref, log_kappa, tilt_mask, order, local_states, nc=1):
+    """x ~ q(x|x_ref) fila a fila.  x_ref (B,N), log_kappa (B,) (0 => q = |ψ|², muestreo AR exacto),
+    tilt_mask (N,) bool: sitios inclinados.  Igual que nk.sampler.ARDirectSampler: usa `model.conditional` con la
+    colección "cache" (los modelos Fast* de NetKet hacen así O(1) por sitio; el resto, una pasada por sitio).
+    nc: trozos de filas (lax.map, secuencial) para acotar la memoria; B debe ser múltiplo de nc."""
+    B, N = x_ref.shape
+    nloc = local_states.shape[0]
+
+    def sample_chunk(args):
+        k, xr, lk = args
+        x0 = jnp.full(xr.shape, local_states[0], dtype=local_states.dtype)
+        kinit, kscan = jax.random.split(k)
+        cache = model.init(kinit, x0, 0, method=model.conditional).get("cache")
+        ref_idx = _value_index(xr, local_states)                                  # (Bc, N)
+
+        def step(carry, inp):
+            x, cache = carry
+            ki, i = inp
+            v = {"params": params, **model_state}
+            if cache:
+                v = {**v, "cache": cache}
+            pr, mut = model.apply(v, x, i, method=model.conditional, mutable=["cache"])
+            cache = mut.get("cache")
+            logp = jnp.log(jnp.maximum(pr, 1e-300))                               # p = |ψ|² (machine_pow)
+            logp = logp - jax.scipy.special.logsumexp(logp, axis=-1, keepdims=True)
+            same = jnp.arange(nloc)[None, :] == ref_idx[:, i][:, None]
+            tilt = jnp.where(same | ~tilt_mask[i], 0.0, lk[:, None])
+            choice = jax.random.categorical(ki, logp + tilt, axis=-1)
+            return (x.at[:, i].set(local_states[choice]), cache), None
+
+        (x, _), _ = jax.lax.scan(step, (x0, cache), (jax.random.split(kscan, order.shape[0]), order))  # order puede ser parcial (puente)
+        return x
+
+    xs = jax.lax.map(sample_chunk, (jax.random.split(key, nc), x_ref.reshape(nc, -1, N), log_kappa.reshape(nc, -1)))
+    return xs.reshape(B, N)
+
+
+def _tilted_log_q_mix(model, params, model_state, x2, x1, log_kappas, log_a, tilt_mask, local_states):
+    """(ln q_mix(x2|x1), ln|ψ(x2)|²) con una sola pasada de la red sobre x2 (todas las κ a la vez)."""
+    cond = model.apply({"params": params, **model_state}, x2, method="conditionals_log_psi")
+    logp = jax.nn.log_softmax(2.0 * jnp.real(cond), axis=-1)                     # (B, N, nloc)
+    i2, i1 = _value_index(x2, local_states), _value_index(x1, local_states)
+    lp2 = jnp.take_along_axis(logp, i2[..., None], -1)[..., 0]                    # (B, N)
+    p1 = jnp.exp(jnp.take_along_axis(logp, i1[..., None], -1)[..., 0])
+    nd = jnp.sum((i2 != i1) & tilt_mask[None], -1)                                 # (B,)
+    k = jnp.exp(log_kappas)[None, None, :]                                         # (1,1,J)
+    logc = jnp.where(tilt_mask[None, :, None], jnp.log(p1[..., None] + k * (1.0 - p1[..., None])), 0.0)
+    lq = lp2.sum(-1)[:, None] + nd[:, None] * log_kappas[None] - logc.sum(1)      # (B, J)
+    return jax.scipy.special.logsumexp(lq + log_a[None], axis=-1), lp2.sum(-1), nd
+
+
+def renyi2_tilted(vstate, subsystem_sites, n_samples, K=5, kappas=(0.05, 0.1, 0.2, 0.4, 1.0),
+                  tilt_sites=None, key=0, compute_grad=True, chunk_size=None, return_info=False, debug=False,
+                  check_order=True):
+    """
+    S₂ = -ln Tr ρ_A² (y su gradiente) con el estimador AR inclinado (mezcla de κ's).
+
+    Parámetros
+    ----------
+    vstate          : MCState de NetKet con un modelo AUTOREGRESIVO (necesita `conditionals_log_psi`).
+                      Los parámetros deben ser reales (ψ puede ser complejo).
+    subsystem_sites : sitios A (los que se intercambian en el swap; típicamente el sistema).
+    n_samples       : M configuraciones x1 ~ |ψ|² (muestreo AR exacto propio, no usa vstate.sample).
+    K               : compañeros x2 por cada x1 (estratificados en las κ: el k usa kappas[k % J]).
+    kappas          : κ's de la mezcla.  kappas=(1.0,) => swap iid con K compañeros.
+    tilt_sites      : sitios inclinados hacia x1 (por defecto TODOS: sistema y ancilla).
+    key             : semilla (int) o PRNGKey.
+    compute_grad    : si False solo devuelve S₂ (grad_S2 = None).
+    chunk_size      : nº de configuraciones x1 por trozo (cada trozo lleva chunk_size·K compañeros) en el muestreo,
+                      la evaluación de los pesos y el gradiente; los trozos van en secuencia (lax.map), así que la memoria
+                      no crece con M.  None = todo junto.  Debe dividir a n_samples.
+    check_order     : comprobar la causalidad de la red en su orden (`check_ar_order`, una pasada de 4 (N+1) filas).
+    return_info     : si True devuelve también un dict de diagnóstico
+                      (S2_err, P, ESS_over_K, mean_d, cv_Z, frac_P_d_ge3).
+
+    Devuelve
+    --------
+    S2, grad_S2   [, info]
+    """
+    model, params, mstate = vstate.model, vstate.parameters, vstate.model_state
+    N = vstate.hilbert.size
+    local_states = jnp.asarray(vstate.hilbert.local_states)
+    A_mask = jnp.zeros(N, bool).at[jnp.asarray(subsystem_sites, int)].set(True)
+    tilt_mask = (jnp.ones(N, bool) if tilt_sites is None
+                 else jnp.zeros(N, bool).at[jnp.asarray(tilt_sites, int)].set(True))
+    kap = np.asarray(kappas, float); J = len(kap)
+    assert np.all(kap > 0) and np.all(kap <= 1.0 + 1e-12), "kappas en (0, 1]"
+    kidx = np.arange(K) % J
+    n_j = np.bincount(kidx, minlength=J)
+    assert np.all(n_j > 0), "K debe ser >= len(kappas) (cada κ necesita al menos un compañero)"
+    log_kappas, log_a = jnp.log(jnp.asarray(kap)), jnp.log(jnp.asarray(n_j / K))
+    order = _ar_order(model, params, mstate, N)
+    bad = check_ar_order(model, params, mstate, local_states, N, order) if check_order else []
+    if bad:
+        raise ValueError(f"{type(model).__name__}: la red NO es causal en el orden de `reorder` ({np.asarray(order)}); "
+                         f"p.ej. cambiar el sitio {bad[0][0]} altera el condicional del sitio {bad[0][1]}. "
+                         "El muestreo autoregresivo (ARDirectSampler y este estimador) sería incorrecto.")
+    key = jax.random.PRNGKey(key) if isinstance(key, (int, np.integer)) else key
+    k1, k2 = jax.random.split(key)
+
+    # x1 ~ |ψ|²  (κ = 1)
+    cs = n_samples if chunk_size is None else max(1, min(int(chunk_size), n_samples))
+    assert n_samples % cs == 0, f"chunk_size={cs} debe dividir a n_samples={n_samples}"
+    x1 = _tilted_sample(model, params, mstate, k1, jnp.full((n_samples, N), local_states[0], local_states.dtype),
+                        jnp.zeros(n_samples), tilt_mask, order, local_states, nc=n_samples // cs)
+    X1 = jnp.repeat(x1, K, axis=0)                                                 # (M K, N), fila m*K + k
+    lk_rows = jnp.tile(log_kappas[jnp.asarray(kidx)], n_samples)
+    X2 = _tilted_sample(model, params, mstate, k2, X1, lk_rows, tilt_mask, order, local_states, nc=n_samples // cs)
+    Y1 = jnp.where(A_mask[None], X2, X1)
+    Y2 = jnp.where(A_mask[None], X1, X2)
+
+    S2, grad, info = _renyi2_tilted_eval(model, params, mstate, X1, X2, Y1, Y2, log_kappas, log_a, tilt_mask,
+                                          local_states, n_samples, K, compute_grad, None if chunk_size is None else cs * K)
+    if not info["P"] > 0:
+        import warnings
+        warnings.warn(f"renyi2_tilted: P̂ = {info['P']:.3e} <= 0 (S₂ = nan).  Con ψ complejo Re w puede ser negativo; si las "
+                      "fases de ψ varían mucho (problema de signo) hacen falta más muestras.", RuntimeWarning)
+    if debug:
+        msg = f"[tilted] S₂ = {float(S2):.6f} ± {info['S2_err']:.6f}  ESS/K = {info['ESS_over_K']:.3f}  <d> = {info['mean_d']:.2f}"
+        if grad is not None:
+            msg += f"  |∇S₂| = {float(jnp.linalg.norm(jax.flatten_util.ravel_pytree(grad)[0])):.6f}"
+        print(msg)
+    return (S2, grad, info) if return_info else (S2, grad)
+
+
+def _renyi2_tilted_eval(model, params, mstate, X1, X2, Y1, Y2, log_kappas, log_a, tilt_mask, local_states,
+                        M, K, compute_grad, chunk_size):
+    B = X1.shape[0]
+    chunk = B if chunk_size is None else max(1, min(int(chunk_size), B))
+    assert B % chunk == 0, f"chunk_size={chunk} debe dividir a n_samples*K={B}"
+    nc = B // chunk
+    lw, nd = _tilted_log_w(model, params, mstate, X1, X2, Y1, Y2, log_kappas, log_a, tilt_mask, local_states, nc)
+    w = jnp.exp(lw)                                                                # (B,) complejo
+    Z = jnp.mean(jnp.real(w).reshape(M, K), axis=1)
+    P = jnp.mean(Z)
+    S2 = -jnp.log(P)
+    wr = jnp.real(w).reshape(M, K)
+    ess = jnp.mean(jnp.sum(wr, 1) ** 2 / jnp.maximum(jnp.sum(wr ** 2, 1), 1e-300)) / K
+    info = dict(S2_err=float(jnp.std(Z) / jnp.sqrt(M) / P), P=float(P), ESS_over_K=float(ess),
+                mean_d=float(jnp.mean(nd)), cv_Z=float(jnp.std(Z) / P),
+                frac_P_d_ge3=float(jnp.sum(jnp.where(nd >= 3, jnp.real(w), 0.0)) / jnp.sum(jnp.real(w))))
+    if not compute_grad:
+        return S2, None, info
+    b = jnp.repeat((jnp.sum(Z) - Z) / max(M - 1, 1), K)                           # línea base sin la propia muestra
+    gP = _tilted_grad_P(model, params, mstate, X1, X2, Y1, Y2, w, b, nc)
+    grad = jax.tree_util.tree_map(lambda g: -g / P, gP)
+    return S2, grad, info
+
+
+@partial(jax.jit, static_argnames=("model", "nc"))
+def _tilted_log_w(model, params, mstate, X1, X2, Y1, Y2, log_kappas, log_a, tilt_mask, local_states, nc):
+    def lpsi(x):
+        return model.apply({"params": params, **mstate}, x).astype(jnp.complex128)
+
+    def one(c):
+        x1, x2, y1, y2 = c
+        lq, lp2, nd = _tilted_log_q_mix(model, params, mstate, x2, x1, log_kappas, log_a, tilt_mask, local_states)
+        return lp2 - lq + lpsi(y1) + lpsi(y2) - lpsi(x1) - lpsi(x2), nd
+
+    sh = lambda x: x.reshape(nc, -1, *x.shape[1:])
+    lw, nd = jax.lax.map(one, (sh(X1), sh(X2), sh(Y1), sh(Y2)))
+    return jax.lax.stop_gradient(lw.reshape(-1)), nd.reshape(-1)
+
+
+@partial(jax.jit, static_argnames=("model", "nc"))
+def _tilted_grad_P(model, params, mstate, X1, X2, Y1, Y2, w, b, nc):
+    w, b = jax.lax.stop_gradient(w), jax.lax.stop_gradient(b)
+    B = X1.shape[0]
+    sh = lambda x: x.reshape(nc, -1, *x.shape[1:])
+
+    def loss(p):
+        def lpsi(x):
+            return model.apply({"params": p, **mstate}, x).astype(jnp.complex128)
+
+        @jax.checkpoint
+        def chunk(c):
+            x1, x2, y1, y2, wc, bc = c
+            l1 = lpsi(x1)
+            sur = jnp.real(wc * (lpsi(y1) + lpsi(y2) + jnp.conj(l1) + jnp.conj(lpsi(x2))))
+            return jnp.sum(sur - bc * 2.0 * jnp.real(l1))                         # línea base (score de x1)
+        return jnp.sum(jax.lax.map(chunk, (sh(X1), sh(X2), sh(Y1), sh(Y2), sh(w), sh(b)))) / B
+
+    return jax.grad(loss)(params)

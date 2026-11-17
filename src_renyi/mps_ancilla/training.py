@@ -9,6 +9,7 @@ import optax
 
 from .models import mps_overlap_rect
 from .mc_loss import make_mc_loss, make_mc_vg, auto_chunks     # noqa: F401  (make_mc_loss se re-exporta)
+from .swap_mc import make_swap_stepper
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -100,10 +101,23 @@ def make_sampler(model, N, M):
     return sample
 
 
+def _log_mem(tag, name):
+    """Imprime la memoria de GPU (pico y limite).  En CPU memory_stats() es None y no hace nada."""
+    try:
+        st = jax.local_devices()[0].memory_stats()
+        if st:
+            print(f"{tag}[{name}] memoria GPU: pico {st.get('peak_bytes_in_use', 0) / 2**30:.2f} GiB | "
+                  f"en uso {st.get('bytes_in_use', 0) / 2**30:.2f} GiB | limite {st.get('bytes_limit', 0) / 2**30:.2f} GiB",
+                  flush=True)
+    except Exception:
+        pass
+
+
 def train_mc(model, params, N, T, hx, J, *, M=512, n_steps=2000, lr=5e-3, clip=10.0, warmup=100,
              end_frac=1e-2, seed=0, chunk=None, pair_block=None, freq=50, exact_fn=None, ref=None,
              ema_decay=0.995, polish_steps=0, polish_M=None, polish_lr=1e-3, polish_pair_block=None,
-             ckpt_fn=None, ckpt_every=250, tag="", purity="iid", sample_chunk=None, mem_gb=None):
+             ckpt_fn=None, ckpt_every=250, tag="", purity="iid", sample_chunk=None, mem_gb=None,
+             swap_chains=256, swap_group=256, swap_stride=20, swap_warm=100, swap_after=0, freeze=None):
     """
     Entrena con el gradiente MC en dos fases:
       1) n_steps con warmup + coseno, lotes de M muestras.
@@ -113,6 +127,10 @@ def train_mc(model, params, N, T, hx, J, *, M=512, n_steps=2000, lr=5e-3, clip=1
     exact_fn(params) -> (F, E, S2) exactos por ED (opcional, solo N pequeno): se imprime para los
                         parametros actuales y para la EMA.
     ref = (F, E, S2) del MRE exacto: se imprime como baseline y se usa para los gaps finales.
+    purity="swap": el termino de S2 se estima muestreando el ensemble swap con cadenas de Metropolis PERSISTENTES
+        (swap_mc.py): swap_chains cadenas (en grupos de swap_group), swap_warm pasos de calentamiento al empezar cada
+        fase y swap_stride pasos por iteracion.  La energia y el valor de S2 que se imprime/guarda siguen saliendo
+        de un lote de M muestras con el estimador nbr (el gradiente de S2 viene solo de las cadenas).
     Devuelve dict con params (ultimos), params_ema, hist (E, S2, F de MC por paso) y s_per_step.
     """
     if ref is not None:
@@ -121,20 +139,52 @@ def train_mc(model, params, N, T, hx, J, *, M=512, n_steps=2000, lr=5e-3, clip=1
     def make_phase(name, Mv, pb, sched):
         sampler = make_sampler(model, N, Mv)
         nch = auto_chunks(Mv, N, model.chi, pb, sample_chunk, mem_gb, grad=True)
-        vg = make_mc_vg(model, N, T, hx, J, chunk, pb, purity=purity, n_chunks=nch)
-        print(f"{tag}[{name}] M={Mv} purity={purity}" + (f" | sample chunking: {nch} trozos de {Mv // nch}" if nch > 1 else ""), flush=True)
+        swap = purity == "swap"
+        # swap: este lote da la energia y el valor de S2 (nbr); el gradiente de S2 lo dan las cadenas
+        vg = make_mc_vg(model, N, T, hx, J, chunk, pb, terms="E" if swap else "both",
+                        purity="nbr" if swap else purity, n_chunks=nch)
+        print(f"{tag}[{name}] M={Mv} purity={purity}" + (f" | sample chunking: {nch} trozos de {Mv // nch}" if nch > 1 else "")
+              + (f" | swap: {swap_chains} cadenas ({swap_chains // swap_group}x{swap_group}), warm={swap_warm}, stride={swap_stride}"
+                 if swap else ""), flush=True)
         tx = optax.chain(optax.clip_by_global_norm(clip), optax.adam(sched))
+        if freeze:   # congela los parametros de primer nivel cuyo nombre empieza por algun prefijo de `freeze`
+            lab = {k: ("frozen" if any(k.startswith(f) for f in freeze) else "train") for k in params}
+            tx = optax.multi_transform({"train": tx, "frozen": optax.set_to_zero()}, lab)
+            print(f"{tag}[{name}] congelados: {sorted(k for k, v in lab.items() if v == 'frozen')}", flush=True)
+        if swap:
+            sw_init, sw_grad = make_swap_stepper(model, N, T, swap_chains, swap_group, swap_stride, swap_warm)
+            chain_sampler = make_sampler(model, N, swap_group)
+
+        def init_chains(params, key):
+            return sw_init(params, key, chain_sampler) if swap else None
 
         @jax.jit
-        def step(params, opt_state, ema, key):
-            key, sub = jax.random.split(key)
+        def step(params, opt_state, ema, key, chains):
+            key, sub, sub2 = jax.random.split(key, 3)
             s = sampler(params, sub)
             (_, aux), g = vg(params, s)
+            if swap:
+                gS, cs, ct, _ = sw_grad(params, sub2, chains[0], chains[1])
+                g = jax.tree_util.tree_map(jnp.add, g, gS)
+                chains = (cs, ct)
             upd, opt_state = tx.update(g, opt_state, params)
             params = optax.apply_updates(params, upd)
             ema = jax.tree_util.tree_map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema, params)
-            return params, opt_state, ema, key, aux
-        return tx, step
+            return params, opt_state, ema, key, chains, aux
+        if swap:        # arranque con nbr (swap_after pasos): ver swap_after en la docstring
+            vg_pre = make_mc_vg(model, N, T, hx, J, chunk, pb, terms="both", purity="nbr", n_chunks=nch)
+
+            @jax.jit
+            def step_pre(params, opt_state, ema, key, chains):
+                key, sub = jax.random.split(key)
+                (_, aux), g = vg_pre(params, sampler(params, sub))
+                upd, opt_state = tx.update(g, opt_state, params)
+                params = optax.apply_updates(params, upd)
+                ema = jax.tree_util.tree_map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema, params)
+                return params, opt_state, ema, key, chains, aux
+        else:
+            step_pre = None
+        return tx, step, init_chains, step_pre
 
     phases = [("main", M, pair_block, n_steps,
                optax.warmup_cosine_decay_schedule(0.0, lr, min(warmup, max(n_steps // 5, 1)), n_steps,
@@ -146,14 +196,24 @@ def train_mc(model, params, N, T, hx, J, *, M=512, n_steps=2000, lr=5e-3, clip=1
     def ema_hat(ema, t):
         return jax.tree_util.tree_map(lambda e: e / (1.0 - ema_decay ** t), ema)
 
+    _log_mem(tag, "inicio")
     key = jax.random.PRNGKey(seed)
     ema = jax.tree_util.tree_map(jnp.zeros_like, params)
     hist, t_total, t0 = [], 0, time.time()
     for name, Mv, pb, n, sched in phases:
-        tx, step = make_phase(name, Mv, pb, sched)
+        tx, step, init_chains, step_pre = make_phase(name, Mv, pb, sched)
+        after = swap_after if (name == "main" and step_pre is not None) else 0
         opt_state = tx.init(params)
+        key, kc = jax.random.split(key)
+        chains = init_chains(params, kc) if after == 0 else None   # swap: arranque + calentamiento con los parametros actuales
         for it in range(n):
-            params, opt_state, ema, key, (E, S2, F) = step(params, opt_state, ema, key)
+            if it < after:                              # swap: primeros pasos con nbr
+                params, opt_state, ema, key, chains, (E, S2, F) = step_pre(params, opt_state, ema, key, chains)
+            else:
+                if step_pre is not None and chains is None:   # swap: fin del arranque nbr, arrancar y calentar las cadenas
+                    chains = init_chains(params, kc)
+                    print(f"{tag}[{name}] paso {it}: cadenas swap arrancadas y calentadas", flush=True)
+                params, opt_state, ema, key, chains, (E, S2, F) = step(params, opt_state, ema, key, chains)
             t_total += 1
             hist.append((float(E), float(S2), float(F)))
             if ckpt_fn is not None and t_total % ckpt_every == 0:
@@ -169,6 +229,7 @@ def train_mc(model, params, N, T, hx, J, *, M=512, n_steps=2000, lr=5e-3, clip=1
                     except Exception as e:                      # la monitorizacion no debe tirar el entrenamiento
                         msg += f" | (monitorizacion ED fallo: {type(e).__name__})"
                 print(msg, flush=True)
+        _log_mem(tag, name + " fin")
     params_ema = ema_hat(ema, t_total)
     if exact_fn is not None:
         print(f"{tag}RESUMEN (evaluacion exacta por ED)")

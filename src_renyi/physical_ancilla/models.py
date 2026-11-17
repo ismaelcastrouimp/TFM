@@ -154,6 +154,11 @@ class InterleavedARNNDense(ARNNDense):
         a_part = jnp.take(reshaped, 1, axis=axis + 1)
         return jnp.concatenate([s_part, a_part], axis=axis)
 
+    def conditionals_log_psi(self, inputs):
+        # ARNNDense de NetKet NO aplica `reorder` en la red (solo lo usa ARDirectSampler para el orden de muestreo)
+        out = super().conditionals_log_psi(self.reorder(inputs, axis=1))
+        return self.inverse_reorder(out, axis=1)
+
 
 class CausalTransformerBlock(nn.Module):
     n_heads: int

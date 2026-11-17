@@ -19,7 +19,13 @@ Estimador de la pureza (S2):
     --purity iid             parejas de muestras independientes dentro de bloques de pair_block (por defecto)
     --purity nbr             suma EXACTA en t=s y los N vecinos a un espin (d<=1) + parejas iid con d>=2.
                              Insesgado; mucho mas estable a S2 alta (casi toda la pureza esta en d<=1).
+    --purity swap            gradiente de S2 muestreando el ensemble swap |rho|^2/P con cadenas de Metropolis
+                             PERSISTENTES (swap_mc.py).  Pensado para N grande y S2 alta.  La energia y el valor de
+                             S2 (monitorizacion y evaluacion final) siguen saliendo del estimador nbr.
     --nbr_from_T X           usa nbr si T >= X e iid si T < X  (implica --purity auto)
+    --swap_from_T Y          usa swap si T >= Y (con --nbr_from_T: iid < X <= nbr < Y <= swap)
+    --swap_chains/--swap_group/--swap_stride/--swap_warm   cadenas, tamano de grupo (memoria), pasos por
+                             iteracion y calentamiento inicial (defecto 256/256/20/100)
 
 Memoria (modelos grandes / M grande):
     --sample_chunk C         procesa el lote en trozos de <= C muestras (gradiente EXACTO, no aproximado)
@@ -82,10 +88,18 @@ ap.add_argument("--eval_batches", type=int, default=None)
 ap.add_argument("--tol", type=float, default=None)
 
 # Estimador de la pureza y memoria
-ap.add_argument("--purity", type=str, choices=["iid", "nbr", "auto"], default=None,
+ap.add_argument("--purity", type=str, choices=["iid", "nbr", "swap", "auto"], default=None,
                 help="Estimador de S2.  'auto' = nbr si T >= --nbr_from_T, iid si no.")
 ap.add_argument("--nbr_from_T", type=float, default=None,
                 help="Temperatura a partir de la cual se usa el estimador nbr (implica --purity auto).")
+ap.add_argument("--swap_from_T", type=float, default=None,
+                help="Temperatura a partir de la cual se usa el estimador swap (implica --purity auto).")
+ap.add_argument("--swap_chains", type=int, default=None, help="Cadenas del estimador swap (defecto 256).")
+ap.add_argument("--swap_group", type=int, default=None, help="Cadenas por grupo, acota la memoria (defecto 256).")
+ap.add_argument("--swap_stride", type=int, default=None, help="Pasos de Metropolis por iteracion (defecto 20).")
+ap.add_argument("--swap_after", type=int, default=None,
+                help="Pasos iniciales de la fase main con nbr antes de pasar a swap (defecto 0; recomendado ~500 si se parte de S2 casi maxima).")
+ap.add_argument("--swap_warm", type=int, default=None, help="Pasos de calentamiento al empezar cada fase (defecto 100).")
 ap.add_argument("--sample_chunk", type=int, default=None,
                 help="Maximo de muestras por trozo (troceado exacto del lote; reduce la memoria).")
 ap.add_argument("--mem_gb", type=float, default=None,
@@ -148,11 +162,17 @@ args.seed       = _get(args.seed,       "training", "seed",       1)
 
 # ── estimador de la pureza ────────────────────────────────────────────────────
 args.nbr_from_T = _get(args.nbr_from_T, "training", "nbr_from_T", None)
+args.swap_from_T = _get(args.swap_from_T, "training", "swap_from_T", None)
 args.purity     = _get(args.purity,     "training", "purity",     None)
+args.swap_chains = _get(args.swap_chains, "training", "swap_chains", 256)
+args.swap_group  = _get(args.swap_group,  "training", "swap_group",  256)
+args.swap_stride = _get(args.swap_stride, "training", "swap_stride", 20)
+args.swap_warm   = _get(args.swap_warm,   "training", "swap_warm",   100)
+args.swap_after  = _get(args.swap_after,  "training", "swap_after",  0)
 if args.purity is None:
-    args.purity = "auto" if args.nbr_from_T is not None else "iid"
-if args.purity == "auto" and args.nbr_from_T is None:
-    sys.exit("--purity auto necesita --nbr_from_T (o training.nbr_from_T en el YAML)")
+    args.purity = "auto" if (args.nbr_from_T is not None or args.swap_from_T is not None) else "iid"
+if args.purity == "auto" and args.nbr_from_T is None and args.swap_from_T is None:
+    sys.exit("--purity auto necesita --nbr_from_T y/o --swap_from_T (o training.* en el YAML)")
 
 # ── memoria ───────────────────────────────────────────────────────────────────
 args.sample_chunk = _get(args.sample_chunk, "training", "sample_chunk", None)
@@ -246,7 +266,9 @@ def ps(vals, k):
 def purity_for(T):
     """Estimador de la pureza para esta temperatura (el mismo en entrenamiento y evaluacion)."""
     if args.purity == "auto":
-        return "nbr" if T >= args.nbr_from_T else "iid"
+        if args.swap_from_T is not None and T >= args.swap_from_T:
+            return "swap"
+        return "nbr" if (args.nbr_from_T is not None and T >= args.nbr_from_T) else "iid"
     return args.purity
 
 
@@ -313,13 +335,15 @@ def run_stage(T, idx, k):
                    M=M, n_steps=steps, lr=lr_k, warmup=warm,
                    seed=seed, pair_block=args.pair_block, freq=max(1, steps // 20),
                    ema_decay=args.ema, polish_steps=pst, polish_M=pM, polish_lr=plr_k,
-                   tag=tag, purity=purity, sample_chunk=args.sample_chunk, mem_gb=args.mem_gb)
+                   tag=tag, purity=purity, sample_chunk=args.sample_chunk, mem_gb=args.mem_gb,
+                   swap_chains=args.swap_chains, swap_group=args.swap_group,
+                   swap_stride=args.swap_stride, swap_warm=args.swap_warm, swap_after=args.swap_after)
     p_final = out["params_ema"]                       # se guarda y se evalua la EMA
 
     # ---- evaluacion MC final con barra de error (mismo estimador y misma politica de memoria) ----
     nch_eval = auto_chunks(args.eval_M, N, chi, args.pair_block, args.sample_chunk, args.mem_gb, grad=False)
     one = make_evaluator(model, N, T, args.h_x, args.J_ZZ, args.eval_M, args.pair_block,
-                         purity=purity, n_chunks=nch_eval)
+                         purity="nbr" if purity == "swap" else purity, n_chunks=nch_eval)
     ev = evaluate(one, p_final, T, args.eval_batches, seed=seed + 999)
 
     # ---- comparacion con el escalon anterior ----
