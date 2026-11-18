@@ -1,5 +1,5 @@
 """
-robust_ed.py  (Claude 16-11-2026)
+robust_ed.py  (16-11-2026)
 =================================
 Bateria de robustez del sesgo inductivo de la ancilla (conv = local + equivariante) fuera del TFIM homogeneo.
 Cadena 1D (PBC salvo --obc), gradiente EXACTO (rho completa, N <= 10), F2 = E - T S2 frente al MRE exacto.

@@ -270,13 +270,11 @@ print(f"2. Análisis a presupuesto fijo B = {BUDGET_FIXED:,}")
 print("=" * 70)
 
 stat = lambda k, f: np.array([f(results[T][k][BUDGET_FIXED]) for T in TEMPS])
-S2_consensus = np.nanmean([stat(k, lambda r: np.nanmean(r["S2"])) for k in METHODS], axis=0)
 
 fig, ax = plt.subplots(figsize=(6.5, 4))
 for k, (lab, mk, c, _) in METHODS.items():
     ax.errorbar(TEMPS, stat(k, lambda r: np.nanmean(r["S2"])), yerr=stat(k, lambda r: np.nanstd(r["S2"])),
                 fmt=mk + "-", color=c, label=lab, capsize=3)
-ax.plot(TEMPS, S2_consensus, "k--", alpha=0.4, label="consenso")
 ax.set_xlabel(r"$T$"); ax.set_ylabel(r"$S_2$")
 ax.set_title(fr"$S_2$ vs $T$ ($N={N}$, $B={BUDGET_FIXED:,}$)")
 ax.legend(); ax.grid(True, alpha=0.3)
