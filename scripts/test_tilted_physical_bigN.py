@@ -1,5 +1,5 @@
 """
-test_tilted_physical_bigN.py  (Claude 16-11-2026)
+test_tilted_physical_bigN.py  (16-11-2026)
 =================================================
 Pruebas de `renyi2_tilted` a N grande (sin referencia exacta):
  (FastARNNDense no se prueba: con esta versión de jax el propio ARDirectSampler de NetKet falla con ella.)

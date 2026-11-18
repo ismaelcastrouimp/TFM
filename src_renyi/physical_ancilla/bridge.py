@@ -1,5 +1,5 @@
 """
-bridge.py  (Claude 17-11-2026)
+bridge.py  (17-11-2026)
 ==============================
 Estimador "puente" de S₂ = -ln Tr ρ_S² (y su gradiente) para la ancilla FÍSICA con red autoregresiva cuyo orden pone
 TODO el sistema antes que la ancilla (ARNNDense, ARSpinViT_Causal, ...).  Teoría: notas.md, "Por qué el AR inclinado va

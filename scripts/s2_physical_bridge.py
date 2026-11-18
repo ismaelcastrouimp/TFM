@@ -1,5 +1,5 @@
 """
-s2_physical_bridge.py  (Claude 16-11-2026)
+s2_physical_bridge.py  (16-11-2026)
 ==========================================
 ¿Por qué el AR inclinado va mal con ancilla FÍSICA y cómo arreglarlo?  Experimento exacto (numpy, sin redes).
 
@@ -30,6 +30,8 @@ ap.add_argument("--n_a", type=int, nargs="+", default=[1, 4])
 ap.add_argument("--n_u", type=int, nargs="*", default=[], help="tamaños del U-estadistico del puente")
 ap.add_argument("--gauge", nargs="+", default=["none"],
                 help="unitaria en la ancilla (F no cambia): none | rot:θ (rotación real R(θ) en cada sitio) | haar:seed (O global aleatoria)")
+ap.add_argument("--psi_file", default=None,
+                help=".npy con Ψ (2^N x 2^N, filas s) entrenada: mide los estimadores en ese estado (un N, un T)")
 ap.add_argument("--oracle", action="store_true", help="añade el puente con propuesta óptima exacta (techo)")
 ap.add_argument("--state", default="mre", choices=["mre", "gibbs"])
 ap.add_argument("--out", default="data/gap_arch/physical_tilted/bridge.json")
@@ -61,7 +63,7 @@ def mre_p(ev, T):
 class ARTable:
     """ψ sobre 2N bits (sitio 0 = bit más significativo) con condicionales AR exactos."""
     def __init__(self, psi, n):
-        self.psi, self.n = psi, n; w = psi ** 2
+        self.psi, self.n = psi, n; w = np.abs(psi) ** 2
         self.M = [w.reshape(2 ** k, -1).sum(1) for k in range(n + 1)]              # M[k][prefijo]
 
     def cond1(self, k, pref):                                                       # p(x_k = 1 | prefijo)
@@ -87,7 +89,7 @@ class ARTable:
 
 
 def gauge_matrix(g, N):
-    if g == "none": return None
+    if g in ("none", "chol", "eig"): return None              # chol / eig: gauges fijados a partir de rho (en run)
     kind, v = g.split(":")
     if kind == "rot":
         t = float(v); r = np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]]); U = np.ones((1, 1))
@@ -101,12 +103,19 @@ def run(N, T, rng, gauge="none"):
     ev, V = tfim(N); p = mre_p(ev, T) if a.state == "mre" else np.exp(-(ev - ev[0]) / T) / np.exp(-(ev - ev[0]) / T).sum()
     sq = (V * np.sqrt(p)) @ V.T                                                     # ρ^{1/2}
     U = gauge_matrix(gauge, N)
+    if gauge == "chol":                    # Ψ = L (Cholesky, triangular inferior en el índice entero: ψ(s,a)=0 si a>s)
+        sq = np.linalg.cholesky((V * p) @ V.T + 1e-12 * np.eye(len(p)))
+    elif gauge == "eig":                   # Ψ = V sqrt(p): la ancilla etiqueta autoestados
+        sq = V * np.sqrt(p)
     if U is not None: sq = sq @ U.T                                                 # ψ(s,a) -> Σ_a' U_{a a'} ψ(s,a'): ρ_S igual
+    if a.psi_file:
+        sq = np.load(a.psi_file); sq = sq / np.sqrt(np.sum(np.abs(sq) ** 2))
+        if np.abs(sq.imag).max() < 1e-14: sq = sq.real
     psi = sq.reshape(-1); D = 2 ** N; tab = ARTable(psi, 2 * N)
-    rho = (V * p) @ V.T; P_ex = float((rho ** 2).sum())
+    rho = sq @ sq.conj().T if a.psi_file else (V * p) @ V.T; P_ex = float((np.abs(rho) ** 2).sum())
     pS = tab.M[N]                                                                    # p(s)
     Phi = sq / np.sqrt(np.maximum(pS, 1e-300))[:, None]                              # φ(a|s) (filas s)
-    O = Phi @ Phi.T                                                                  # O(s1,s2) exacto
+    O = Phi @ Phi.conj().T                                                                  # O(s1,s2) exacto
     Kn = len(KAPPAS); K = a.K; Nt = 2 * N
     lnk = lambda lq: np.log(np.mean(np.exp(lq), 1))                                  # log q_mix (mezcla uniforme de κ)
     def kap_rows(B): return np.tile(KAPPAS, B // Kn + 1)[:B]
@@ -114,7 +123,7 @@ def run(N, T, rng, gauge="none"):
     def est_exact_anc(M):
         s1, _ = tab.sample(M, rng, k1=N); s1r = np.repeat(s1, K); kap = kap_rows(M * K)
         s2, lq = tab_sample_s(s1r, kap)
-        return np.mean(pS[s2] * O[s1r, s2] ** 2 / np.exp(lnk(lq))), N + K * N
+        return np.mean(pS[s2] * np.abs(O[s1r, s2]) ** 2 / np.exp(lnk(lq))), N + K * N
 
     def tab_sample_s(anchor_s, kap):                                                 # inclinado solo en los N sitios de s
         tabS = ARTable.__new__(ARTable); tabS.n = N; tabS.M = tab.M[:N + 1]
@@ -143,13 +152,13 @@ def run(N, T, rng, gauge="none"):
             lr += np.log(np.maximum(np.where(b, g1, g0) / np.maximum(Z, 1e-300), 1e-300))
             pa1, pa2 = 2 * pa1 + b, 2 * pa2 + b
         aa = pa1 & (D - 1)
-        w = Phi[s1, aa] * Phi[s2, aa] / np.exp(lr)
+        w = Phi[s1, aa] * np.conj(Phi[s2, aa]) / np.exp(lr)
         return w.reshape(B, n_a).mean(1) if not raw else w.reshape(B, n_a)
 
     def est_bridge(M, n_a):
         s1, _ = tab.sample(M, rng, k1=N); s1r = np.repeat(s1, K); kap = kap_rows(M * K)
         s2, lq = tab_sample_s(s1r, kap)
-        f = overlap_bridge(s1r, s2, n_a) * overlap_bridge(s1r, s2, n_a)
+        f = np.real(overlap_bridge(s1r, s2, n_a) * np.conj(overlap_bridge(s1r, s2, n_a)))
         return np.mean(pS[s2] * f / np.exp(lnk(lq))), N + K * (N + 2 * 2 * N * n_a)
 
     def est_bridge_u(M, n):
@@ -169,10 +178,12 @@ def run(N, T, rng, gauge="none"):
         f = (w.sum(1) ** 2 - (w ** 2).sum(1)) / (n * (n - 1))
         return np.mean(pS[s2] * f / np.exp(lnk(lq))), N + K * (N + 2 * N * n)
 
-    herm = float(np.sum(sq * sq.T))                    # Re Σ ψ(s,a)ψ(a,s) = 1 sii ψ hermítica (gauge canónico ρ^{1/2})
-    out = dict(N=N, T=T, P=P_ex, S2=-np.log(P_ex), gauge=gauge, herm=herm, trace=float(np.trace(sq)))
+    herm = float(np.real(np.sum(sq * sq.T)))                    # Re Σ ψ(s,a)ψ(a,s) = 1 sii ψ hermítica (gauge canónico ρ^{1/2})
+    out = dict(N=N, T=T, P=P_ex, S2=-np.log(P_ex), gauge=gauge, herm=herm, trace=float(np.real(np.trace(sq))), trace_canon=float(np.sqrt(np.clip(np.linalg.eigvalsh(rho), 0, None)).sum()))
     meths = {"exact_anc": lambda: est_exact_anc(a.M), "tilt_full": lambda: est_tilt(a.M, False),
              "tilt_sys": lambda: est_tilt(a.M, True)}
+    if a.psi_file and np.iscomplexobj(sq):                 # est_tilt supone ψ real
+        del meths["tilt_full"], meths["tilt_sys"]
     for n_a in a.n_a: meths[f"bridge_na{n_a}"] = (lambda n_a=n_a: est_bridge(a.M, n_a))
     for n in a.n_u: meths[f"bridgeU_{n}"] = (lambda n=n: est_bridge_u(a.M, n))
     if a.oracle: meths["oracle_U2"] = lambda: est_bridge_oracle(a.M, 2)

@@ -1,5 +1,5 @@
 """
-gauge_drift.py  (Claude 17-11-2026)
+gauge_drift.py  (17-11-2026)
 ===================================
 Libertad gauge de la ancilla física: ψ -> (I⊗U)ψ deja ρ_S (y F) igual, pero la varianza de los estimadores de S₂ cambia
 ×100-1000 (scripts/s2_physical_bridge.py --gauge).  El gauge canónico ψ = ρ^{1/2} (thermofield double) es hermítico como

@@ -1,5 +1,5 @@
 """
-test_tilted_physical.py  (Claude 16-11-2026)
+test_tilted_physical.py  (16-11-2026)
 ============================================
 Valida `entropy.renyi2_tilted` (AR inclinado, ancilla física) frente al cálculo EXACTO de S₂ y ∇S₂ para varias redes
 autoregresivas: ARNNDense, InterleavedARNNDense, ARSpinViT_Causal (complejo), ARSpinViT_Causal_Interleaved (complejo).

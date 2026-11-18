@@ -1,4 +1,4 @@
-"""test_hermiticity.py (Claude 17-11-2026): bridge.hermiticity (MC) frente al H exacto y su gradiente, N=3+3.
+"""test_hermiticity.py (17-11-2026): bridge.hermiticity (MC) frente al H exacto y su gradiente, N=3+3.
 Uso: JAX_PLATFORMS=cpu .venv/bin/python -u scripts/test_hermiticity.py"""
 import os, sys
 os.environ.setdefault("JAX_PLATFORMS", "cpu")

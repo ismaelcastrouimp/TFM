@@ -1,5 +1,5 @@
 """
-test_bridge_physical.py  (Claude 17-11-2026)
+test_bridge_physical.py  (17-11-2026)
 ============================================
 Valida `bridge.renyi2_bridge` (estimador puente, ancilla física) frente al cálculo EXACTO de S₂ y ∇S₂ para varias redes
 autoregresivas: ARNNDense, InterleavedARNNDense, ARSpinViT_Causal (complejo), ARSpinViT_Causal_Interleaved (complejo).
