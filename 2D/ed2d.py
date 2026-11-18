@@ -5,6 +5,7 @@ TFIM 2D (red Lx x Ly, PBC): H = J sum_<ij> Z_i Z_j + h sum_i X_i  (J=-1, h=-1.5 
 Entrena ARViT + ancilla MPS con gradiente EXACTO (rho completa; N = Lx*Ly <= ~12) minimizando F2 = E - T S2 y compara
 con el MRE exacto (minimo de F2, espectro completo) y con el Gibbs.  Mismo bucle que scripts/gap_ed_small.py.
 Reporta dF = F2 - F2_MRE, distancia de traza al MRE, <ZZ> de vecinos, <X>, y F_vN - F_Gibbs.
+arch "vit:sbs:...": ancilla de varias strings (2D/models_sbs.py).
 Uso:
   python 2D/ed2d.py --Lx 3 --Ly 3 --T 1 3 --archs vit:conv2d:r=1,win=plus vit:conv:r=1 --chis 4 8 --out data/2D/ed_3x3.json
 """
@@ -17,6 +18,7 @@ jax.config.update("jax_enable_x64", True)
 from src_renyi.mps_ancilla import training
 from src_renyi.mps_ancilla.ladder import init_params
 from models2d import build_model_2d
+from models_sbs import build_model_sbs, make_loss_fns_sbs
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--Lx", type=int, default=3); ap.add_argument("--Ly", type=int, default=3)
@@ -84,9 +86,10 @@ for T in a.T:
         for chi in a.chis:
             for seed in a.seeds:
                 if (arch, chi, T, seed, a.steps, a.lr, a.h_x) in done: continue
-                model = build_model_2d(Lx, Ly, chi, arch, a.d)
+                sbs = arch.split(":")[1] == "sbs"          # ancilla string-bond (2D/models_sbs.py)
+                model = (build_model_sbs if sbs else build_model_2d)(Lx, Ly, chi, arch, a.d)
                 params = init_params(model, N, seed)
-                loss, rho_fn = training.make_loss_fns(model, all_s, H, T, chunk=a.chunk)
+                loss, rho_fn = (make_loss_fns_sbs if sbs else training.make_loss_fns)(model, all_s, H, T, chunk=a.chunk)
                 tag = f"[{arch} chi={chi} T={T} s={seed}] "
                 out = training.train(loss, params, a.steps, a.lr, T, freq=max(1, a.steps // 5), tag=tag)
                 rho = np.asarray(rho_fn(out["params_best"])); rho = 0.5 * (rho + rho.conj().T); o = obs(rho)
