@@ -21,7 +21,7 @@ import numpy as np
 import jax
 jax.config.update("jax_enable_x64", True)
 from src_renyi.mps_ancilla import training
-from src_renyi.mps_ancilla.ladder import init_params
+from src_renyi.mps_ancilla.ladder import init_params, save_params
 from src_renyi.mps_ancilla.models_alt import build_alt_model
 
 ap = argparse.ArgumentParser()
@@ -36,6 +36,8 @@ ap.add_argument("--chis", type=int, nargs="+", default=[4]); ap.add_argument("--
 ap.add_argument("--steps", type=int, default=3000); ap.add_argument("--lr", type=float, default=5e-3)
 ap.add_argument("--seeds", type=int, nargs="+", default=[1]); ap.add_argument("--chunk", type=int, default=None)
 ap.add_argument("--out", required=True)
+ap.add_argument("--save_params", action="store_true",
+                help="guarda params_best de cada entrenamiento en <out sin .json>_params/<arch>_chi<chi>_T<T>_s<seed>.msgpack")
 a = ap.parse_args()
 N = a.N; D = 2 ** N
 assert "/data/0/" not in os.path.abspath(a.out)
@@ -128,4 +130,8 @@ for T in a.T:
                 print(f"{tag}=> dF={r['dF']:+.5f} ({r['dF_per_site']:+.5f}/sitio)  E={o['E']:.4f} (MRE {Em:.4f})  "
                       f"S2={o['S2']:.4f} (MRE {S2m:.4f})  D(rho,MRE)={r['D_mre']:.4f}  n_par={r['n_params']}  "
                       f"{1e3 * out['s_per_step']:.1f} ms/paso", flush=True)
+                if a.save_params:
+                    pdir = os.path.splitext(a.out)[0] + "_params"; os.makedirs(pdir, exist_ok=True)
+                    r["params_file"] = os.path.join(pdir, f"{arch.replace(':', '_')}_chi{chi}_T{T}_s{seed}.msgpack")
+                    save_params(r["params_file"], out["params_best"])
                 res.append(r); json.dump(res, open(a.out, "w"), indent=1)
