@@ -123,11 +123,117 @@ def spectrum(name, N, J=1.0, J2=0.5, Delta=1.0, use_k=True, use_sym=True, verbos
     return ev
 
 
-def mre(ev, T):
-    from scipy.optimize import brentq
-    ev = np.asarray(ev, np.float64)
-    cc = brentq(lambda c: c - (np.maximum(c - ev, 0) * ev).sum() / np.maximum(c - ev, 0).sum() - 2 * T,
-                ev.min() + 1e-9, ev.max() + 20 * T + 10, xtol=1e-12)
+def mre(ev, T, method="minF"):
+    """MRE a T: p ∝ (c − E)_+ con c − ⟨E⟩ = 2T.  La condición puede tener VARIAS raíces c (T(c) no es monótona cuando
+    entra un multiplete grande, y a T < Δ/2 siempre está la raíz del fundamental); el MRE es la de MÍNIMA F = E − T S2.
+    method="minF": enumera todas las raíces (k niveles en el soporte, cuadrática en c, como robust_ed.py);
+    method="brentq": una raíz cualquiera (versión antigua; solo para comparar)."""
+    ev = np.sort(np.asarray(ev, np.float64))
+    if T <= 0:                                   # límite T -> 0+: mezcla uniforme del multiplete fundamental
+        g = int(np.sum(np.abs(ev - ev[0]) < 1e-9 * max(1.0, abs(ev[0]))))
+        return dict(E=float(ev[0]), S2=float(np.log(g)), F=float(ev[0]), c=float(ev[0]))
+    if method == "brentq":
+        from scipy.optimize import brentq
+        cc = brentq(lambda c: c - (np.maximum(c - ev, 0) * ev).sum() / np.maximum(c - ev, 0).sum() - 2 * T,
+                    ev.min() + 1e-9, ev.max() + 20 * T + 10, xtol=1e-12)
+    else:
+        e0 = ev[0]; x = ev - e0                                   # desplazar: mejor condicionado
+        k = np.arange(1, len(x) + 1, dtype=np.float64)
+        S1, S2c = np.cumsum(x), np.cumsum(x ** 2)
+        b = S1 + T * k; disc = b ** 2 - k * (S2c + 2 * T * S1)
+        hi = np.append(x[1:], np.inf)
+        best = None
+        for sgn in (1.0, -1.0):
+            c = (b + sgn * np.sqrt(np.maximum(disc, 0))) / k
+            ok = (disc >= 0) & (c > x) & (c <= hi + 1e-12)
+            if not ok.any():
+                continue
+            kk, cc_, s1, s2 = k[ok], c[ok], S1[ok], S2c[ok]
+            Z = kk * cc_ - s1
+            E = (cc_ * s1 - s2) / Z
+            P2 = (kk * cc_ ** 2 - 2 * cc_ * s1 + s2) / Z ** 2
+            F = E + T * np.log(P2)
+            i = int(np.argmin(F))
+            if best is None or F[i] < best[0]:
+                best = (F[i], cc_[i])
+        cc = best[1] + e0
     pw = np.maximum(cc - ev, 0); pw /= pw.sum()
     E, S2 = float((pw * ev).sum()), float(-np.log((pw ** 2).sum()))
     return dict(E=E, S2=S2, F=E - T * S2, c=float(cc))
+
+
+# ─── observables locales del MRE: ⟨n|O_r|n⟩ en cada autoestado (bloque a bloque) ─────────────────────────────────
+# O_r = (1/N) Σ_i σ_i·σ_{i+r} (Paulis; conserva Sz y momento, y es invariante bajo inversión de espines y reflexión,
+# así que valen los mismos atajos que para el espectro).  Dentro de un subespacio degenerado ⟨n|O|n⟩ depende de la base,
+# pero el MRE da el mismo peso a niveles degenerados y solo importa la traza sobre el subespacio, que es invariante.
+
+def _block_op(N, q, R, diag, rows, cols, amps, ls, ok, idx, dense):
+    k = 2 * np.pi * q / N
+    m = ok[rows] & ok[cols]
+    vals = amps[m] * np.exp(-1j * k * ls[m]) * np.sqrt(R[cols[m]] / R[rows[m]])
+    n = int(ok.sum())
+    if dense:
+        M = np.zeros((n, n), complex); M[np.arange(n), np.arange(n)] = diag[ok]
+        np.add.at(M, (idx[rows[m]], idx[cols[m]]), vals)
+        return M
+    import scipy.sparse as sp
+    M = sp.coo_matrix((vals, (idx[rows[m]], idx[cols[m]])), shape=(n, n)).tocsr()
+    return M + sp.diags(diag[ok].astype(complex))
+
+
+def spectrum_obs(name, N, J=1.0, J2=0.5, Delta=1.0, rs=None, use_sym=True, verbose=False, col_chunk=1024):
+    """Autovalores (2^N,) ordenados y O (len(rs), 2^N) con ⟨n|O_r|n⟩ en el mismo orden.  Solo PBC con momento."""
+    from scipy.linalg import eigh
+    rs = list(range(1, N // 2 + 1)) if rs is None else list(rs)
+    bonds = bonds_for(name, N, J, J2, Delta)
+    obonds = {r: [(i, (i + r) % N, 1.0 / N, 1.0) for i in range(N)] for r in rs}
+    allst = np.arange(2 ** N, dtype=np.int64)
+    pc = _popcount(allst)
+    evs, obs = [], []
+    t0 = time.time()
+    ups = range((N + 1) // 2, N + 1) if use_sym else range(N + 1)
+    for nu in ups:
+        mult_m = 2 if (use_sym and 2 * nu != N) else 1
+        st = allst[pc == nu]
+        hs = _sector_elements(st, N, bonds, True)
+        R = hs[1]
+        os_ = {r: _sector_elements(st, N, obonds[r], True) for r in rs}
+        qs = range(N // 2 + 1) if use_sym else range(N)
+        for q in qs:
+            mult_q = 2 if (use_sym and 0 < q and 2 * q != N) else 1
+            ok = (q * R) % N == 0
+            if not ok.any():
+                continue
+            idx = -np.ones(len(R), np.int64); idx[ok] = np.arange(ok.sum())
+            H = _block_op(N, q, *hs[1:], ok, idx, dense=True)
+            assert np.abs(H - H.conj().T).max() < 1e-10
+            real = np.abs(H.imag).max() < 1e-12
+            w, V = eigh(H.real if real else H, overwrite_a=True, check_finite=False)
+            del H
+            ob = np.zeros((len(rs), len(w)))
+            for ir, r in enumerate(rs):
+                O = _block_op(N, q, *os_[r][1:], ok, idx, dense=False)
+                if real:
+                    O = O.real
+                for c0 in range(0, len(w), col_chunk):
+                    Vc = V[:, c0:c0 + col_chunk]
+                    ob[ir, c0:c0 + col_chunk] = np.real(np.sum(Vc.conj() * (O @ Vc), axis=0))
+            del V
+            for _ in range(mult_m * mult_q):
+                evs.append(w); obs.append(ob)
+            if verbose and len(w) > 2000:
+                print(f"  n_up={nu} q={q}: dim {len(w)}  ({time.time() - t0:.0f} s)", flush=True)
+    ev = np.concatenate(evs); O = np.concatenate(obs, axis=1)
+    assert len(ev) == 2 ** N
+    order = np.argsort(ev, kind="stable")
+    return ev[order], O[:, order], rs
+
+
+def mre_obs(ev, O, T, rs=None):
+    """MRE a T con E, S2, F y C(r) = Σ_n p_n ⟨n|O_r|n⟩."""
+    m = mre(ev, T)
+    p = np.maximum(m["c"] - np.asarray(ev), 0); p /= p.sum()
+    m["C"] = [float(x) for x in O @ p]
+    if rs is not None:
+        m["rs"] = list(rs)
+    return m

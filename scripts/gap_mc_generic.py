@@ -15,6 +15,7 @@ import argparse, json, os, sys, time
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(script_dir, ".."))
+sys.path.insert(0, script_dir)
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", required=True, choices=["tfim", "tfim_hz", "xxz", "j1j2"])
 ap.add_argument("--N", type=int, required=True); ap.add_argument("--T", type=float, required=True)
@@ -25,6 +26,9 @@ ap.add_argument("--chi", type=int, default=8); ap.add_argument("--arch", default
 ap.add_argument("--d", type=int, default=16); ap.add_argument("--heads", type=int, default=4)
 ap.add_argument("--blocks", type=int, default=2)
 ap.add_argument("--init", default="scratch"); ap.add_argument("--seed", type=int, default=1)
+ap.add_argument("--init_chi", type=int, default=None,
+                help="chi de --init; si es menor que --chi se amplía con pad_chi_mlp (ancilla global, estado idéntico)")
+ap.add_argument("--pad_noise", type=float, default=1e-3)
 ap.add_argument("--M", type=int, default=1024, help="muestras de la energía")
 ap.add_argument("--Mp", type=int, default=256); ap.add_argument("--K", type=int, default=5)
 ap.add_argument("--kappas", type=float, nargs="*", default=[0.05, 0.1, 0.2, 0.4, 1.0])
@@ -55,7 +59,16 @@ os.makedirs(a.out_dir, exist_ok=True)
 N, T, chi, tag = a.N, a.T, a.chi, f"[{a.label}] "
 H = build_hamiltonian(a.model, N, obc=a.obc, J=a.J, h=a.h, hz=a.hz, Delta=a.Delta, J2=a.J2)
 model = build_alt_model(N, chi, a.arch, a.d, a.heads, a.blocks)
-params = init_params(model, N, a.seed) if a.init == "scratch" else load_params(a.init, model, N)
+if a.init == "scratch":
+    params = init_params(model, N, a.seed)
+elif a.init_chi and a.init_chi != chi:
+    from pad_chi_mlp import pad_chi_mlp
+    assert a.init_chi < chi
+    p_small = load_params(a.init, build_alt_model(N, a.init_chi, a.arch, a.d, a.heads, a.blocks), N)
+    params = pad_chi_mlp(p_small, init_params(model, N, a.seed), N, a.init_chi, chi, a.pad_noise, a.seed)
+    print(f"{tag}init: {a.init} ampliado chi {a.init_chi} -> {chi} (ruido {a.pad_noise:g})", flush=True)
+else:
+    params = load_params(a.init, model, N)
 terms = make_energy_terms(model, chi, H)
 purity = make_tilted_purity(model, N, chi, T)
 mix = make_mix_partners(model, N, a.kappas, a.K)
@@ -96,12 +109,8 @@ if N <= 10 or (ev is None and N <= 14):
         lossx = jax.jit(make_loss_fns(model, all_s, Hd, T, chunk=64)[0])
         exact = lambda p: (lambda r: (float(r[0]), float(r[1][0]), float(r[1][1])))(lossx(p))
 if ev is not None:
-    from scipy.optimize import brentq
-    cc = brentq(lambda c: c - (np.maximum(c - ev, 0) * ev).sum() / np.maximum(c - ev, 0).sum() - 2 * T,
-                ev.min() + 1e-9, ev.max() + 20 * T + 10, xtol=1e-12)
-    pw = np.maximum(cc - ev, 0); pw /= pw.sum()
-    ref = dict(E=float((pw * ev).sum()), S2=float(-np.log((pw ** 2).sum())))
-    ref["F"] = ref["E"] - T * ref["S2"]
+    from src_renyi.mps_ancilla.block_ed import mre as mre_fn      # raíz de mínima F (puede haber varias)
+    ref = {k: v for k, v in mre_fn(ev, T).items() if k in ("E", "S2", "F")}
     print(f"{tag}MRE exacto: F={ref['F']:.6f} E={ref['E']:.6f} S2={ref['S2']:.5f}  (E0/N={ev[0] / N:.6f})", flush=True)
 
 
