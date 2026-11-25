@@ -34,7 +34,10 @@ def shell_flips(N, dsh):
     return np.array(pats)
 
 
-def make_lowvar_purity(model, N, chi, T, kappas, K, dsh=1, cv_t=True):
+def make_lowvar_purity(model, N, chi, T, kappas, K, dsh=1, cv_t=True, sym=False):
+    """Propuesta inclinada SIN restricción de sector (vale para cualquier modelo: TFIM, ...).  dsh: cascarón exacto de
+    Hamming <= dsh (-1 = sin cascarón; en el TFIM un movimiento de H = un giro = Hamming 1).  sym=True: forma simétrica
+    (todo el score en s, factor 2; sin variable de control en t)."""
     pair_logs = make_pair_logs(model, chi)
     mix_logq = make_mix_logq(model)
     Fl = jnp.asarray(shell_flips(N, dsh)) if dsh >= 0 else None
@@ -50,18 +53,18 @@ def make_lowvar_purity(model, N, chi, T, kappas, K, dsh=1, cv_t=True):
         w = jnp.exp(sg(lpt + logf - lq)) * far                                    # (M*K,)
         W = w.reshape(M, K)
         Zs = W.mean(1)
-        L = jnp.sum(w * (lpt + logf)) / (M * K)
+        L = jnp.sum(w * (logf if sym else lpt + logf)) / (M * K)
         if nF:
             tsh = (s[:, None, :] * Fl[None]).reshape(-1, N)
             _, lpt_sh, logf_sh = pair_logs(params, s, tsh, nF)
             wsh = jnp.exp(sg(lpt_sh + logf_sh))                                     # p(t) f, exacto
             Zs = Zs + wsh.reshape(M, nF).sum(1)
-            L = L + jnp.sum(wsh * (lpt_sh + logf_sh)) / M
+            L = L + jnp.sum(wsh * (logf_sh if sym else lpt_sh + logf_sh)) / M
         P_hat = Zs.mean()
         den = sg(P_hat) if den is None else den
         base = sg(P_hat) if base is None else base
-        L = L + jnp.sum(sg(Zs - base) * lps) / M
-        if cv_t:
+        L = L + (2.0 if sym else 1.0) * jnp.sum(sg(Zs - base) * lps) / M
+        if cv_t and not sym:
             lq_live, _ = mix_logq(params, _rep(s, K), t, logks, loga)              # log q_mix con gradiente
             beta = (W.sum(1, keepdims=True) - W) / (K - 1)                          # deja-uno-fuera
             L = L - jnp.sum(sg(beta).reshape(-1) * lq_live) / (M * K)

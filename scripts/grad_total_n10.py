@@ -4,13 +4,15 @@ grad_total_n10.py
 Ruido y sesgo del gradiente TOTAL de F2 = E − T S2 por lote (energía + pureza, como en gap_mc_hybrid) frente al exacto
 (Ψ densa), N <= 10, en unos parámetros fijos.  Mismas s para todas las configuraciones (las M de la energía; la pureza usa
 las Mp primeras).  Configuración = "nombre:eform:pest:psym:Mp:K:kappas"
-  eform std|vmc;  pest tilted|u1|loc1|ham2;  psym 0|1.
+  eform std|vmc;  pest tilted|lowvar|lowvar1|u1|u1c|loc1|ham2;  psym 0|1.  --model j1j2|xxz|tfim|tfim_hz (--h);
+  estimadores de sector y --sz_label solo con j1j2/xxz (assert).  lowvar1 = lowvar + cascarón de Hamming 1; u1c: kappas = "κ,μ".
 Uso:
   python scripts/grad_total_n10.py --params X.msgpack --nb 100 --out X.json --configs base:std:tilted:0:256:5:0.05,0.1,0.2,0.4,1.0 ...
 """
 import argparse, json, os, sys, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 ap = argparse.ArgumentParser()
+ap.add_argument("--model", default="j1j2", choices=["j1j2", "xxz", "tfim", "tfim_hz"]); ap.add_argument("--h", type=float, default=-1.5)
 ap.add_argument("--J2", type=float, default=0.5); ap.add_argument("--N", type=int, default=10); ap.add_argument("--T", type=float, default=3.0)
 ap.add_argument("--chi", type=int, default=16); ap.add_argument("--arch", default="vit:mlp")
 ap.add_argument("--params", required=True); ap.add_argument("--nb", type=int, default=100); ap.add_argument("--M", type=int, default=1024)
@@ -42,7 +44,7 @@ p = serialization.from_bytes(init_params(model, N), open(a.params, "rb").read())
 if a.perturb > 0:
     p = jax.tree_util.tree_map(lambda x: x + a.perturb * jax.random.normal(jax.random.PRNGKey(7), x.shape, x.dtype), p)
 model = maybe_label(model, N, a.sz_label)
-H = build_hamiltonian("j1j2", N, J2=a.J2)
+H = build_hamiltonian(a.model, N, J2=a.J2, h=a.h)
 sampler = jax.jit(make_sampler(model, N, a.M))
 idx = np.arange(D); Sx = jnp.asarray((2 * ((idx[:, None] >> np.arange(N)) & 1) - 1).astype(np.float64))
 sp, mels = H.to_jax_operator().get_conn_padded(Sx); sp, mels = np.asarray(sp), np.asarray(mels).real
@@ -84,7 +86,14 @@ ec = min(a.e_chunk, a.M)
 
 
 def make_cfg(eform, pest, psym, Mp, K, ks):
-    if pest == "tilted":
+    from src_renyi.mps_ancilla.sz_label import assert_sz_ok
+    assert_sz_ok(a.model, pest, bool(a.sz_label))
+    assert not (a.sz_label and pest.startswith(("tilted", "lowvar"))), "etiqueta solo con estimadores de sector"
+    if pest.startswith("lowvar"):                 # lowvar = inclinado sin sector; lowvar1 = + cascarón Hamming 1
+        from src_renyi.mps_ancilla.purity_lowvar import make_lowvar_purity
+        pur = make_lowvar_purity(model, N, chi, T, ks, K, dsh=int(pest[6:] or -1), cv_t=False, sym=psym)
+        mix = make_mix_partners(model, N, ks, K)
+    elif pest == "tilted":
         pur, mix = make_tilted_purity(model, N, chi, T), make_mix_partners(model, N, ks, K)
     elif pest == "u1c":                            # kappas = "κ,μ" (componentes c = -1, 0, +1)
         from src_renyi.mps_ancilla.purity_charge import make_charge_mix_partners, charge_comps

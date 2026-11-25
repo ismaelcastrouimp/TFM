@@ -4,7 +4,8 @@ grad_total_cmp.py
 Ruido y SEÑAL del gradiente total de F2 = E − T S2 por lote (energía + pureza, como gap_mc_hybrid), sin referencia exacta
 (sirve a cualquier N), en unos parámetros fijos.  Una configuración por proceso (memoria pico propia); con la misma
 --seed las s son las mismas en todas.
-  config = "nombre:eform:pest:psym:Mp:K:kappas:p_chunks"   (eform std|vmc; pest tilted|u1|loc1|ham2; psym 0|1)
+  config = "nombre:eform:pest:psym:Mp:K:kappas:p_chunks"   (eform std|vmc; pest tilted|lowvar|lowvar1|u1|u1c|loc1|ham2; psym 0|1)
+  --model j1j2 (defecto)|xxz|tfim|tfim_hz (--h); estimadores de sector y --sz_label solo con j1j2/xxz (assert).  u1c: kappas = "κ,μ".
 Por configuración (nb lotes):  ruido = sqrt(tr Σ) de un lote;  señal |g| con |g|² = |m̂|² − tr Σ/nb (sin sesgo) y su error;
 S/R = |g|/ruido;  (S/R)²/t = eficiencia por segundo (nº de "lotes equivalentes con S/R = 1" por segundo);  memoria pico.
 Guarda <out_dir>/<nombre>.npz (media, varianza) y <nombre>.json.
@@ -17,12 +18,13 @@ Uso:
 import argparse, json, os, sys, time, glob
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 ap = argparse.ArgumentParser()
+ap.add_argument("--model", default="j1j2", choices=["j1j2", "xxz", "tfim", "tfim_hz"]); ap.add_argument("--h", type=float, default=-1.5)
 ap.add_argument("--J2", type=float, default=0.5); ap.add_argument("--N", type=int, default=20); ap.add_argument("--T", type=float, default=3.0)
 ap.add_argument("--chi", type=int, default=16); ap.add_argument("--arch", default="vit:mlp")
 ap.add_argument("--params", default=None); ap.add_argument("--nb", type=int, default=60); ap.add_argument("--M", type=int, default=1024)
 ap.add_argument("--e_chunk", type=int, default=64); ap.add_argument("--config", default=None); ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--out_dir", required=True); ap.add_argument("--analyse", action="store_true")
-ap.add_argument("--sz_label", type=int, default=0, help="1: etiqueta de Sz en la ancilla (solo pest u1)")
+ap.add_argument("--sz_label", type=int, default=0, help="1: etiqueta de Sz en la ancilla (solo j1j2/xxz y estimadores de sector)")
 a = ap.parse_args()
 assert "/data/0" not in os.path.abspath(a.out_dir)
 import numpy as np
@@ -60,14 +62,21 @@ p = serialization.from_bytes(init_params(model, N), open(a.params, "rb").read())
 if a.sz_label:
     from src_renyi.mps_ancilla.sz_label import SzLabelModel
     model = SzLabelModel(model, N)
-H = build_hamiltonian("j1j2", N, J2=a.J2)
+H = build_hamiltonian(a.model, N, J2=a.J2, h=a.h)
 sampler = jax.jit(make_sampler(model, N, a.M))
 flat = lambda g: jnp.concatenate([x.ravel() for x in jax.tree_util.tree_leaves(g)])
 nm, eform, pest, psym, Mp, K, ks, pc = a.config.split(":")
 psym, Mp, K, pc = bool(int(psym)), int(Mp), int(K), int(pc); ks = [float(x) for x in ks.split(",")]
-assert Mp <= a.M and Mp % pc == 0 and (not a.sz_label or pest != "tilted")
+assert Mp <= a.M and Mp % pc == 0 and True
 terms = make_energy_terms_vmc(model, chi, H) if eform == "vmc" else make_energy_terms(model, chi, H)
-if pest == "tilted":
+from src_renyi.mps_ancilla.sz_label import assert_sz_ok
+assert_sz_ok(a.model, pest, bool(a.sz_label))
+assert not (a.sz_label and pest.startswith(("tilted", "lowvar"))), "etiqueta solo con estimadores de sector"
+if pest.startswith("lowvar"):                 # lowvar = inclinado sin sector; lowvar1 = + cascarón Hamming 1
+    from src_renyi.mps_ancilla.purity_lowvar import make_lowvar_purity
+    pur = make_lowvar_purity(model, N, chi, T, ks, K, dsh=int(pest[6:] or -1), cv_t=False, sym=psym)
+    mix = make_mix_partners(model, N, ks, K)
+elif pest == "tilted":
     pur, mix = make_tilted_purity(model, N, chi, T), make_mix_partners(model, N, ks, K)
 elif pest == "u1c":                            # kappas = "κ,μ" (componentes c = -1, 0, +1)
     from src_renyi.mps_ancilla.purity_charge import make_charge_mix_partners, charge_comps

@@ -13,6 +13,21 @@ Referencia: MRE exacto. xxz/j1j2 con PBC por bloques Sz + k (block_ed.py, hasta 
 Uso:
   python scripts/gap_mc_generic.py --model j1j2 --J2 0.5 --N 10 --T 1 --chi 8 --arch vit:mlp --steps 3000 \
       --lr 1e-3 --label j1j2_test --out_dir data/gap_arch/generic
+
+Estimadores (25-11; notas.md "Estimador de pureza de baja varianza", "Etiqueta clásica de Sz"):
+  opción                     | qué hace                                              | modelos
+  ---------------------------+-------------------------------------------------------+---------------------------------
+  --pest tilted (defecto)    | inclinado, parejas en todo el espacio                 | todos
+  --pest lowvar [--lv_dsh d] | inclinado (todo el espacio) + cascarón Hamming <= d   | todos (TFIM: d=1 = un movimiento)
+  --pest u1 / u1c            | parejas en el sector de Sz de s (u1c: carga transport.)| solo j1j2, xxz (conservan Sz)
+  --pest u1shell/loc1/ham2/  | sector + cascarón exacto por máscaras                 | solo j1j2, xxz
+         loc2                |                                                       |
+  --psym 1                   | forma simétrica de la pureza (todo el score en s)     | con lowvar y los de sector (no tilted)
+  --cv 1                     | variable de control en el score de t (sin --psym)     | lowvar, u1, u1shell, máscaras (no u1c)
+  --eform vmc                | gradiente de E en forma VMC (menos varianza)          | todos
+  --sz_label 1               | etiqueta de Sz en la ancilla (ρ diagonal por bloques) | solo j1j2, xxz; con estimadores de sector
+  Gradiente "combinado": --eform vmc --psym 1 + (u1 --sz_label 1 en j1j2/xxz | lowvar en el TFIM).
+  Todo lo nuevo está desactivado por defecto (comportamiento por defecto = gap_mc_generic).
 """
 import argparse, json, os, sys, time
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -44,15 +59,16 @@ ap.add_argument("--max_hours", type=float, default=None)
 ap.add_argument("--spectra_dir", default="data/gap_arch/generic/spectra", help="caché de espectros por bloques")
 ap.add_argument("--exact_part", default="none", choices=["none", "E", "S2"])
 ap.add_argument("--p_chunks", type=int, default=1, help="pureza por trozos de s (mismo estimador: P̂ global fijo como den y base)")
-ap.add_argument("--pest", default="tilted", choices=["tilted", "u1", "u1shell", "loc1", "ham2", "loc2", "u1c"],
+ap.add_argument("--pest", default="tilted", choices=["tilted", "u1", "u1shell", "loc1", "ham2", "loc2", "u1c", "lowvar"],
                 help="estimador de pureza: tilted (make_tilted_purity) | u1 (parejas en el sector de Sz de s, "
                      "purity_lowvar) | u1shell (u1 + d=0 y d=2 exactos) | loc1/ham2/loc2 (sector + cascarón por máscaras)")
+ap.add_argument("--lv_dsh", type=int, default=-1, help="pest lowvar: cascarón exacto de Hamming <= lv_dsh (-1 = ninguno)")
 ap.add_argument("--psym", type=int, default=0, help="forma simétrica de la pureza (todo el score en s; purity_lowvar, sym)")
 ap.add_argument("--eform", default="std", choices=["std", "vmc"],
                 help="gradiente de la energía: std (score + camino, make_energy_terms) | vmc (vmc_energy, forma de estado puro)")
 ap.add_argument("--cmu", type=float, default=0.3, help="pest u1c: μ de la carga transportada (purity_charge.py)")
 ap.add_argument("--ckap", type=float, default=0.5, help="pest u1c: κ de las componentes c = -1, 0, +1")
-ap.add_argument("--sz_label", type=int, default=0, help="1: etiqueta clásica de Sz en la ancilla (sz_label.py; ρ diagonal por bloques; solo con --pest u1)")
+ap.add_argument("--sz_label", type=int, default=0, help="1: etiqueta clásica de Sz en la ancilla (sz_label.py; ρ diagonal por bloques; solo j1j2/xxz y estimadores de sector)")
 ap.add_argument("--cv", type=int, default=0, help="variable de control en el score de t (purity_lowvar)")
 ap.add_argument("--label", required=True); ap.add_argument("--out_dir", default="data/gap_arch/generic")
 a = ap.parse_args()
@@ -76,7 +92,7 @@ H = build_hamiltonian(a.model, N, obc=a.obc, J=a.J, h=a.h, hz=a.hz, Delta=a.Delt
 model = build_alt_model(N, chi, a.arch, a.d, a.heads, a.blocks)
 if a.sz_label:
     from src_renyi.mps_ancilla.sz_label import SzLabelModel
-    assert a.pest != "tilted" and a.exact_part == "none", "--sz_label no vale con el inclinado (parejas fuera del sector: log 0)"
+    assert a.pest not in ("tilted", "lowvar") and a.exact_part == "none", "--sz_label no vale con tilted/lowvar (parejas fuera del sector: log 0)"
     model = SzLabelModel(model, N); print(f"{tag}etiqueta de Sz en la ancilla: {model.n_label} sitios extra", flush=True)
 if a.init == "scratch":
     params = init_params(model, N, a.seed)
@@ -93,8 +109,14 @@ if a.eform == "vmc":
     terms = make_energy_terms_vmc(model, chi, H)
 else:
     terms = make_energy_terms(model, chi, H)
+from src_renyi.mps_ancilla.sz_label import assert_sz_ok
+assert_sz_ok(a.model, a.pest, bool(a.sz_label))
 if a.pest == "tilted":
     purity = make_tilted_purity(model, N, chi, T)
+    mix = make_mix_partners(model, N, a.kappas, a.K)
+elif a.pest == "lowvar":
+    from src_renyi.mps_ancilla.purity_lowvar import make_lowvar_purity
+    purity = make_lowvar_purity(model, N, chi, T, a.kappas, a.K, dsh=a.lv_dsh, cv_t=bool(a.cv), sym=bool(a.psym))
     mix = make_mix_partners(model, N, a.kappas, a.K)
 else:
     from src_renyi.mps_ancilla.purity_lowvar import make_u1_mix_partners, make_u1_lowvar_purity, make_u1_mask_purity

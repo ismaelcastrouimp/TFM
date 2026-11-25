@@ -46,5 +46,19 @@ class SzLabelModel:
         return logA, jnp.concatenate([M, lab], axis=1)
 
 
+SZ_MODELS = ("j1j2", "xxz")          # modelos de generic_eloc.build_hamiltonian que conservan Sz
+SECTOR_PESTS = ("u1", "u1shell", "u1c", "loc1", "ham2", "loc2")
+
+
+def assert_sz_ok(model_name, pest=None, sz_label=False):
+    """Los estimadores de sector y la etiqueta de Sz solo valen si H conserva Sz (si no, ρ(s,t) != 0 entre sectores y
+    se perdería esa parte de P, o la etiqueta impediría representar el estado)."""
+    if model_name in SZ_MODELS:
+        return
+    assert pest not in SECTOR_PESTS, (f"--pest {pest} restringe las parejas al sector de Sz, pero '{model_name}' no conserva Sz: "
+                                      f"usa --pest tilted o --pest lowvar")
+    assert not sz_label, f"--sz_label impone ρ diagonal por bloques de Sz, pero '{model_name}' no conserva Sz"
+
+
 def maybe_label(model, N, on):
     return SzLabelModel(model, N) if on else model
