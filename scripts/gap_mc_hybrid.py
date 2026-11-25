@@ -50,6 +50,7 @@ ap.add_argument("--pest", default="tilted", choices=["tilted", "u1", "u1shell", 
 ap.add_argument("--psym", type=int, default=0, help="forma simétrica de la pureza (todo el score en s; purity_lowvar, sym)")
 ap.add_argument("--eform", default="std", choices=["std", "vmc"],
                 help="gradiente de la energía: std (score + camino, make_energy_terms) | vmc (vmc_energy, forma de estado puro)")
+ap.add_argument("--sz_label", type=int, default=0, help="1: etiqueta clásica de Sz en la ancilla (sz_label.py; ρ diagonal por bloques; solo con --pest u1)")
 ap.add_argument("--cv", type=int, default=0, help="variable de control en el score de t (purity_lowvar)")
 ap.add_argument("--label", required=True); ap.add_argument("--out_dir", default="data/gap_arch/generic")
 a = ap.parse_args()
@@ -71,6 +72,10 @@ os.makedirs(a.out_dir, exist_ok=True)
 N, T, chi, tag = a.N, a.T, a.chi, f"[{a.label}] "
 H = build_hamiltonian(a.model, N, obc=a.obc, J=a.J, h=a.h, hz=a.hz, Delta=a.Delta, J2=a.J2)
 model = build_alt_model(N, chi, a.arch, a.d, a.heads, a.blocks)
+if a.sz_label:
+    from src_renyi.mps_ancilla.sz_label import SzLabelModel
+    assert a.pest == "u1" and a.exact_part == "none", "--sz_label solo con --pest u1 (parejas siempre en el sector: log 0 en las demás)"
+    model = SzLabelModel(model, N); print(f"{tag}etiqueta de Sz en la ancilla: {model.n_label} sitios extra", flush=True)
 if a.init == "scratch":
     params = init_params(model, N, a.seed)
 elif a.init_chi and a.init_chi != chi:

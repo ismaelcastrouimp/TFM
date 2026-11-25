@@ -17,6 +17,8 @@ ap.add_argument("--params", required=True); ap.add_argument("--nb", type=int, de
 ap.add_argument("--e_chunk", type=int, default=128); ap.add_argument("--pairs_chunk", type=int, default=2048)
 ap.add_argument("--configs", nargs="+", required=True); ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--out", required=True)
+ap.add_argument("--sz_label", type=int, default=0, help="1: etiqueta de Sz en la ancilla (sz_label.py)")
+ap.add_argument("--perturb", type=float, default=0.0, help="ruido gaussiano sumado a los parámetros (lejos del óptimo)")
 a = ap.parse_args()
 assert "/data/0" not in os.path.abspath(a.out)
 import numpy as np
@@ -31,10 +33,15 @@ from src_renyi.mps_ancilla.tilted_loss import make_mix_partners, make_tilted_pur
 from src_renyi.mps_ancilla.generic_eloc import build_hamiltonian, make_energy_terms
 from src_renyi.mps_ancilla.vmc_energy import make_energy_terms_vmc
 from src_renyi.mps_ancilla.purity_lowvar import make_u1_mix_partners, make_u1_lowvar_purity, make_u1_mask_purity
+from src_renyi.mps_ancilla.sz_label import maybe_label
+from src_renyi.mps_ancilla.training import compute_rho
 
 N, T, chi = a.N, a.T, a.chi; D = 2 ** N; sg = jax.lax.stop_gradient
 model = build_alt_model(N, chi, a.arch, 16)
 p = serialization.from_bytes(init_params(model, N), open(a.params, "rb").read())
+if a.perturb > 0:
+    p = jax.tree_util.tree_map(lambda x: x + a.perturb * jax.random.normal(jax.random.PRNGKey(7), x.shape, x.dtype), p)
+model = maybe_label(model, N, a.sz_label)
 H = build_hamiltonian("j1j2", N, J2=a.J2)
 sampler = jax.jit(make_sampler(model, N, a.M))
 idx = np.arange(D); Sx = jnp.asarray((2 * ((idx[:, None] >> np.arange(N)) & 1) - 1).astype(np.float64))
@@ -54,13 +61,24 @@ def psi(q):
     return P / jnp.sqrt(jnp.sum(jnp.abs(P) ** 2))
 
 
+_mg = np.asarray(Sx).sum(1); SAME = jnp.asarray((_mg[:, None] == _mg[None, :]).astype(np.float64))
+
+
+def rho_ex(q):                                     # ψ densa con los N sitios de la ancilla; la etiqueta = δ de sector en ρ
+    P = psi(q); r = P @ P.conj().T
+    return r * SAME if a.sz_label else r
+
+
 def F_ex(q):
-    P = psi(q); E = jnp.real(jnp.sum(P.conj() * (Hx @ P))); G = P.conj().T @ P
-    return E + T * jnp.log(jnp.sum(jnp.abs(G) ** 2))
+    r = rho_ex(q)
+    return jnp.real(jnp.sum(Hx.T * r)) + T * jnp.log(jnp.sum(jnp.abs(r) ** 2))
 
 
 gx = np.asarray(flat(jax.grad(F_ex)(p)))
-print(f"|∇F| exacto = {np.linalg.norm(gx):.4f}", flush=True)
+_r = np.asarray(rho_ex(p)); _a2 = np.abs(_r) ** 2; _sm = _mg[:, None] == _mg[None, :]
+_rc = np.asarray(compute_rho(model, p, Sx, 64)); assert np.abs(_rc - _r).max() < 1e-10, "ρ densa != ρ por solapes"
+print(f"|∇F| exacto = {np.linalg.norm(gx):.4f}   P = {_a2.sum():.6g} (S2 = {-np.log(_a2.sum()):.4f}),  fracción de P fuera del sector = "
+      f"{(_a2.sum() - _a2[_sm].sum()) / _a2.sum():.3e}   F = {F_ex(p):.5f}   sz_label={a.sz_label} perturb={a.perturb}", flush=True)
 TE = {"std": make_energy_terms(model, chi, H), "vmc": make_energy_terms_vmc(model, chi, H)}
 ec = min(a.e_chunk, a.M)
 

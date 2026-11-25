@@ -22,6 +22,7 @@ ap.add_argument("--chi", type=int, default=16); ap.add_argument("--arch", defaul
 ap.add_argument("--params", default=None); ap.add_argument("--nb", type=int, default=60); ap.add_argument("--M", type=int, default=1024)
 ap.add_argument("--e_chunk", type=int, default=64); ap.add_argument("--config", default=None); ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--out_dir", required=True); ap.add_argument("--analyse", action="store_true")
+ap.add_argument("--sz_label", type=int, default=0, help="1: etiqueta de Sz en la ancilla (solo pest u1)")
 a = ap.parse_args()
 assert "/data/0" not in os.path.abspath(a.out_dir)
 import numpy as np
@@ -56,12 +57,15 @@ from src_renyi.mps_ancilla.purity_lowvar import make_u1_mix_partners, make_u1_lo
 N, T, chi = a.N, a.T, a.chi; sg = jax.lax.stop_gradient
 model = build_alt_model(N, chi, a.arch, 16)
 p = serialization.from_bytes(init_params(model, N), open(a.params, "rb").read())
+if a.sz_label:
+    from src_renyi.mps_ancilla.sz_label import SzLabelModel
+    model = SzLabelModel(model, N)
 H = build_hamiltonian("j1j2", N, J2=a.J2)
 sampler = jax.jit(make_sampler(model, N, a.M))
 flat = lambda g: jnp.concatenate([x.ravel() for x in jax.tree_util.tree_leaves(g)])
 nm, eform, pest, psym, Mp, K, ks, pc = a.config.split(":")
 psym, Mp, K, pc = bool(int(psym)), int(Mp), int(K), int(pc); ks = [float(x) for x in ks.split(",")]
-assert Mp <= a.M and Mp % pc == 0
+assert Mp <= a.M and Mp % pc == 0 and (not a.sz_label or pest == "u1")
 terms = make_energy_terms_vmc(model, chi, H) if eform == "vmc" else make_energy_terms(model, chi, H)
 if pest == "tilted":
     pur, mix = make_tilted_purity(model, N, chi, T), make_mix_partners(model, N, ks, K)
