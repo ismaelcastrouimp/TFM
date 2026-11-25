@@ -65,10 +65,14 @@ sampler = jax.jit(make_sampler(model, N, a.M))
 flat = lambda g: jnp.concatenate([x.ravel() for x in jax.tree_util.tree_leaves(g)])
 nm, eform, pest, psym, Mp, K, ks, pc = a.config.split(":")
 psym, Mp, K, pc = bool(int(psym)), int(Mp), int(K), int(pc); ks = [float(x) for x in ks.split(",")]
-assert Mp <= a.M and Mp % pc == 0 and (not a.sz_label or pest == "u1")
+assert Mp <= a.M and Mp % pc == 0 and (not a.sz_label or pest != "tilted")
 terms = make_energy_terms_vmc(model, chi, H) if eform == "vmc" else make_energy_terms(model, chi, H)
 if pest == "tilted":
     pur, mix = make_tilted_purity(model, N, chi, T), make_mix_partners(model, N, ks, K)
+elif pest == "u1c":                            # kappas = "κ,μ" (componentes c = -1, 0, +1)
+    from src_renyi.mps_ancilla.purity_charge import make_charge_mix_partners, charge_comps
+    pur = make_u1_lowvar_purity(model, N, chi, T, ks, K, shell=False, cv_t=False, sym=psym)
+    mix = make_charge_mix_partners(model, N, charge_comps(ks[0]), ks[1], K)
 elif pest == "u1":
     pur, mix = make_u1_lowvar_purity(model, N, chi, T, ks, K, shell=False, cv_t=False, sym=psym), make_u1_mix_partners(model, N, ks, K)
 else:

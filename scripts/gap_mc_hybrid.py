@@ -44,12 +44,14 @@ ap.add_argument("--max_hours", type=float, default=None)
 ap.add_argument("--spectra_dir", default="data/gap_arch/generic/spectra", help="caché de espectros por bloques")
 ap.add_argument("--exact_part", default="none", choices=["none", "E", "S2"])
 ap.add_argument("--p_chunks", type=int, default=1, help="pureza por trozos de s (mismo estimador: P̂ global fijo como den y base)")
-ap.add_argument("--pest", default="tilted", choices=["tilted", "u1", "u1shell", "loc1", "ham2", "loc2"],
+ap.add_argument("--pest", default="tilted", choices=["tilted", "u1", "u1shell", "loc1", "ham2", "loc2", "u1c"],
                 help="estimador de pureza: tilted (make_tilted_purity) | u1 (parejas en el sector de Sz de s, "
                      "purity_lowvar) | u1shell (u1 + d=0 y d=2 exactos) | loc1/ham2/loc2 (sector + cascarón por máscaras)")
 ap.add_argument("--psym", type=int, default=0, help="forma simétrica de la pureza (todo el score en s; purity_lowvar, sym)")
 ap.add_argument("--eform", default="std", choices=["std", "vmc"],
                 help="gradiente de la energía: std (score + camino, make_energy_terms) | vmc (vmc_energy, forma de estado puro)")
+ap.add_argument("--cmu", type=float, default=0.3, help="pest u1c: μ de la carga transportada (purity_charge.py)")
+ap.add_argument("--ckap", type=float, default=0.5, help="pest u1c: κ de las componentes c = -1, 0, +1")
 ap.add_argument("--sz_label", type=int, default=0, help="1: etiqueta clásica de Sz en la ancilla (sz_label.py; ρ diagonal por bloques; solo con --pest u1)")
 ap.add_argument("--cv", type=int, default=0, help="variable de control en el score de t (purity_lowvar)")
 ap.add_argument("--label", required=True); ap.add_argument("--out_dir", default="data/gap_arch/generic")
@@ -74,7 +76,7 @@ H = build_hamiltonian(a.model, N, obc=a.obc, J=a.J, h=a.h, hz=a.hz, Delta=a.Delt
 model = build_alt_model(N, chi, a.arch, a.d, a.heads, a.blocks)
 if a.sz_label:
     from src_renyi.mps_ancilla.sz_label import SzLabelModel
-    assert a.pest == "u1" and a.exact_part == "none", "--sz_label solo con --pest u1 (parejas siempre en el sector: log 0 en las demás)"
+    assert a.pest != "tilted" and a.exact_part == "none", "--sz_label no vale con el inclinado (parejas fuera del sector: log 0)"
     model = SzLabelModel(model, N); print(f"{tag}etiqueta de Sz en la ancilla: {model.n_label} sitios extra", flush=True)
 if a.init == "scratch":
     params = init_params(model, N, a.seed)
@@ -96,12 +98,17 @@ if a.pest == "tilted":
     mix = make_mix_partners(model, N, a.kappas, a.K)
 else:
     from src_renyi.mps_ancilla.purity_lowvar import make_u1_mix_partners, make_u1_lowvar_purity, make_u1_mask_purity
-    if a.pest in ("u1", "u1shell"):
+    if a.pest == "u1c":
+        from src_renyi.mps_ancilla.purity_charge import make_charge_mix_partners, charge_comps
+        assert not a.cv, "u1c: la variable de control usa la densidad u1"
+        purity = make_u1_lowvar_purity(model, N, chi, T, a.kappas, a.K, shell=False, cv_t=False, sym=bool(a.psym))
+    elif a.pest in ("u1", "u1shell"):
         purity = make_u1_lowvar_purity(model, N, chi, T, a.kappas, a.K, shell=a.pest == "u1shell", cv_t=bool(a.cv),
                                        sym=bool(a.psym))
     else:
         purity = make_u1_mask_purity(model, N, chi, T, a.kappas, a.K, kind=a.pest, cv_t=bool(a.cv), sym=bool(a.psym))
-    mix = make_u1_mix_partners(model, N, a.kappas, a.K)
+    mix = (make_charge_mix_partners(model, N, charge_comps(a.ckap), a.cmu, a.K) if a.pest == "u1c"
+           else make_u1_mix_partners(model, N, a.kappas, a.K))
 assert not (a.psym and a.pest == "tilted"), "--psym solo con los estimadores de purity_lowvar"
 sampler = make_sampler(model, N, a.M)
 ec = max(1, min(a.e_chunk, a.M)); assert a.M % ec == 0

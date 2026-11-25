@@ -166,8 +166,9 @@ def make_u1_lowvar_purity(model, N, chi, T, kappas, K, shell=True, cv_t=True, sy
         L = jnp.sum(w * (logf if sym else lpt + logf)) / (M * K)
         if nF:
             tsh = (s[:, None, :] * Fl[None]).reshape(-1, N)
-            _, lpt_sh, logf_sh = pair_logs(params, s, tsh, nF)
             ok = jnp.concatenate([jnp.ones((M, 1), bool), s[:, pi] != s[:, pj]], 1).reshape(-1)
+            tsh = jnp.where(ok[:, None], tsh, _rep(s, nF))          # no válidas -> s (solape != 0: sin log 0 con etiqueta)
+            _, lpt_sh, logf_sh = pair_logs(params, s, tsh, nF)
             wsh = jnp.where(ok, jnp.exp(sg(lpt_sh + logf_sh)), 0.0)
             Zs = Zs + wsh.reshape(M, nF).sum(1)
             L = L + jnp.sum(wsh * jnp.where(ok, logf_sh if sym else lpt_sh + logf_sh, 0.0)) / M
@@ -245,8 +246,9 @@ def make_u1_mask_purity(model, N, chi, T, kappas, K, kind="loc1", cv_t=True, sym
         order = jnp.argsort(~ok, axis=1, stable=True)[:, :L_eval]                         # validas primero
         oks = jnp.take_along_axis(ok, order, 1)
         tsh = jnp.take_along_axis(tall, order[..., None], 1).reshape(-1, N)
-        _, lpt_sh, logf_sh = pair_logs(params, s, tsh, L_eval)
         oks = oks.reshape(-1)
+        tsh = jnp.where(oks[:, None], tsh, _rep(s, L_eval))         # no válidas -> s (sin log 0 con etiqueta)
+        _, lpt_sh, logf_sh = pair_logs(params, s, tsh, L_eval)
         wsh = jnp.where(oks, jnp.exp(sg(lpt_sh + logf_sh)), 0.0)
         Zs = Zs + wsh.reshape(M, L_eval).sum(1)
         L = L + jnp.sum(wsh * jnp.where(oks, logf_sh if sym else lpt_sh + logf_sh, 0.0)) / M

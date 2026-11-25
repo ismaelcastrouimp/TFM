@@ -86,6 +86,10 @@ ec = min(a.e_chunk, a.M)
 def make_cfg(eform, pest, psym, Mp, K, ks):
     if pest == "tilted":
         pur, mix = make_tilted_purity(model, N, chi, T), make_mix_partners(model, N, ks, K)
+    elif pest == "u1c":                            # kappas = "κ,μ" (componentes c = -1, 0, +1)
+        from src_renyi.mps_ancilla.purity_charge import make_charge_mix_partners, charge_comps
+        pur = make_u1_lowvar_purity(model, N, chi, T, ks, K, shell=False, cv_t=False, sym=psym)
+        mix = make_charge_mix_partners(model, N, charge_comps(ks[0]), ks[1], K)
     elif pest == "u1":
         pur, mix = make_u1_lowvar_purity(model, N, chi, T, ks, K, shell=False, cv_t=False, sym=psym), make_u1_mix_partners(model, N, ks, K)
     else:
